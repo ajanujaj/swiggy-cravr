@@ -1,0 +1,29 @@
+order_id,user_id,user_name,order_date,restaurant_name,cuisine,item_name,meal_type,dietary_type,quantity,unit_price_inr,line_total_inr,order_status
+ORD-1001,USR-001,Aarav Sharma,2026-01-12,Punjab Grill,North Indian,Butter Chicken,All Day,Non-Veg,1,420,420,Delivered
+ORD-1001,USR-001,Aarav Sharma,2026-01-12,Punjab Grill,North Indian,Garlic Naan,All Day,Veg,2,75,150,Delivered
+ORD-1002,USR-001,Aarav Sharma,2026-01-26,Dakshin Delights,South Indian,Masala Dosa,All Day,Veg,1,180,180,Delivered
+ORD-1002,USR-001,Aarav Sharma,2026-01-26,Dakshin Delights,South Indian,Filter Coffee,All Day,Veg,1,70,70,Delivered
+ORD-1003,USR-001,Aarav Sharma,2026-02-08,Wok This Way,Chinese,Chicken Fried Rice,All Day,Non-Veg,1,260,260,Delivered
+ORD-1003,USR-001,Aarav Sharma,2026-02-08,Wok This Way,Chinese,Chilli Chicken,All Day,Non-Veg,1,310,310,Delivered
+ORD-1004,USR-001,Aarav Sharma,2026-02-18,Olive Bistro,Italian,Margherita Pizza,All Day,Veg,1,350,350,Delivered
+ORD-1004,USR-001,Aarav Sharma,2026-02-18,Olive Bistro,Italian,Tiramisu,All Day,Veg,1,240,240,Delivered
+ORD-1005,USR-001,Aarav Sharma,2026-03-02,Taco Fiesta,Mexican,Chicken Tacos,All Day,Non-Veg,2,290,580,Delivered
+ORD-1005,USR-001,Aarav Sharma,2026-03-02,Taco Fiesta,Mexican,Nachos with Salsa,All Day,Veg,1,220,220,Delivered
+ORD-1006,USR-001,Aarav Sharma,2026-03-16,Sakura House,Japanese,California Sushi Roll,All Day,Non-Veg,1,480,480,Delivered
+ORD-1006,USR-001,Aarav Sharma,2026-03-16,Sakura House,Japanese,Miso Soup,All Day,Veg,1,140,140,Delivered
+ORD-1007,USR-001,Aarav Sharma,2026-04-04,Thai Basil,Thai,Pad Thai Noodles,All Day,Veg,1,340,340,Delivered
+ORD-1007,USR-001,Aarav Sharma,2026-04-04,Thai Basil,Thai,Tom Yum Soup,All Day,Veg,1,220,220,Delivered
+ORD-1008,USR-001,Aarav Sharma,2026-04-19,Cafe Boulevard,Continental,Classic Veg Burger,All Day,Veg,1,280,280,Delivered
+ORD-1008,USR-001,Aarav Sharma,2026-04-19,Cafe Boulevard,Continental,Chocolate Brownie,All Day,Veg,1,190,190,Delivered
+ORD-1009,USR-001,Aarav Sharma,2026-05-03,The Great Kabab Factory,North Indian,Chicken Biryani,All Day,Non-Veg,1,390,390,Delivered
+ORD-1009,USR-001,Aarav Sharma,2026-05-03,The Great Kabab Factory,North Indian,Dal Makhani,All Day,Veg,1,320,320,Delivered
+ORD-1010,USR-001,Aarav Sharma,2026-05-21,Coastal Kitchen,South Indian,Appam with Egg Curry,Breakfast,Non-Veg,1,220,220,Delivered
+ORD-1010,USR-001,Aarav Sharma,2026-05-21,Coastal Kitchen,South Indian,Medu Vada,Breakfast,Veg,1,110,110,Delivered
+ORD-1011,USR-001,Aarav Sharma,2026-06-07,Chilli Bean,Mexican,Bean and Cheese Enchiladas,All Day,Veg,1,300,300,Delivered
+ORD-1011,USR-001,Aarav Sharma,2026-06-07,Chilli Bean,Mexican,Churros,All Day,Veg,1,180,180,Delivered
+ORD-1012,USR-001,Aarav Sharma,2026-06-24,The European Plate,Continental,Grilled Chicken Steak,All Day,Non-Veg,1,480,480,Delivered
+ORD-1012,USR-001,Aarav Sharma,2026-06-24,The European Plate,Continental,Granola Yogurt Bowl,Breakfast,Veg,1,220,220,Delivered
+ORD-1013,USR-001,Aarav Sharma,2026-07-11,La Pino's Kitchen,Italian,Chicken Panini,Breakfast,Non-Veg,1,270,270,Delivered
+ORD-1013,USR-001,Aarav Sharma,2026-07-11,La Pino's Kitchen,Italian,Garlic Breadsticks,All Day,Veg,1,160,160,Delivered
+ORD-1014,USR-001,Aarav Sharma,2026-07-21,Tokyo Table,Japanese,Spicy Tuna Maki,All Day,Non-Veg,1,520,520,Delivered
+ORD-1014,USR-001,Aarav Sharma,2026-07-21,Tokyo Table,Japanese,Matcha Pancakes,Breakfast,Veg,1,220,220,Delivered

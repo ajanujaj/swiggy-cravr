@@ -1,0 +1,5 @@
+pandas
+fastmcp
+langchain
+langgraph
+langchain-ollama
