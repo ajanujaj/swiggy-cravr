@@ -9,6 +9,7 @@ pip install -r requirements.txt
 ollama pull qwen2.5:7b-instruct   # default model; must support tool calling for structured output
 python -m cravr.run
 python -m unittest discover -s tests -v
+CRAVR_DEBUG=1 python cravr/run.py  ## debug model
 ```
 
 Also start the MCP server (`python mcp_server/run_mcp.py`) before running the CLI, since `historyAgent`/`RecommendAgent` call it over HTTP.

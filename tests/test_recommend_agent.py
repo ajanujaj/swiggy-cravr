@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from langchain_core.messages import HumanMessage
 
-from cravr.graph import _route_entry
+from cravr.graph import FEEDBACK, NEW_REQUEST, _route_entry, app
 from cravr.RecommendAgent import (
     _build_recommendation_filters,
     build_recommendation_brief,
@@ -479,13 +479,18 @@ class FeedbackShortcutTests(unittest.TestCase):
 
     def test_graph_routes_the_entry_edge_both_ways(self):
         base = {"messages": [], "recommendation_state": self.STATE}
-        self.assertEqual(
-            _route_entry({**base, "messages": [HumanMessage(content="3")]}), "recommendation_agent"
-        )
+        self.assertEqual(_route_entry({**base, "messages": [HumanMessage(content="3")]}), FEEDBACK)
         self.assertEqual(
             _route_entry({**base, "messages": [HumanMessage(content="make it non-veg")]}),
-            "intent_discovery",
+            NEW_REQUEST,
         )
+
+    def test_entry_labels_are_wired_to_the_right_nodes(self):
+        """The router returns a reason, not a node name -- so the path map is
+        what actually decides where each reason goes. Check they line up."""
+        edges = {(e.source, e.target, getattr(e, "data", None)) for e in app.get_graph().edges}
+        self.assertIn(("__start__", "recommendation_agent", FEEDBACK), edges)
+        self.assertIn(("__start__", "intent_discovery", NEW_REQUEST), edges)
 
 
 if __name__ == "__main__":
