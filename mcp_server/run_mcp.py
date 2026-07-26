@@ -17,20 +17,28 @@ def recommendation(
     tags: str = None,
     dietary_type: str = None,
     meal_type: str = None,
+    course: str = None,
     max_price_inr: int = None,
 ) -> dict:
     """
     Get restaurant recommendations based on user inputs.
     Can accept cuisine, restaurant_name, or tags individually or in combination.
-    
+
     Args:
         cuisine: Type of cuisine (e.g., 'Italian', 'Chinese', 'Indian')
         restaurant_name: Name of the restaurant
-        tags: Food tags (e.g., 'pasta', 'pizza', 'noodles')
+        tags: Food tags (e.g., 'spicy', 'vegetarian;dessert'). Pass multiple
+            tags comma-separated (e.g., 'spicy,gluten-free') to require a dish
+            to carry all of them.
         dietary_type: Dietary type (for example, 'Veg' or 'Non-Veg')
         meal_type: Meal time (for example, 'Breakfast' or 'All Day')
+        course: What role the item plays in a meal -- 'main' (stands alone),
+            'side' (accompaniment, small plate, clear soup), 'dessert', or
+            'beverage'. Pass multiple comma-separated (e.g. 'main,side') to
+            allow any of them. Filter on 'main' when the user wants a meal,
+            so a coffee or a portion of naan is never offered as the answer.
         max_price_inr: Maximum item price in INR
-    
+
     Returns:
         dict: Filtered recommendations with restaurant details
     """
@@ -45,17 +53,32 @@ def recommendation(
         filtered_df = filtered_df[filtered_df['restaurant_name'].str.lower().str.contains(restaurant_name.lower(), na=False)]
     
     if tags:
-        filtered_df = filtered_df[filtered_df['tags'].str.lower().str.contains(tags.lower(), na=False)]
+        # Support comma-separated tags with AND semantics (a dish must carry
+        # every requested tag), while staying backward-compatible with a
+        # single free-text tag string (e.g. a craving phrase).
+        for tag in [t.strip() for t in tags.split(",") if t.strip()]:
+            filtered_df = filtered_df[filtered_df['tags'].str.lower().str.contains(tag.lower(), na=False)]
 
     if dietary_type:
-        filtered_df = filtered_df[
-            filtered_df['dietary_type'].str.lower().str.contains(dietary_type.lower(), na=False)
-        ]
+        # Exact match, not substring: dietary_type is a closed set ('Veg' /
+        # 'Non-Veg'), and .str.contains('veg') would also match 'non-veg'
+        # (it contains the substring 'veg'), silently letting a vegetarian
+        # request return meat dishes.
+        filtered_df = filtered_df[filtered_df['dietary_type'].str.lower() == dietary_type.lower()]
 
     if meal_type:
         filtered_df = filtered_df[
             filtered_df['meal_type'].str.lower().str.contains(meal_type.lower(), na=False)
         ]
+
+    # `course` is OR semantics (unlike tags): "main,side" means either is
+    # acceptable, because a caller widening the course is loosening a
+    # constraint, not adding one. Guarded on column presence so older menu
+    # files without the column keep working instead of raising KeyError.
+    if course and 'course' in filtered_df.columns:
+        wanted_courses = {c.strip().lower() for c in course.split(",") if c.strip()}
+        if wanted_courses:
+            filtered_df = filtered_df[filtered_df['course'].str.lower().isin(wanted_courses)]
 
     if max_price_inr is not None:
         filtered_df = filtered_df[filtered_df['price_inr'] <= max_price_inr]
@@ -98,6 +121,9 @@ def order_history(user_id: str) -> dict:
         on=["restaurant_name", "cuisine", "item_name"],
         how="left",
     )
+
+    user_orders["order_date"] = pd.to_datetime(user_orders["order_date"], errors="coerce")
+    user_orders = user_orders.sort_values("order_date", ascending=False, na_position="last").head(10)
 
     orders = user_orders[
         ["restaurant_name", "cuisine", "item_name", "meal_type", "tags"]
