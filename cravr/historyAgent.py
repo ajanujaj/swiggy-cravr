@@ -9,6 +9,7 @@ from typing import Any
 
 from fastmcp import Client
 
+from .debug_utils import debug
 from .state import CravrState
 
 
@@ -27,6 +28,7 @@ def fetch_order_history(user_id: str | None) -> dict[str, Any]:
     try:
         result = asyncio.run(_call_tool())
     except Exception as exc:  # pragma: no cover - exercised through runtime failures
+        debug("history_agent", f"MCP call FAILED ({type(exc).__name__}: {exc}) at {target_url}")
         return {"status": "error", "message": f"Unable to retrieve order history: {exc}"}
 
     if isinstance(result, dict):
@@ -52,4 +54,9 @@ def history_discovery_node(state: CravrState) -> dict:
     """Fetch order history for the current user and store it in state."""
     user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
     history_profile = fetch_order_history(user_id)
+    debug(
+        "history_agent",
+        f"user_id={user_id!r} status={history_profile.get('status')!r} "
+        f"orders={len(history_profile.get('orders') or [])}",
+    )
     return {"history_profile": history_profile, "user_id": user_id or "USR-001"}

@@ -1,81 +1,81 @@
-cuisine,restaurant_name,item_name,meal_type,dietary_type,price_inr,rating,tags
-North Indian,Punjab Grill,Butter Chicken,All Day,Non-Veg,420,4.5,high-protein;gluten-free
-North Indian,Punjab Grill,Paneer Tikka Masala,All Day,Veg,360,4.3,high-protein;vegetarian;gluten-free
-North Indian,Punjab Grill,Garlic Naan,All Day,Veg,75,4.4,vegetarian;comfort-food
-North Indian,Punjab Grill,Aloo Paratha,Breakfast,Veg,150,4.4,vegetarian;breakfast;high-fiber
-North Indian,Punjab Grill,Chole Bhature,Breakfast,Veg,180,4.3,vegetarian;breakfast;high-protein
-North Indian,The Great Kabab Factory,Dal Makhani,All Day,Veg,320,4.6,vegetarian;high-protein;high-fiber
-North Indian,The Great Kabab Factory,Chicken Biryani,All Day,Non-Veg,390,4.4,high-protein;one-pot-meal
-North Indian,The Great Kabab Factory,Seekh Kebab,All Day,Non-Veg,340,4.5,high-protein;low-carb
-North Indian,The Great Kabab Factory,Paneer Paratha,Breakfast,Veg,165,4.4,vegetarian;breakfast;high-protein
-North Indian,The Great Kabab Factory,Poha,Breakfast,Veg,130,4.2,vegetarian;breakfast;lightweight
-South Indian,Dakshin Delights,Masala Dosa,All Day,Veg,180,4.5,vegetarian;breakfast;lightweight
-South Indian,Dakshin Delights,Idli Vada Combo,All Day,Veg,145,4.3,vegetarian;breakfast
-South Indian,Dakshin Delights,Filter Coffee,All Day,Veg,70,4.6,vegetarian;breakfast;sugar-free-option
-South Indian,Dakshin Delights,Plain Idli,Breakfast,Veg,100,4.4,vegetarian;breakfast;lightweight;low-calorie
-South Indian,Dakshin Delights,Pongal,Breakfast,Veg,135,4.3,vegetarian;breakfast;comfort-food
-South Indian,Coastal Kitchen,Chettinad Chicken Curry,All Day,Non-Veg,360,4.4,high-protein;gluten-free
-South Indian,Coastal Kitchen,Appam with Veg Stew,All Day,Veg,240,4.2,vegetarian;breakfast;lightweight
-South Indian,Coastal Kitchen,Hyderabadi Veg Biryani,All Day,Veg,290,4.5,vegetarian;high-fiber
-South Indian,Coastal Kitchen,Appam with Egg Curry,Breakfast,Non-Veg,220,4.4,breakfast;high-protein
-South Indian,Coastal Kitchen,Medu Vada,Breakfast,Veg,110,4.3,vegetarian;breakfast
-Chinese,Wok This Way,Chilli Chicken,All Day,Non-Veg,310,4.4,high-protein
-Chinese,Wok This Way,Veg Hakka Noodles,All Day,Veg,240,4.3,vegetarian;vegan-option
-Chinese,Wok This Way,Chicken Fried Rice,All Day,Non-Veg,260,4.2,high-protein
-Chinese,Wok This Way,Veg Congee,Breakfast,Veg,180,4.2,vegetarian;vegan;breakfast;lightweight
-Chinese,Wok This Way,Chicken Congee,Breakfast,Non-Veg,210,4.3,high-protein;breakfast;lightweight
-Chinese,Dragon Bowl,Schezwan Paneer,All Day,Veg,280,4.5,vegetarian;high-protein
-Chinese,Dragon Bowl,Kung Pao Chicken,All Day,Non-Veg,330,4.4,high-protein
-Chinese,Dragon Bowl,Vegetable Spring Rolls,All Day,Veg,190,4.1,vegetarian;vegan
-Chinese,Dragon Bowl,Vegetable Bao,Breakfast,Veg,160,4.3,vegetarian;vegan;breakfast
-Chinese,Dragon Bowl,Chicken Bao,Breakfast,Non-Veg,190,4.4,high-protein;breakfast
-Italian,Olive Bistro,Margherita Pizza,All Day,Veg,350,4.5,vegetarian;comfort-food
-Italian,Olive Bistro,Spaghetti Aglio e Olio,All Day,Veg,320,4.3,vegetarian;vegan;lightweight
-Italian,Olive Bistro,Tiramisu,All Day,Veg,240,4.6,vegetarian;dessert
-Italian,Olive Bistro,Tomato Bruschetta,Breakfast,Veg,190,4.2,vegetarian;vegan;breakfast;lightweight
-Italian,Olive Bistro,Mushroom Omelette,Breakfast,Non-Veg,230,4.4,high-protein;breakfast;low-carb
-Italian,La Pino's Kitchen,Pepperoni Pizza,All Day,Non-Veg,460,4.4,high-protein;comfort-food
-Italian,La Pino's Kitchen,Creamy Mushroom Risotto,All Day,Veg,390,4.2,vegetarian;comfort-food
-Italian,La Pino's Kitchen,Garlic Breadsticks,All Day,Veg,160,4.3,vegetarian;comfort-food
-Italian,La Pino's Kitchen,Cheese Croissant,Breakfast,Veg,150,4.2,vegetarian;breakfast
-Italian,La Pino's Kitchen,Chicken Panini,Breakfast,Non-Veg,270,4.4,high-protein;breakfast
-Mexican,Taco Fiesta,Chicken Tacos,All Day,Non-Veg,290,4.4,high-protein
-Mexican,Taco Fiesta,Vegetarian Burrito Bowl,All Day,Veg,310,4.3,vegetarian;high-protein;high-fiber
-Mexican,Taco Fiesta,Nachos with Salsa,All Day,Veg,220,4.2,vegetarian;vegan
-Mexican,Taco Fiesta,Huevos Rancheros,Breakfast,Non-Veg,260,4.4,high-protein;breakfast
-Mexican,Taco Fiesta,Bean Breakfast Burrito,Breakfast,Veg,240,4.3,vegetarian;breakfast;high-protein;high-fiber
-Mexican,Chilli Bean,Chipotle Chicken Quesadilla,All Day,Non-Veg,340,4.5,high-protein
-Mexican,Chilli Bean,Bean and Cheese Enchiladas,All Day,Veg,300,4.3,vegetarian;high-protein
-Mexican,Chilli Bean,Churros,All Day,Veg,180,4.4,vegetarian;dessert
-Mexican,Chilli Bean,Veg Breakfast Tacos,Breakfast,Veg,220,4.2,vegetarian;vegan;breakfast
-Mexican,Chilli Bean,Chorizo Burrito,Breakfast,Non-Veg,280,4.4,high-protein;breakfast
-Japanese,Sakura House,Chicken Teriyaki Bowl,All Day,Non-Veg,420,4.4,high-protein
-Japanese,Sakura House,California Sushi Roll,All Day,Non-Veg,480,4.5,high-protein
-Japanese,Sakura House,Miso Soup,All Day,Veg,140,4.2,vegetarian;vegan;low-calorie
-Japanese,Sakura House,Tamago Rice Bowl,Breakfast,Non-Veg,260,4.3,high-protein;breakfast
-Japanese,Sakura House,Vegetable Onigiri,Breakfast,Veg,180,4.2,vegetarian;vegan;breakfast;lightweight
-Japanese,Tokyo Table,Spicy Tuna Maki,All Day,Non-Veg,520,4.5,high-protein
-Japanese,Tokyo Table,Veg Tempura,All Day,Veg,320,4.3,vegetarian
-Japanese,Tokyo Table,Ramen Noodle Bowl,All Day,Non-Veg,450,4.4,high-protein
-Japanese,Tokyo Table,Salmon Onigiri,Breakfast,Non-Veg,240,4.4,high-protein;breakfast;lightweight
-Japanese,Tokyo Table,Matcha Pancakes,Breakfast,Veg,220,4.5,vegetarian;breakfast
-Thai,Thai Basil,Green Curry with Rice,All Day,Veg,360,4.5,vegetarian;vegan;gluten-free
-Thai,Thai Basil,Pad Thai Noodles,All Day,Veg,340,4.4,vegetarian;vegan-option
-Thai,Thai Basil,Tom Yum Soup,All Day,Veg,220,4.3,vegetarian;vegan;low-calorie
-Thai,Thai Basil,Thai Omelette Rice,Breakfast,Non-Veg,230,4.3,high-protein;breakfast
-Thai,Thai Basil,Coconut Rice Porridge,Breakfast,Veg,190,4.2,vegetarian;vegan;breakfast;lightweight
-Thai,Lemongrass Kitchen,Red Curry Chicken,All Day,Non-Veg,390,4.4,high-protein;gluten-free
-Thai,Lemongrass Kitchen,Thai Basil Fried Rice,All Day,Veg,310,4.2,vegetarian;vegan-option
-Thai,Lemongrass Kitchen,Mango Sticky Rice,All Day,Veg,210,4.6,vegetarian;vegan;dessert
-Thai,Lemongrass Kitchen,Chicken Rice Soup,Breakfast,Non-Veg,240,4.4,high-protein;breakfast;lightweight
-Thai,Lemongrass Kitchen,Banana Coconut Pancakes,Breakfast,Veg,200,4.3,vegetarian;vegan;breakfast
-Continental,The European Plate,Grilled Chicken Steak,All Day,Non-Veg,480,4.5,high-protein;low-carb;gluten-free
-Continental,The European Plate,Herb Roasted Vegetables,All Day,Veg,260,4.2,vegetarian;vegan;low-calorie;organic
-Continental,The European Plate,Fish and Chips,All Day,Non-Veg,440,4.3,high-protein
-Continental,The European Plate,Classic Eggs Benedict,Breakfast,Non-Veg,320,4.5,high-protein;breakfast
-Continental,The European Plate,Granola Yogurt Bowl,Breakfast,Veg,220,4.3,vegetarian;breakfast;high-fiber;organic
-Continental,Cafe Boulevard,Chicken Caesar Salad,All Day,Non-Veg,350,4.4,high-protein;low-carb
-Continental,Cafe Boulevard,Classic Veg Burger,All Day,Veg,280,4.1,vegetarian;high-fiber
-Continental,Cafe Boulevard,Chocolate Brownie,All Day,Veg,190,4.5,vegetarian;dessert
-Continental,Cafe Boulevard,Avocado Toast,Breakfast,Veg,240,4.3,vegetarian;vegan-option;breakfast;organic
-Continental,Cafe Boulevard,Bacon and Eggs,Breakfast,Non-Veg,290,4.4,high-protein;breakfast;low-carb
+cuisine,restaurant_name,item_name,meal_type,course,dietary_type,price_inr,rating,tags
+North Indian,Punjab Grill,Butter Chicken,All Day,main,Non-Veg,420,4.5,high-protein;gluten-free;mild
+North Indian,Punjab Grill,Paneer Tikka Masala,All Day,main,Veg,360,4.3,high-protein;vegetarian;gluten-free;spicy
+North Indian,Punjab Grill,Garlic Naan,All Day,side,Veg,75,4.4,vegetarian;comfort-food;savory
+North Indian,Punjab Grill,Aloo Paratha,Breakfast,main,Veg,150,4.4,vegetarian;breakfast;high-fiber;mild
+North Indian,Punjab Grill,Chole Bhature,Breakfast,main,Veg,180,4.3,vegetarian;breakfast;high-protein;spicy
+North Indian,The Great Kabab Factory,Dal Makhani,All Day,main,Veg,320,4.6,vegetarian;high-protein;high-fiber;mild
+North Indian,The Great Kabab Factory,Chicken Biryani,All Day,main,Non-Veg,390,4.4,high-protein;one-pot-meal;spicy
+North Indian,The Great Kabab Factory,Seekh Kebab,All Day,main,Non-Veg,340,4.5,high-protein;low-carb;spicy
+North Indian,The Great Kabab Factory,Paneer Paratha,Breakfast,main,Veg,165,4.4,vegetarian;breakfast;high-protein;mild
+North Indian,The Great Kabab Factory,Poha,Breakfast,main,Veg,130,4.2,vegetarian;breakfast;lightweight;mild;tangy
+South Indian,Dakshin Delights,Masala Dosa,All Day,main,Veg,180,4.5,vegetarian;breakfast;lightweight;mild
+South Indian,Dakshin Delights,Idli Vada Combo,All Day,main,Veg,145,4.3,vegetarian;breakfast;mild
+South Indian,Dakshin Delights,Filter Coffee,All Day,beverage,Veg,70,4.6,vegetarian;breakfast;sugar-free-option;sweet
+South Indian,Dakshin Delights,Plain Idli,Breakfast,side,Veg,100,4.4,vegetarian;breakfast;lightweight;low-calorie;mild
+South Indian,Dakshin Delights,Pongal,Breakfast,main,Veg,135,4.3,vegetarian;breakfast;comfort-food;mild
+South Indian,Coastal Kitchen,Chettinad Chicken Curry,All Day,main,Non-Veg,360,4.4,high-protein;gluten-free;spicy
+South Indian,Coastal Kitchen,Appam with Veg Stew,All Day,main,Veg,240,4.2,vegetarian;breakfast;lightweight;mild
+South Indian,Coastal Kitchen,Hyderabadi Veg Biryani,All Day,main,Veg,290,4.5,vegetarian;high-fiber;spicy
+South Indian,Coastal Kitchen,Appam with Egg Curry,Breakfast,main,Non-Veg,220,4.4,breakfast;high-protein;mild
+South Indian,Coastal Kitchen,Medu Vada,Breakfast,side,Veg,110,4.3,vegetarian;breakfast;savory
+Chinese,Wok This Way,Chilli Chicken,All Day,main,Non-Veg,310,4.4,high-protein;spicy
+Chinese,Wok This Way,Veg Hakka Noodles,All Day,main,Veg,240,4.3,vegetarian;vegan-option;savory
+Chinese,Wok This Way,Chicken Fried Rice,All Day,main,Non-Veg,260,4.2,high-protein;savory
+Chinese,Wok This Way,Veg Congee,Breakfast,main,Veg,180,4.2,vegetarian;vegan;breakfast;lightweight;mild
+Chinese,Wok This Way,Chicken Congee,Breakfast,main,Non-Veg,210,4.3,high-protein;breakfast;lightweight;mild
+Chinese,Dragon Bowl,Schezwan Paneer,All Day,main,Veg,280,4.5,vegetarian;high-protein;spicy
+Chinese,Dragon Bowl,Kung Pao Chicken,All Day,main,Non-Veg,330,4.4,high-protein;spicy
+Chinese,Dragon Bowl,Vegetable Spring Rolls,All Day,side,Veg,190,4.1,vegetarian;vegan;savory
+Chinese,Dragon Bowl,Vegetable Bao,Breakfast,side,Veg,160,4.3,vegetarian;vegan;breakfast;mild
+Chinese,Dragon Bowl,Chicken Bao,Breakfast,side,Non-Veg,190,4.4,high-protein;breakfast;mild
+Italian,Olive Bistro,Margherita Pizza,All Day,main,Veg,350,4.5,vegetarian;comfort-food;savory
+Italian,Olive Bistro,Spaghetti Aglio e Olio,All Day,main,Veg,320,4.3,vegetarian;vegan;lightweight;savory
+Italian,Olive Bistro,Tiramisu,All Day,dessert,Veg,240,4.6,vegetarian;dessert;sweet
+Italian,Olive Bistro,Tomato Bruschetta,Breakfast,side,Veg,190,4.2,vegetarian;vegan;breakfast;lightweight;tangy
+Italian,Olive Bistro,Mushroom Omelette,Breakfast,main,Non-Veg,230,4.4,high-protein;breakfast;low-carb;savory
+Italian,La Pino's Kitchen,Pepperoni Pizza,All Day,main,Non-Veg,460,4.4,high-protein;comfort-food;savory
+Italian,La Pino's Kitchen,Creamy Mushroom Risotto,All Day,main,Veg,390,4.2,vegetarian;comfort-food;mild
+Italian,La Pino's Kitchen,Garlic Breadsticks,All Day,side,Veg,160,4.3,vegetarian;comfort-food;savory
+Italian,La Pino's Kitchen,Cheese Croissant,Breakfast,side,Veg,150,4.2,vegetarian;breakfast;mild
+Italian,La Pino's Kitchen,Chicken Panini,Breakfast,main,Non-Veg,270,4.4,high-protein;breakfast;savory
+Mexican,Taco Fiesta,Chicken Tacos,All Day,main,Non-Veg,290,4.4,high-protein;spicy
+Mexican,Taco Fiesta,Vegetarian Burrito Bowl,All Day,main,Veg,310,4.3,vegetarian;high-protein;high-fiber;mild
+Mexican,Taco Fiesta,Nachos with Salsa,All Day,side,Veg,220,4.2,vegetarian;vegan;spicy
+Mexican,Taco Fiesta,Huevos Rancheros,Breakfast,main,Non-Veg,260,4.4,high-protein;breakfast;spicy
+Mexican,Taco Fiesta,Bean Breakfast Burrito,Breakfast,main,Veg,240,4.3,vegetarian;breakfast;high-protein;high-fiber;mild
+Mexican,Chilli Bean,Chipotle Chicken Quesadilla,All Day,main,Non-Veg,340,4.5,high-protein;spicy
+Mexican,Chilli Bean,Bean and Cheese Enchiladas,All Day,main,Veg,300,4.3,vegetarian;high-protein;spicy
+Mexican,Chilli Bean,Churros,All Day,dessert,Veg,180,4.4,vegetarian;dessert;sweet
+Mexican,Chilli Bean,Veg Breakfast Tacos,Breakfast,main,Veg,220,4.2,vegetarian;vegan;breakfast;mild
+Mexican,Chilli Bean,Chorizo Burrito,Breakfast,main,Non-Veg,280,4.4,high-protein;breakfast;spicy
+Japanese,Sakura House,Chicken Teriyaki Bowl,All Day,main,Non-Veg,420,4.4,high-protein;savory
+Japanese,Sakura House,California Sushi Roll,All Day,main,Non-Veg,480,4.5,high-protein;mild
+Japanese,Sakura House,Miso Soup,All Day,side,Veg,140,4.2,vegetarian;vegan;low-calorie;savory
+Japanese,Sakura House,Tamago Rice Bowl,Breakfast,main,Non-Veg,260,4.3,high-protein;breakfast;mild
+Japanese,Sakura House,Vegetable Onigiri,Breakfast,side,Veg,180,4.2,vegetarian;vegan;breakfast;lightweight;mild
+Japanese,Tokyo Table,Spicy Tuna Maki,All Day,main,Non-Veg,520,4.5,high-protein;spicy
+Japanese,Tokyo Table,Veg Tempura,All Day,side,Veg,320,4.3,vegetarian;mild
+Japanese,Tokyo Table,Ramen Noodle Bowl,All Day,main,Non-Veg,450,4.4,high-protein;savory
+Japanese,Tokyo Table,Salmon Onigiri,Breakfast,side,Non-Veg,240,4.4,high-protein;breakfast;lightweight;mild
+Japanese,Tokyo Table,Matcha Pancakes,Breakfast,main,Veg,220,4.5,vegetarian;breakfast;sweet
+Thai,Thai Basil,Green Curry with Rice,All Day,main,Veg,360,4.5,vegetarian;vegan;gluten-free;spicy
+Thai,Thai Basil,Pad Thai Noodles,All Day,main,Veg,340,4.4,vegetarian;vegan-option;tangy
+Thai,Thai Basil,Tom Yum Soup,All Day,side,Veg,220,4.3,vegetarian;vegan;low-calorie;spicy;tangy
+Thai,Thai Basil,Thai Omelette Rice,Breakfast,main,Non-Veg,230,4.3,high-protein;breakfast;savory
+Thai,Thai Basil,Coconut Rice Porridge,Breakfast,main,Veg,190,4.2,vegetarian;vegan;breakfast;lightweight;sweet
+Thai,Lemongrass Kitchen,Red Curry Chicken,All Day,main,Non-Veg,390,4.4,high-protein;gluten-free;spicy
+Thai,Lemongrass Kitchen,Thai Basil Fried Rice,All Day,main,Veg,310,4.2,vegetarian;vegan-option;spicy
+Thai,Lemongrass Kitchen,Mango Sticky Rice,All Day,dessert,Veg,210,4.6,vegetarian;vegan;dessert;sweet
+Thai,Lemongrass Kitchen,Chicken Rice Soup,Breakfast,main,Non-Veg,240,4.4,high-protein;breakfast;lightweight;mild
+Thai,Lemongrass Kitchen,Banana Coconut Pancakes,Breakfast,main,Veg,200,4.3,vegetarian;vegan;breakfast;sweet
+Continental,The European Plate,Grilled Chicken Steak,All Day,main,Non-Veg,480,4.5,high-protein;low-carb;gluten-free;savory
+Continental,The European Plate,Herb Roasted Vegetables,All Day,side,Veg,260,4.2,vegetarian;vegan;low-calorie;organic;savory
+Continental,The European Plate,Fish and Chips,All Day,main,Non-Veg,440,4.3,high-protein;savory
+Continental,The European Plate,Classic Eggs Benedict,Breakfast,main,Non-Veg,320,4.5,high-protein;breakfast;savory
+Continental,The European Plate,Granola Yogurt Bowl,Breakfast,main,Veg,220,4.3,vegetarian;breakfast;high-fiber;organic;sweet
+Continental,Cafe Boulevard,Chicken Caesar Salad,All Day,main,Non-Veg,350,4.4,high-protein;low-carb;savory
+Continental,Cafe Boulevard,Classic Veg Burger,All Day,main,Veg,280,4.1,vegetarian;high-fiber;savory
+Continental,Cafe Boulevard,Chocolate Brownie,All Day,dessert,Veg,190,4.5,vegetarian;dessert;sweet
+Continental,Cafe Boulevard,Avocado Toast,Breakfast,main,Veg,240,4.3,vegetarian;vegan-option;breakfast;organic;savory
+Continental,Cafe Boulevard,Bacon and Eggs,Breakfast,main,Non-Veg,290,4.4,high-protein;breakfast;low-carb;savory

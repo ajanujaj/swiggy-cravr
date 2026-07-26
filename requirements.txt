@@ -3,3 +3,4 @@ fastmcp
 langchain
 langgraph
 langchain-ollama
+pydantic
