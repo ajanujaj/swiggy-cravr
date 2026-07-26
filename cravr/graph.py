@@ -13,6 +13,16 @@ from .RecommendAgent import is_pure_feedback, recommendation_agent_node
 from .state import CravrState
 
 
+# Router return values. These double as the conditional-edge labels in the
+# generated Mermaid diagram, so they're named for *why* the branch was taken
+# rather than for the node it lands on -- `draw_mermaid()` shows an unlabelled
+# dashed line when a path-map key is just the destination node's name.
+FEEDBACK = "feedback"
+NEW_REQUEST = "new_request"
+RECOMMEND = "recommend"
+NEEDS_MORE_INFO = "needs_more_info"
+
+
 def _route_entry(state: CravrState) -> str:
     """Send replies about the current suggestions straight to the recommender.
 
@@ -25,19 +35,19 @@ def _route_entry(state: CravrState) -> str:
     takes the full path so the profile is actually updated.
     """
     if is_pure_feedback(latest_user_text(state.get("messages") or []), state.get("recommendation_state")):
-        return "recommendation_agent"
-    return "intent_discovery"
+        return FEEDBACK
+    return NEW_REQUEST
 
 
 def _route_after_decision(state: CravrState) -> str:
     if state.get("ready_to_recommend"):
-        return "recommendation_agent"
+        return RECOMMEND
     if state.get("decision") == CLARIFY_AND_RETRY:
         # A clarification question was just answered (via interrupt/resume) —
         # loop back through intent/context discovery so the answer is folded
         # into the profiles by those nodes before deciding again.
-        return "intent_discovery"
-    return END
+        return CLARIFY_AND_RETRY
+    return NEEDS_MORE_INFO
 
 
 def build_graph():
@@ -52,7 +62,7 @@ def build_graph():
     workflow.add_conditional_edges(
         START,
         _route_entry,
-        {"intent_discovery": "intent_discovery", "recommendation_agent": "recommendation_agent"},
+        {FEEDBACK: "recommendation_agent", NEW_REQUEST: "intent_discovery"},
     )
     workflow.add_edge("intent_discovery", "history_discovery")
     # workflow.add_edge("context_discovery", "history_discovery")
@@ -60,7 +70,11 @@ def build_graph():
     workflow.add_conditional_edges(
         "decision_agent",
         _route_after_decision,
-        {"recommendation_agent": "recommendation_agent", "intent_discovery": "intent_discovery", END: END},
+        {
+            RECOMMEND: "recommendation_agent",
+            CLARIFY_AND_RETRY: "intent_discovery",
+            NEEDS_MORE_INFO: END,
+        },
     )
     workflow.add_edge("recommendation_agent", END)
     # A checkpointer is required so decision_agent_node can pause mid-graph
