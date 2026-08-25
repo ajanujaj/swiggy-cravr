@@ -25,23 +25,13 @@ from pydantic import BaseModel, Field
 class IntentExtraction(BaseModel):
     """Structured facts extracted from the user's food-ordering message(s)."""
 
-    mood: Optional[str] = None
-    hunger_level: Optional[Literal["low", "medium", "high"]] = None
-    occasion: Optional[str] = None
+    hunger_level: Optional[str] = Field(None, description="The user's hunger level, e.g. low, medium, high.")
+    meal_intent: Optional[str] = Field(None, description="The user's intent for the meal, e.g. breakfast, lunch, dinner, snack,late_night_craving, quick_bite, quick_lunch, celebration etc.")
     meal_time: Optional[str] = None
     craving: Optional[str] = None
+    craving_tag: Optional[str] = Field(None, description="A normalized tag for the craving, e.g. comfort-food, lightweight, high-protein, low-calorie, dessert. Leave null if none of them fit.")
+    flavor: Optional[str] = Field(None, description="A normalized tag for the craving, e.g. spicy, sweet, savory, etc.")
     cuisine: Optional[str] = None
-    taste_preference: list[Literal["spicy", "mild", "sweet", "savory", "tangy"]] = Field(
-        default_factory=list
-    )
-    dietary_preferences: list[str] = Field(default_factory=list)
-    allergies_or_avoidances: list[str] = Field(default_factory=list)
-    budget_inr: Optional[int] = None
-    minimum_rating: Optional[float] = None
-    delivery_preference: Optional[Literal["delivery", "dine_in"]] = None
-    location: Optional[str] = None
-    other_constraints: list[str] = Field(default_factory=list)
-
 
 class ContextExtraction(BaseModel):
     """Structured delivery-context facts extracted from the conversation."""

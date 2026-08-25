@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from cravr import client as client_module
-from cravr.historyAgent import history_discovery_node
+from cravr.history.historyAgent import history_discovery_node
 from mcp_server.run_mcp import order_history
 
 
@@ -28,7 +28,7 @@ class ClientTests(unittest.TestCase):
     def test_history_discovery_node_uses_order_history_tool(self):
         fake_history = {"status": "success", "count": 1, "orders": [{"restaurant_name": "Test Cafe"}]}
 
-        with patch("cravr.historyAgent.fetch_order_history", return_value=fake_history) as mock_fetch:
+        with patch("cravr.history.historyAgent.fetch_order_history", return_value=fake_history) as mock_fetch:
             result = history_discovery_node({
                 "messages": [{"role": "user", "content": "show me my last orders"}],
                 "intent_profile": {},

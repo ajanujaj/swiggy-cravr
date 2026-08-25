@@ -67,10 +67,17 @@ def main() -> None:
                 if isinstance(payload, dict):
                     question = payload.get("question")
                     source = payload.get("agent") or "assistant"
+                    options = payload.get("options") or []
                 else:
                     question = payload
                     source = "assistant"
+                    options = []
                 print(f"Assistant [{source}]:", question)
+                # Options are numbered so a one-keystroke reply works; the
+                # agents accept the number, the value or the label, so typing
+                # something else entirely is still fine.
+                for position, option in enumerate(options, start=1):
+                    print(f"    {position}. {option.get('label') or option.get('value')}")
                 clarification = input("You: ").strip()
                 try:
                     result = app.invoke(Command(resume=clarification), config=config)

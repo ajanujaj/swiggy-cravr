@@ -3,13 +3,12 @@
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from .intentAgent import intent_discovery_node
-from .ContextAgent import context_discovery_node
-from .historyAgent import history_discovery_node
-from .decisionAgent import CLARIFY_AND_RETRY, decision_agent_node
+from .context import context_discovery_node
+from .decision import CLARIFY_AND_RETRY, decision_agent_node
+from .history import history_discovery_node
+from .intent import intent_discovery_node
 from .profile_utils import latest_user_text
-from .RecommendAgent import is_pure_feedback, recommendation_agent_node
-# from ..cravrbacklog.orchestrator import orchestrator_node
+from .recommend import is_pure_feedback, recommendation_agent_node
 from .state import CravrState
 
 
@@ -55,28 +54,32 @@ def build_graph():
 
     workflow.add_node("intent_discovery", intent_discovery_node)
     # workflow.add_node("context_discovery", context_discovery_node)
-    workflow.add_node("history_discovery", history_discovery_node)
-    workflow.add_node("decision_agent", decision_agent_node)
-    workflow.add_node("recommendation_agent", recommendation_agent_node)
+    # workflow.add_node("history_discovery", history_discovery_node)
+    # workflow.add_node("decision_agent", decision_agent_node)
+    # workflow.add_node("recommendation_agent", recommendation_agent_node)
 
-    workflow.add_conditional_edges(
-        START,
-        _route_entry,
-        {FEEDBACK: "recommendation_agent", NEW_REQUEST: "intent_discovery"},
-    )
-    workflow.add_edge("intent_discovery", "history_discovery")
+    # workflow.add_conditional_edges(
+    #     START,
+    #     _route_entry,
+    #     {FEEDBACK: "recommendation_agent", NEW_REQUEST: "intent_discovery"},
+    # )
+    # workflow.add_edge("intent_discovery", "history_discovery")
     # workflow.add_edge("context_discovery", "history_discovery")
-    workflow.add_edge("history_discovery", "decision_agent")
-    workflow.add_conditional_edges(
-        "decision_agent",
-        _route_after_decision,
-        {
-            RECOMMEND: "recommendation_agent",
-            CLARIFY_AND_RETRY: "intent_discovery",
-            NEEDS_MORE_INFO: END,
-        },
-    )
-    workflow.add_edge("recommendation_agent", END)
+    # workflow.add_edge("history_discovery", "decision_agent")
+    # workflow.add_conditional_edges(
+    #     "decision_agent",
+    #     _route_after_decision,
+    #     {
+    #         RECOMMEND: "recommendation_agent",
+    #         CLARIFY_AND_RETRY: "intent_discovery",
+    #         NEEDS_MORE_INFO: END,
+    #     },
+    # )
+    # workflow.add_edge("recommendation_agent", END)
+
+    workflow.add_edge(START, "intent_discovery")
+    workflow.add_edge("intent_discovery", END)
+
     # A checkpointer is required so decision_agent_node can pause mid-graph
     # (via `interrupt()`) to ask the user a clarifying question, then resume
     # with just their answer instead of restarting the whole pipeline.

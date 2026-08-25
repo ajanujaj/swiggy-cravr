@@ -11,12 +11,15 @@ from cravr.schemas import IntentExtraction, ContextExtraction, DecisionOutput
 class ClarificationContextTests(unittest.TestCase):
     """Regression test for a live bug report: a bare clarification reply
     like "Indian" or "500" was never getting extracted into intent_profile
-    at all, round after round. Root cause: decision_agent_node recorded the
+    at all, round after round. Root cause: the asking node recorded the
     user's answer in `messages` but never the question that prompted it, so
     on the next round intent_discovery_node's LLM call saw an orphaned
     one-word message with zero context tying it to "what cuisine?" or
     "what's your budget?". This checks the question is now present in
     `messages` right before the answer, in the right role, after a resume.
+
+    Clarification has since moved into intent_discovery_node, so this now
+    exercises that node's interrupt loop end-to-end through the real graph.
     """
 
     def test_question_is_recorded_in_messages_alongside_the_answer(self):
@@ -27,7 +30,8 @@ class ClarificationContextTests(unittest.TestCase):
                 class Stub:
                     def invoke(self, messages):
                         if schema is IntentExtraction:
-                            return IntentExtraction(taste_preference=["spicy"])
+                            # A craving but no meal_intent, so intent asks.
+                            return IntentExtraction(craving="something spicy")
                         if schema is ContextExtraction:
                             return ContextExtraction()
                         return DecisionOutput(ready_to_recommend=False, decision="clarify")
@@ -35,9 +39,9 @@ class ClarificationContextTests(unittest.TestCase):
                 return Stub()
 
         stub = StubLLM()
-        with patch("cravr.intentAgent.get_llm", return_value=stub), \
-             patch("cravr.ContextAgent.get_llm", return_value=stub), \
-             patch("cravr.decisionAgent.get_llm", return_value=stub):
+        with patch("cravr.intent.intentAgent.get_llm", return_value=stub), \
+             patch("cravr.context.ContextAgent.get_llm", return_value=stub), \
+             patch("cravr.decision.decisionAgent.get_llm", return_value=stub):
             result = app.invoke(
                 {
                     "messages": [{"role": "user", "content": "I want something spicy"}],

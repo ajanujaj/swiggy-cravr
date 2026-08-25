@@ -9,8 +9,8 @@ from typing import Any
 
 from fastmcp import Client
 
-from .debug_utils import debug
-from .state import CravrState
+from ..debug_utils import debug
+from ..state import CravrState
 
 
 DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")

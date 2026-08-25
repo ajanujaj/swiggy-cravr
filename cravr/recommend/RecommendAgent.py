@@ -12,11 +12,11 @@ from typing import Any
 from fastmcp import Client
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from .debug_utils import debug
-from .intentAgent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
-from .llm import get_llm
-from .profile_utils import latest_user_text
-from .state import CravrState
+from ..debug_utils import debug
+from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
+from ..llm import get_llm
+from ..profile_utils import latest_user_text
+from ..state import CravrState
 
 
 DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")

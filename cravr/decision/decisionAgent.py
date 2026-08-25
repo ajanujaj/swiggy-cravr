@@ -6,14 +6,13 @@ import json
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langgraph.types import interrupt
 
-from .RecommendAgent import build_recommendation_brief
-from .debug_utils import debug
-from .llm import get_llm
-from .profile_utils import latest_user_text
-from .schemas import DecisionOutput
-from .state import CravrState
+from ..debug_utils import debug
+from ..llm import get_llm
+from ..profile_utils import latest_user_text
+from ..recommend import build_recommendation_brief
+from ..schemas import DecisionOutput
+from ..state import CravrState
 
 
 # `decision` value that tells graph.py to route back to intent_discovery
@@ -251,13 +250,16 @@ def _needs_clarification(user_input: str, intent_profile: dict, context_profile:
 
 
 def _has_usable_signal(intent_profile: dict) -> bool:
-    """True when the profile carries at least one thing we can filter a menu on."""
+    """True when the profile carries at least one thing we can filter a menu on.
+
+    Tracks `IntentExtraction`: craving/cuisine/craving_tag are the filterable
+    fields. `meal_intent` alone does not count -- "dinner" narrows nothing on
+    its own, since 48 of the 80 menu rows are All Day.
+    """
     return bool(
         intent_profile.get("craving")
         or intent_profile.get("cuisine")
-        or intent_profile.get("taste_preference")
-        or intent_profile.get("dietary_preferences")
-        or intent_profile.get("budget_inr") is not None
+        or intent_profile.get("craving_tag")
     )
 
 
@@ -277,23 +279,18 @@ def _next_clarification_question(intent_profile: dict, context_profile: dict) ->
 
 
 def decision_agent_node(state: CravrState) -> dict:
-    """Decide whether the bot can recommend now.
+    """Judge whether the bot can recommend now. This node never asks.
 
-    Whenever required information is missing, this node pauses the graph with
-    LangGraph's `interrupt()` and asks the user a *specific* question (e.g.
-    "What's your budget for this order in INR?") instead of a generic
-    clarification message, then routes back to `intent_discovery` (via
-    `CLARIFY_AND_RETRY`) so the answer is folded into the profiles by the
-    normal, reliably-committed graph nodes.
+    `intent_discovery_node` owns clarification: by the time control reaches
+    here the user has already been asked about every gap intent could name, up
+    to its own round budget. Asking again from a second node would mean two
+    interrupt sites competing over one conversation -- the user answering the
+    same gap twice, and two independent round budgets neither of which knows
+    about the other.
 
-    Important: this node calls `interrupt()` at most once per execution.
-    LangGraph re-executes a node's code from the top on every resume, so
-    looping through multiple `interrupt()` calls *within one node call* would
-    re-derive the merged profile from the last checkpointed (stale) state on
-    every resume and silently drop facts learned in earlier rounds. Doing one
-    round per full graph pass avoids that: each round's profile update is
-    committed by intent_discovery_node/context_discovery_node before this
-    node runs again.
+    So a gap that survives intent is not a reason to stop; it is a reason to
+    recommend loosely and let the user steer. The only genuine dead end is a
+    profile with nothing filterable in it at all.
     """
     intent_profile = _coerce_profile(state.get("intent_profile"))
     context_profile = _coerce_profile(state.get("context_profile"))
@@ -305,55 +302,10 @@ def decision_agent_node(state: CravrState) -> dict:
     debug("decision_agent", f"user_input={user_input!r}")
     debug("decision_agent", f"intent_profile={intent_profile}")
     debug("decision_agent", f"context_profile={context_profile}")
-    debug("decision_agent", f"clarification_rounds so far={state.get('clarification_rounds') or 0}")
-
-    asked_fields = list(state.get("asked_clarification_fields") or [])
-    exhausted = False
-
-    if _needs_clarification(user_input, intent_profile, context_profile):
-        rounds = int(state.get("clarification_rounds") or 0)
-        field, question = _next_clarification(intent_profile, context_profile, asked_fields)
-        debug("decision_agent", f"needs_clarification=True (already asked: {asked_fields})")
-
-        if field is None:
-            # Every gap has already been put to the user once. Asking again
-            # would just repeat ourselves, so proceed with what we have.
-            debug("decision_agent", "no unasked gaps left — proceeding with the profile as-is")
-            exhausted = True
-        elif rounds >= MAX_CLARIFICATION_ROUNDS:
-            debug("decision_agent", f"MAX_CLARIFICATION_ROUNDS ({MAX_CLARIFICATION_ROUNDS}) reached — proceeding anyway")
-            exhausted = True
-        else:
-            debug(
-                "decision_agent",
-                f"asking (round {rounds + 1}/{MAX_CLARIFICATION_ROUNDS}) about {field!r}: {question!r}",
-            )
-            answer = interrupt({
-                "question": question,
-                "agent": "decision_agent",
-                "field": field,
-                "intent_profile": intent_profile,
-                "context_profile": context_profile,
-            })
-            debug("decision_agent", f"got answer for {field!r}: {answer!r}")
-            return {
-                # The question itself must also land in `messages`, not just
-                # the answer -- a bare reply like "Indian" or "500" carries no
-                # context when intent_discovery_node re-reads the history.
-                # `pending_clarification_field` is the belt-and-braces version
-                # of that: it lets intent_discovery apply the answer to the
-                # right field without the model having to infer anything.
-                "messages": [
-                    AIMessage(content=question, name="decision_agent"),
-                    HumanMessage(content=str(answer)),
-                ],
-                "ready_to_recommend": False,
-                "decision": CLARIFY_AND_RETRY,
-                "summary": summary,
-                "clarification_rounds": rounds + 1,
-                "pending_clarification_field": field,
-                "asked_clarification_fields": asked_fields + [field],
-            }
+    # Whatever intent could not fill, it has already asked about and given up
+    # on. Treat that as spent rather than as a fresh reason to interrogate.
+    exhausted = bool(intent_profile.get("important_missing_information"))
+    debug("decision_agent", f"gaps left by intent={intent_profile.get('important_missing_information')}")
 
     debug("decision_agent", f"asking the decision LLM (exhausted={exhausted})")
     payload = {

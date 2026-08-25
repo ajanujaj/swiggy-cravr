@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from langchain_core.messages import SystemMessage
 
-from .debug_utils import debug
-from .llm import get_llm
-from .profile_utils import merge_profile
-from .schemas import ContextExtraction
-from .state import CravrState
+from ..debug_utils import debug
+from ..llm import get_llm
+from ..profile_utils import merge_profile
+from ..schemas import ContextExtraction
+from ..state import CravrState
 
 
 CONTEXT_DISCOVERY_PROMPT = """
