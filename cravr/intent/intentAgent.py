@@ -26,87 +26,23 @@ from .meal_clock import (
     meal_intent_question,
     resolve_meal_intent,
 )
-
-
-INTENT_DISCOVERY_PROMPT = """
-You are Cravr's Intent Discovery agent. Analyze the user's food-ordering message(s).
-You are not a conversational assistant: do not recommend food and do not ask a
-question. Extract only facts explicitly stated or safely implied by the message.
-Use null/empty values for anything not mentioned. Never fabricate values.
-
-Field notes:
-- meal_intent: what the user wants this order to BE -- breakfast, lunch, dinner,
-  snack, quick_bite, quick_lunch, late_night_craving, celebration. Only set it
-  when the user says or clearly implies it; do not infer it from the clock.
-- craving: the dish or food the user named, in their own words ("biryani",
-  "something with paneer"). Free text.
-- flavor: normalize the craving/flavour onto exactly one of: spicy, mild,
-  sweet, savory, tangy, comfort-food, lightweight, high-protein, low-calorie,
-  dessert. Leave null if none of them fit.
-- cuisine: e.g. North Indian, Chinese, Italian, Thai.
-- hunger_level: low, medium or high -- only when stated ("starving", "not very
-  hungry").
-
-Users describe flavour in many ways; match intent, not the literal word:
-- spicy: "spicy", "hot", "extra hot", "fiery", "with chilli", "make it hot"
-- mild: "mild", "not spicy", "less spicy", "no chilli", "nothing too hot"
-- sweet: "sweet", "sweet tooth", "something sugary", "sweet treat"
-- savory: "savory", "salty", "umami", "hearty"
-- tangy: "tangy", "tart", "sour", "citrusy", "zesty"
-Never guess a flavour the user did not express.
-""".strip()
-
-
-MAX_INTENT_CLARIFICATION_ROUNDS = 3
-
-KNOWN_CUISINE_WORDS = (
-    "north indian", "south indian", "indian", "chinese", "italian", "mexican",
-    "japanese", "thai", "continental", "punjabi", "mughlai", "asian",
+from .meal_utils import (
+    CRAVING_TAG_CUES,
+    HUNGER_BY_INTENT,
+    KNOWN_CUISINE_WORDS,
+    MILD_PATTERN,
+    MILD_WORDS,
+    NO_PREFERENCE_ANSWERS,
+    REQUIRED_FIELDS,
+    TASTE_CUES,
+    VEG_ANSWERS,
+    NON_VEG_ANSWERS,
+    DEFAULT_HUNGER,
+    MAX_INTENT_CLARIFICATION_ROUNDS,
 )
 
-NO_PREFERENCE_ANSWERS = (
-    "anything", "any", "no preference", "nothing", "none", "doesn't matter",
-    "does not matter", "dont matter", "don't matter", "you decide", "you choose",
-    "surprise me", "whatever", "up to you", "no idea", "not sure", "idk",
-)
+from .prompt import INTENT_DISCOVERY_PROMPT
 
-TASTE_CUES = {
-    "spicy": ("spicy", "hot", "fiery", "chilli", "chili", "masala"),
-    "sweet": ("sweet", "sugary", "sweet tooth"),
-    "savory": ("savory", "savoury", "salty", "umami", "hearty"),
-    "tangy": ("tangy", "tart", "sour", "citrusy", "zesty"),
-}
-
-MILD_PATTERN = re.compile(
-    r"\b(?:not|no|nothing|less|avoid|without)\s+(?:too\s+|very\s+)?(?:spicy|hot|chill?i)\b"
-)
-MILD_WORDS = ("mild", "bland")
-
-VEG_ANSWERS = ("vegetarian", "veg", "pure veg", "no meat", "veggie")
-NON_VEG_ANSWERS = ("non-veg", "non veg", "nonveg", "non-vegetarian", "non vegetarian",
-                   "meat", "chicken", "mutton", "fish", "egg", "eggetarian")
-
-CRAVING_TAG_CUES = {
-    "comfort-food": ("comfort", "homely", "home food", "cosy", "cozy"),
-    "lightweight": ("light", "lightweight"),
-    "high-protein": ("protein", "high protein"),
-    "low-calorie": ("low calorie", "low-cal", "diet", "healthy"),
-    "dessert": ("dessert", "pudding", "cake", "ice cream", "brownie", "pastry"),
-}
-
-HUNGER_BY_INTENT = {
-    "breakfast": "medium",
-    "lunch": "high",
-    "quick_lunch": "medium",
-    "dinner": "high",
-    "celebration": "high",
-    "snack": "low",
-    "quick_bite": "low",
-    "late_night_craving": "low",
-}
-DEFAULT_HUNGER = "medium"
-
-REQUIRED_FIELDS = ("meal_intent", "craving_or_cuisine")
 
 
 def _is_no_preference(answer: str) -> bool:
@@ -208,14 +144,34 @@ def _missing_fields(profile: dict) -> list[str]:
     return missing
 
 
-def _question_for(field: str, now: datetime | None = None) -> tuple[str, list[dict]]:
+def _question_for(
+    field: str, now: datetime | None = None, profile: dict | None = None
+) -> tuple[str, list[dict]]:
     """The question to ask for a field, plus any options to offer."""
     if field == "meal_intent":
         return meal_intent_question(now), meal_intent_options(now)
     if field == "craving_or_cuisine":
+        meal_intent = (profile or {}).get("meal_intent")
+        follow_ups = {
+            "late_night_craving": (
+                "Late-night craving it is. What sounds good — a dish, cuisine, "
+                "or flavour such as spicy or sweet?"
+            ),
+            "snack": (
+                "Snack it is. What are you in the mood for — a dish, cuisine, "
+                "or flavour such as spicy or sweet?"
+            ),
+            "quick_bite": (
+                "Something quick it is. What would you like — a dish, cuisine, "
+                "or flavour such as spicy or sweet?"
+            ),
+        }
         return (
-            "What are you in the mood for — a dish, a cuisine, or just a flavour "
-            "like spicy or sweet?",
+            follow_ups.get(
+                meal_intent,
+                "What are you in the mood for — a dish, a cuisine, or just a flavour "
+                "like spicy or sweet?",
+            ),
             [],
         )
     return f"Could you tell me a bit more about {field.replace('_', ' ')}?", []
@@ -286,15 +242,23 @@ def intent_discovery_node(state: CravrState) -> dict:
     """
     now = datetime.now()
 
-    try:
-        structured_llm = get_llm().with_structured_output(IntentExtraction)
-        extraction = structured_llm.invoke(
-            [SystemMessage(content=INTENT_DISCOVERY_PROMPT), *state["messages"]]
-        )
-        extracted = extraction.model_dump()
-        debug("intent_agent", f"structured extraction={extracted}")
-    except Exception as exc:
-        debug("intent_agent", f"structured output call failed ({exc}) — treating as no new information")
+    # The CLI intentionally starts with no user message so it can offer a
+    # meal choice first. Never ask the extraction model to infer preferences
+    # from that empty conversation: some models invent a craving, which skips
+    # the next question entirely.
+    if state.get("messages"):
+        try:
+            structured_llm = get_llm().with_structured_output(IntentExtraction)
+            llm_messages = [SystemMessage(content=INTENT_DISCOVERY_PROMPT), *state["messages"]]
+            debug("intent_agent", f"LLM request messages={llm_messages!r}")
+            extraction = structured_llm.invoke(llm_messages)
+            extracted = extraction.model_dump()
+            debug("intent_agent", f"LLM response structured extraction={extracted}")
+        except Exception as exc:
+            debug("intent_agent", f"structured output call failed ({exc}) — treating as no new information")
+            extracted = {}
+    else:
+        debug("intent_agent", "LLM extraction skipped: no user message yet")
         extracted = {}
 
     merged = merge_profile(state.get("intent_profile"), extracted)
@@ -315,7 +279,7 @@ def intent_discovery_node(state: CravrState) -> dict:
             break
 
         field = pending[0]
-        question, options = _question_for(field, now)
+        question, options = _question_for(field, now, profile)
         debug("intent_agent", f"asking (round {round_number}) about {field!r}: {question!r}")
 
         answer = interrupt({
@@ -336,13 +300,16 @@ def intent_discovery_node(state: CravrState) -> dict:
         transcript.append(HumanMessage(content=str(answer)))
 
         profile = _derive(_apply_answer(profile, field, str(answer), now), now)
+        
         debug("intent_agent", f"profile after {field!r}={profile}")
 
     still_missing = _missing_fields(profile)
     if still_missing:
         debug("intent_agent", f"proceeding with gaps remaining: {still_missing}")
     profile["important_missing_information"] = still_missing
-    profile["clarification_questions"] = [_question_for(f, now)[0] for f in still_missing]
+    profile["clarification_questions"] = [
+        _question_for(field, now, profile)[0] for field in still_missing
+    ]
 
     updates: dict = {"intent_profile": profile}
     if transcript:

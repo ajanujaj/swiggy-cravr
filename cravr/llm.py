@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .debug_utils import debug
+
 _llm: Any | None = None
 
 # llama3.2:1b is too small to reliably follow structured-output/JSON
@@ -26,4 +28,5 @@ def get_llm() -> Any:
             raise RuntimeError("Install requirements.txt to run Cravr's local Llama chat agent.") from error
         model_name = os.getenv("CRAVR_MODEL", DEFAULT_MODEL)
         _llm = ChatOllama(model=model_name, temperature=0.3)
+        debug("llm", f"created ChatOllama model={model_name!r} temperature=0.3")
     return _llm

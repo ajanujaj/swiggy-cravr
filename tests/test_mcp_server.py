@@ -87,6 +87,7 @@ class OrderHistoryTests(unittest.TestCase):
                     "item_name": "Butter Chicken",
                     "meal_type": "All Day",
                     "order_date": "2026-01-12",
+                    "order_time": "20:14",
                     "quantity": 1,
                     "unit_price_inr": 420,
                     "line_total_inr": 420,
@@ -103,6 +104,8 @@ class OrderHistoryTests(unittest.TestCase):
         self.assertEqual(result["orders"][0]["cuisine"], "North Indian")
         self.assertEqual(result["orders"][0]["item_name"], "Butter Chicken")
         self.assertEqual(result["orders"][0]["meal_type"], "All Day")
+        self.assertEqual(result["orders"][0]["order_date"], "2026-01-12")
+        self.assertEqual(result["orders"][0]["order_time"], "20:14")
         self.assertEqual(result["orders"][0]["tags"], "high-protein")
         self.assertNotIn("price_inr", result["orders"][0])
         self.assertNotIn("rating", result["orders"][0])
@@ -134,6 +137,7 @@ class OrderHistoryTests(unittest.TestCase):
                     "order_status": "Delivered",
                     "meal_type": "Dinner",
                     "order_date": f"2024-01-{i:02d}",
+                    "order_time": "20:00",
                 }
                 for i in range(1, 13)
             ]

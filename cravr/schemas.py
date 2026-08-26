@@ -38,6 +38,8 @@ class ContextExtraction(BaseModel):
 
     location: Optional[str] = None
     weather: Optional[str] = None
+    delivery_area: Optional[str] = None
+    max_delivery_minutes: Optional[int] = "under 30 minutes"
 
 
 class DecisionOutput(BaseModel):

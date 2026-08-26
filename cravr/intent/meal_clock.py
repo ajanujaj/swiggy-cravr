@@ -1,92 +1,6 @@
-"""Clock-driven meal windows.
-
-`meal_intent` is the one required field the user should almost never have to
-*type*. The wall clock already narrows it to two or three plausible answers --
-at 10pm nobody is ordering breakfast -- so this module turns the current time
-into a short menu of choices instead of an open question.
-
-Deliberately pure and dependency-free: it takes a `datetime` (defaulting to
-now) and returns data. No LLM, no state, no I/O -- which is what makes the
-window boundaries testable at 05:00:00 and 04:59:59 rather than "whenever the
-suite happens to run".
-"""
-
 from __future__ import annotations
-
-from dataclasses import dataclass
-from datetime import datetime, time
-
-
-@dataclass(frozen=True)
-class MealWindow:
-    """One slice of the day and the meal intents plausible inside it."""
-
-    name: str
-    start: time
-    end: time
-    # First option is the "obvious" answer for this window and is used as the
-    # fallback when the user's reply can't be matched to anything.
-    options: tuple[tuple[str, str], ...]  # (value, human label)
-
-    @property
-    def default_intent(self) -> str:
-        return self.options[0][0]
-
-    def spans_midnight(self) -> bool:
-        return self.start > self.end
-
-
-# Ordered windows covering all 24 hours. The late-night window wraps midnight,
-# which is why containment is checked with an explicit `spans_midnight` branch
-# rather than a naive `start <= t <= end`.
-#
-# The option sets encode a real asymmetry: at lunch and dinner the user might
-# want a full meal OR something small, but at 3pm "lunch" is no longer on the
-# table. Offering an impossible option is worse than offering fewer.
-MEAL_WINDOWS: tuple[MealWindow, ...] = (
-    MealWindow(
-        name="breakfast",
-        start=time(5, 0),
-        end=time(10, 29),
-        options=(("breakfast", "Breakfast"), ("quick_bite", "Just a quick bite")),
-    ),
-    MealWindow(
-        name="lunch",
-        start=time(10, 30),
-        end=time(15, 29),
-        options=(
-            ("lunch", "Lunch"),
-            ("quick_lunch", "A quick lunch"),
-            ("snack", "Something snacky"),
-        ),
-    ),
-    MealWindow(
-        name="evening",
-        start=time(15, 30),
-        end=time(18, 59),
-        options=(("snack", "An evening snack"), ("quick_bite", "Just a quick bite")),
-    ),
-    MealWindow(
-        name="dinner",
-        start=time(19, 0),
-        end=time(22, 59),
-        options=(
-            ("dinner", "Dinner"),
-            ("quick_bite", "Something quick"),
-            ("snack", "Just a snack"),
-        ),
-    ),
-    MealWindow(
-        name="late_night",
-        start=time(23, 0),
-        end=time(4, 59),
-        options=(
-            ("late_night_craving", "A late-night craving"),
-            ("snack", "Just a snack"),
-            ("quick_bite", "Something quick"),
-        ),
-    ),
-)
+from datetime import datetime
+from .meal_utils import MealWindow, MEAL_WINDOWS
 
 
 def current_meal_window(now: datetime | None = None) -> MealWindow:
@@ -99,9 +13,7 @@ def current_meal_window(now: datetime | None = None) -> MealWindow:
                 return window
         elif window.start <= moment <= window.end:
             return window
-
-    # Unreachable while the windows tile the full 24 hours, but a silent
-    # KeyError at 3am is a bad way to find out someone edited the table.
+        
     raise ValueError(f"No meal window covers {moment!r}; MEAL_WINDOWS has a gap.")
 
 
@@ -178,11 +90,6 @@ def resolve_meal_intent(answer: str, now: datetime | None = None) -> str | None:
 
     return None
 
-
-# What the menu can actually filter on. `menu.csv`'s `meal_type` column holds
-# only "Breakfast" (32 rows) and "All Day" (48), so breakfast is the single
-# meal_type worth constraining on -- and only in the morning. Every other
-# window would either match everything or wrongly exclude the All Day items.
 def menu_meal_type(meal_intent: str | None, now: datetime | None = None) -> str | None:
     """Translate a meal_intent into the menu's `meal_type`, or None for no filter."""
     if (meal_intent or "").strip().lower() == "breakfast":
