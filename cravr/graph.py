@@ -5,7 +5,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .context import context_discovery_node
 from .decision import CLARIFY_AND_RETRY, decision_agent_node
-from .history import history_discovery_node
+from .userPreference import user_preference_node
 from .intent import intent_discovery_node
 from .profile_utils import latest_user_text
 from .recommend import is_pure_feedback, recommendation_agent_node
@@ -52,33 +52,33 @@ def _route_after_decision(state: CravrState) -> str:
 def build_graph():
     workflow = StateGraph(CravrState)
 
+    workflow.add_node("user_preference", user_preference_node)
+    workflow.add_node("context_discovery", context_discovery_node)
     workflow.add_node("intent_discovery", intent_discovery_node)
-    # workflow.add_node("context_discovery", context_discovery_node)
-    # workflow.add_node("history_discovery", history_discovery_node)
-    # workflow.add_node("decision_agent", decision_agent_node)
-    # workflow.add_node("recommendation_agent", recommendation_agent_node)
+    workflow.add_node("decision_agent", decision_agent_node)
+    workflow.add_node("recommendation_agent", recommendation_agent_node)
 
-    # workflow.add_conditional_edges(
-    #     START,
-    #     _route_entry,
-    #     {FEEDBACK: "recommendation_agent", NEW_REQUEST: "intent_discovery"},
-    # )
-    # workflow.add_edge("intent_discovery", "history_discovery")
-    # workflow.add_edge("context_discovery", "history_discovery")
-    # workflow.add_edge("history_discovery", "decision_agent")
-    # workflow.add_conditional_edges(
-    #     "decision_agent",
-    #     _route_after_decision,
-    #     {
-    #         RECOMMEND: "recommendation_agent",
-    #         CLARIFY_AND_RETRY: "intent_discovery",
-    #         NEEDS_MORE_INFO: END,
-    #     },
-    # )
-    # workflow.add_edge("recommendation_agent", END)
-
-    workflow.add_edge(START, "intent_discovery")
-    workflow.add_edge("intent_discovery", END)
+    workflow.add_conditional_edges(
+        START,
+        _route_entry,
+        {FEEDBACK: "recommendation_agent", NEW_REQUEST: "user_preference"},
+    )
+    # New requests first load the durable user profile and recent order
+    # history, then enrich delivery context, and only then interpret the
+    # request itself.
+    workflow.add_edge("user_preference", "context_discovery")
+    workflow.add_edge("context_discovery", "intent_discovery")
+    workflow.add_edge("intent_discovery", "decision_agent")
+    workflow.add_conditional_edges(
+        "decision_agent",
+        _route_after_decision,
+        {
+            RECOMMEND: "recommendation_agent",
+            CLARIFY_AND_RETRY: "intent_discovery",
+            NEEDS_MORE_INFO: END,
+        },
+    )
+    workflow.add_edge("recommendation_agent", END)
 
     # A checkpointer is required so decision_agent_node can pause mid-graph
     # (via `interrupt()`) to ask the user a clarifying question, then resume

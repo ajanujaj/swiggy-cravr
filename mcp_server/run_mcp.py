@@ -8,7 +8,7 @@ app = FastMCP("recommendation-server")
 DATA_DIR = Path(__file__).resolve().parent / "data"
 recommendations_data = pd.read_csv(DATA_DIR / "menu.csv")
 order_history_data = pd.read_csv(DATA_DIR / "order_history.csv")
-user_preferences_data = pd.read_csv(DATA_DIR / "user_preferences.csv")
+user_data = pd.read_csv(DATA_DIR / "user.csv")
 
 @app.tool()
 def recommendation(
@@ -147,17 +147,45 @@ def user_preferences(user_id: str) -> dict:
         user_id: Unique identifier for the user
     """
 
-    user_prefs = user_preferences_data[user_preferences_data['user_id'] == user_id]
+    user_prefs = user_data[user_data['user_id'] == user_id]
 
     if user_prefs.empty:
         return {"status": "no_results", "message": "No user preferences found for the given user ID"}
 
     preferences = user_prefs[
-        ["default_budget_inr", "dietary_preference","allergies"]
-    ].to_dict("records")
+        [
+            "default_budget_inr",
+            "dietary_preference",
+            "allergies",
+            "preferred_cuisines",
+            "preferred_flavors",
+        ]
+    ].iloc[0].to_dict()
 
     return {
+        "status": "success",
+        "user_id": user_id,
         "preferences": preferences
+    }
+
+
+@app.tool()
+def user_location(user_id: str) -> dict:
+    """Get the saved city and delivery area for a user.
+
+    This is intentionally separate from ``user_preferences`` so the context
+    agent can obtain delivery context without handling dietary or budget data.
+    """
+    user = user_data[user_data["user_id"] == user_id]
+    if user.empty:
+        return {"status": "no_results", "message": "No saved location found for the given user ID"}
+
+    location = user[["default_city", "default_delivery_area"]].iloc[0].to_dict()
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "location": location["default_city"],
+        "delivery_area": location["default_delivery_area"],
     }
 
 

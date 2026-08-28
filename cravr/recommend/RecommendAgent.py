@@ -334,8 +334,30 @@ def _brief_summary(filters: dict[str, Any], history: dict[str, Any]) -> str:
     return "; ".join(parts) + "."
 
 
+def _apply_saved_preferences(
+    intent_profile: dict[str, Any], preference_profile: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Apply durable defaults only where this request did not specify one."""
+    merged = dict(intent_profile)
+    preferences = _coerce_profile(preference_profile).get("preferences") or {}
+    # Support the older MCP response shape while clients migrate to one
+    # profile object per user.
+    if isinstance(preferences, list):
+        preferences = preferences[0] if preferences else {}
+    if not isinstance(preferences, dict):
+        return merged
+
+    if merged.get("budget_inr") is None and preferences.get("default_budget_inr") is not None:
+        merged["budget_inr"] = preferences["default_budget_inr"]
+    if not merged.get("dietary_preferences") and preferences.get("dietary_preference"):
+        merged["dietary_preferences"] = [preferences["dietary_preference"]]
+    return merged
+
+
 def build_recommendation_brief(
-    intent_profile: dict[str, Any], history_profile: dict[str, Any]
+    intent_profile: dict[str, Any],
+    history_profile: dict[str, Any],
+    preference_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Freeze a request into everything the recommender needs, and nothing more.
 
@@ -344,7 +366,10 @@ def build_recommendation_brief(
     vocabulary, tag vocabulary, course inference) happens exactly once, rather
     than being re-derived -- or worse, re-parsed out of prose -- downstream.
     """
-    filters = _build_recommendation_filters(_coerce_profile(intent_profile))
+    effective_intent = _apply_saved_preferences(
+        _coerce_profile(intent_profile), preference_profile
+    )
+    filters = _build_recommendation_filters(effective_intent)
     history = _summarise_history(_coerce_profile(history_profile))
     return {"filters": filters, "history": history, "summary": _brief_summary(filters, history)}
 

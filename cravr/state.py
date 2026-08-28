@@ -10,7 +10,12 @@ class CravrState(TypedDict):
 
     messages: Annotated[list, add_messages]
     intent_profile: dict
-    # context_profile: dict | None
+    # Ambient facts pulled from MCP (e.g. saved delivery location). These are
+    # never user-facing requirements.
+    context_profile: dict
+    # Persistent dietary/budget/allergy preferences returned by the user
+    # profile MCP endpoint.
+    preference_profile: dict
     history_profile: dict
     user_id: str
     recommendation_state: dict

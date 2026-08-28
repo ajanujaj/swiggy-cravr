@@ -151,5 +151,21 @@ class OrderHistoryTests(unittest.TestCase):
         self.assertEqual(result["orders"][-1]["item_name"], "Item 3")
 
 
+class UserProfileTests(unittest.TestCase):
+    def test_user_preferences_returns_saved_profile(self):
+        result = run_mcp.user_preferences("USR-001")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["preferences"]["dietary_preference"], "Non-Veg")
+        self.assertEqual(result["preferences"]["allergies"], "Peanuts")
+
+    def test_user_location_returns_saved_delivery_context(self):
+        result = run_mcp.user_location("USR-002")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["location"], "Bengaluru")
+        self.assertEqual(result["delivery_area"], "Indiranagar")
+
+
 if __name__ == "__main__":
     unittest.main()

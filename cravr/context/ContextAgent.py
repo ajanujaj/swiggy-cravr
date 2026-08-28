@@ -2,63 +2,67 @@
 
 from __future__ import annotations
 
-from langchain_core.messages import SystemMessage
+import asyncio
+import json
+import os
+from typing import Any
 
+from fastmcp import Client
 from ..debug_utils import debug
-from ..llm import get_llm
 from ..profile_utils import merge_profile
-from ..schemas import ContextExtraction
 from ..state import CravrState
 
-
-CONTEXT_DISCOVERY_PROMPT = """
-You are Cravr's Context discovery agent. Analyze the user's food-ordering message(s).
-You are not a conversational assistant: do not recommend food and do not ask a
-question. Extract only facts explicitly stated or safely implied by the message.
-Use null values for anything not mentioned. Never fabricate values.
-""".strip()
+DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
 
 
-def _important_missing_fields(profile: dict) -> list[str]:
-    """Decide what's still missing from the MERGED profile, not from the
-    model's own (unreliable, per-turn) self-report."""
-    missing: list[str] = []
-    if not profile.get("location"):
-        missing.append("location")
-    if not profile.get("weather"):
-        missing.append("weather")
-    return missing
+def fetch_user_location(user_id: str | None) -> dict[str, Any]:
+    """Fetch saved delivery location without asking the user for it."""
+    async def _call_tool() -> Any:
+        async with Client(DEFAULT_MCP_URL) as client:
+            return await client.call_tool(name="user_location", arguments={"user_id": user_id})
 
+    try:
+        result = asyncio.run(_call_tool())
+    except Exception as exc:  # pragma: no cover - runtime/network failure
+        debug("context_agent", f"MCP user_location FAILED ({type(exc).__name__}: {exc})")
+        return {"status": "error", "message": f"Unable to retrieve saved location: {exc}"}
 
-def _question_for(item: str) -> str:
-    if item == "location":
-        return "What's the delivery location (city/area)?"
-    if item == "weather":
-        return "Is the weather (e.g., raining) affecting delivery where you are?"
-    return "Can you clarify this: %s" % item
+    if isinstance(result, dict):
+        return result
+    content = getattr(result, "content", None)
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(getattr(item, "text", None), str):
+                try:
+                    return json.loads(item.text)
+                except json.JSONDecodeError:
+                    break
+    return {"status": "error", "message": "Unexpected user_location response format"}
 
 
 def context_discovery_node(state: CravrState) -> dict:
-    """Call the local model with a schema-enforced structured-output call,
-    merge what it found onto the running context profile (so an earlier
-    answer survives even if this turn's extraction doesn't restate it), and
-    recompute what's still missing from the merged facts.
+    """Second workflow node: enrich state with saved delivery context.
+
+    Context is ambient. It must not call an LLM, fabricate live conditions,
+    or create user-facing clarification questions when location data is
+    unavailable.
     """
-    try:
-        structured_llm = get_llm().with_structured_output(ContextExtraction)
-        extraction = structured_llm.invoke([SystemMessage(content=CONTEXT_DISCOVERY_PROMPT), *state["messages"]])
-        extracted = extraction.model_dump()
-        debug("context_agent", f"structured extraction={extracted}")
-    except Exception as exc:
-        debug("context_agent", f"structured output call failed ({exc}) — treating as no new information")
-        extracted = {}
+    user_id = state.get("user_id")
+    location_result = fetch_user_location(user_id)
+    extracted = {
+        key: location_result[key]
+        for key in ("location", "delivery_area")
+        if location_result.get(key)
+    }
 
     profile = merge_profile(state.get("context_profile"), extracted)
+    profile["important_missing_information"] = []
+    profile["clarification_questions"] = []
 
-    important_missing = _important_missing_fields(profile)
-    profile["important_missing_information"] = important_missing
-    profile["clarification_questions"] = [_question_for(item) for item in important_missing]
-
-    debug("context_agent", f"merged profile={profile}")
+    debug(
+        "context_agent",
+        f"user_id={user_id!r} location_status={location_result.get('status')!r} "
+        f"profile={profile}",
+    )
 
     return {"context_profile": profile}

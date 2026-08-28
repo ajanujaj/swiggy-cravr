@@ -41,10 +41,18 @@ class ContextExtraction(BaseModel):
     delivery_area: Optional[str] = None
     max_delivery_minutes: Optional[int] = "under 30 minutes"
 
-
 class DecisionOutput(BaseModel):
     """The decision agent's verdict on whether to recommend now."""
 
     ready_to_recommend: bool
     decision: Literal["recommend", "clarify"]
     clarification_message: Optional[str] = None
+
+class UserProfile(BaseModel):
+    """Structured facts about the user, extracted from the conversation and/or
+    fetched from the MCP.
+    """
+    
+    dietary_preference: Optional[str] = None
+    allergies: Optional[str] = None
+    default_budget_inr: Optional[str] = None

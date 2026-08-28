@@ -71,7 +71,7 @@ def _extract_latest_user_input(messages: Any) -> str:
     return latest_user_text(messages)
 
 
-def _build_summary(intent_profile: dict, context_profile: dict, history_profile: dict, user_input: str) -> str:
+def _build_summary(intent_profile: dict, context_profile: dict, history_profile: dict, preference_profile: dict, user_input: str) -> str:
     """Create a single concise summary that captures the user's intent, context, and order history."""
     parts: list[str] = []
 
@@ -95,10 +95,24 @@ def _build_summary(intent_profile: dict, context_profile: dict, history_profile:
     context_bits = []
     if context_profile.get("location"):
         context_bits.append(f"location={context_profile['location']}")
+    if context_profile.get("delivery_area"):
+        context_bits.append(f"delivery_area={context_profile['delivery_area']}")
     if context_profile.get("weather"):
         context_bits.append(f"weather={context_profile['weather']}")
     if context_bits:
         parts.append("context:" + "; ".join(context_bits))
+
+    preferences = preference_profile.get("preferences") or {}
+    if isinstance(preferences, list):
+        preferences = preferences[0] if preferences else {}
+    preference_bits = []
+    if isinstance(preferences, dict):
+        if preferences.get("dietary_preference"):
+            preference_bits.append(f"saved_diet={preferences['dietary_preference']}")
+        if preferences.get("default_budget_inr") is not None:
+            preference_bits.append(f"saved_budget_inr={preferences['default_budget_inr']}")
+    if preference_bits:
+        parts.append("preferences:" + "; ".join(preference_bits))
 
     history_bits = []
     orders = history_profile.get("orders") or []
@@ -295,13 +309,17 @@ def decision_agent_node(state: CravrState) -> dict:
     intent_profile = _coerce_profile(state.get("intent_profile"))
     context_profile = _coerce_profile(state.get("context_profile"))
     history_profile = _coerce_profile(state.get("history_profile"))
+    preference_profile = _coerce_profile(state.get("preference_profile"))
     messages = state.get("messages") or []
     user_input = _extract_latest_user_input(messages)
-    summary = _build_summary(intent_profile, context_profile, history_profile, user_input)
+    summary = _build_summary(
+        intent_profile, context_profile, history_profile, preference_profile, user_input
+    )
 
     debug("decision_agent", f"user_input={user_input!r}")
     debug("decision_agent", f"intent_profile={intent_profile}")
     debug("decision_agent", f"context_profile={context_profile}")
+    debug("decision_agent", f"preference_profile={preference_profile}")
     # Whatever intent could not fill, it has already asked about and given up
     # on. Treat that as spent rather than as a fresh reason to interrogate.
     exhausted = bool(intent_profile.get("important_missing_information"))
@@ -311,7 +329,8 @@ def decision_agent_node(state: CravrState) -> dict:
     payload = {
         "user_input": user_input,
         "intent_profile": intent_profile,
-        # "context_profile": context_profile,
+        "context_profile": context_profile,
+        "preference_profile": preference_profile,
         "history_profile": history_profile,
         "summary": summary,
     }
@@ -365,7 +384,9 @@ def decision_agent_node(state: CravrState) -> dict:
     if ready_to_recommend:
         # Freeze the request exactly once, at the moment we commit to
         # recommending. Everything downstream reads this and only this.
-        brief = build_recommendation_brief(intent_profile, history_profile)
+        brief = build_recommendation_brief(
+            intent_profile, history_profile, preference_profile
+        )
         debug("decision_agent", f"brief filters={brief['filters']} history={brief['history']}")
         debug("decision_agent", f"brief summary={brief['summary']!r}")
         updates["recommendation_brief"] = brief

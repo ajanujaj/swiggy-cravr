@@ -84,11 +84,11 @@ class GraphWiringTests(unittest.TestCase):
             f"Node(s) {unreachable} are registered but have no edges connecting them to the graph.",
         )
 
-    def test_context_discovery_sits_between_intent_and_history(self):
+    def test_user_preference_context_and_intent_are_ordered(self):
         graph = app.get_graph()
         edge_pairs = {(edge.source, edge.target) for edge in graph.edges}
-        self.assertIn(("intent_discovery", "context_discovery"), edge_pairs)
-        self.assertIn(("context_discovery", "history_discovery"), edge_pairs)
+        self.assertIn(("user_preference", "context_discovery"), edge_pairs)
+        self.assertIn(("context_discovery", "intent_discovery"), edge_pairs)
 
 
 if __name__ == "__main__":
