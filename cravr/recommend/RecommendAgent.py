@@ -9,7 +9,6 @@ import re
 from collections import Counter
 from typing import Any
 
-from fastmcp import Client
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..debug_utils import debug
@@ -475,6 +474,8 @@ def _unwrap_tool_result(result: Any) -> list[dict[str, Any]]:
 
 def _call_recommendation_tool(filters: dict[str, Any]) -> list[dict[str, Any]]:
     async def _call_tool() -> Any:
+        from fastmcp import Client
+
         async with Client(DEFAULT_MCP_URL) as client:
             return await client.call_tool(name="recommendation", arguments=filters)
 

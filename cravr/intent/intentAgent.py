@@ -153,17 +153,27 @@ def _question_for(
     if field == "craving_or_cuisine":
         meal_intent = (profile or {}).get("meal_intent")
         follow_ups = {
-            "late_night_craving": (
-                "Late-night craving it is. What sounds good — a dish, cuisine, "
-                "or flavour such as spicy or sweet?"
-            ),
-            "snack": (
-                "Snack it is. What are you in the mood for — a dish, cuisine, "
-                "or flavour such as spicy or sweet?"
+            "breakfast": (
+                "Breakfast it is! What are you in the mood for — something light, healthy, "
+                "or filling?"
             ),
             "quick_bite": (
-                "Something quick it is. What would you like — a dish, cuisine, "
-                "or flavour such as spicy or sweet?"
+                "Got it — something quick. Are you craving sweet, spicy, healthy, or indulgent?"
+            ),
+            "lunch": (
+                "Great — lunch it is! What are you in the mood for today?"
+            ),
+            "quick_lunch": (
+                "Got it — a quick lunch. Do you want something light, filling, or easy to grab?"
+            ),
+            "snack": (
+                "Snack it is! Are you craving something spicy, sweet, crunchy, or healthy?"
+            ),
+            "dinner": (
+                "Dinner it is! What kind of meal are you in the mood for?"
+            ),
+            "late_night_craving": (
+                "Late-night craving detected 😄 What are you craving — sweet, savoury, spicy, or comforting?"
             ),
         }
         return (

@@ -163,8 +163,6 @@ def user_preferences(user_id: str) -> dict:
     ].iloc[0].to_dict()
 
     return {
-        "status": "success",
-        "user_id": user_id,
         "preferences": preferences
     }
 
@@ -182,8 +180,6 @@ def user_location(user_id: str) -> dict:
 
     location = user[["default_city", "default_delivery_area"]].iloc[0].to_dict()
     return {
-        "status": "success",
-        "user_id": user_id,
         "location": location["default_city"],
         "delivery_area": location["default_delivery_area"],
     }

@@ -13,52 +13,8 @@ from ..profile_utils import latest_user_text
 from ..recommend import build_recommendation_brief
 from ..schemas import DecisionOutput
 from ..state import CravrState
-
-
-# `decision` value that tells graph.py to route back to intent_discovery
-# (rather than END) after a clarification round, so the human's answer gets
-# folded into the profiles by the normal, reliably-committed graph nodes.
-CLARIFY_AND_RETRY = "clarify_and_retry"
-
-# Upper bound on how many clarification round-trips (tracked in graph state,
-# not a local loop) we'll ask for before giving up gracefully.
-MAX_CLARIFICATION_ROUNDS = 3
-
-GENERIC_CLARIFICATION_FALLBACK = (
-    "I can help with that, but I need a bit more detail such as your craving, "
-    "cuisine, dietary preference, or budget."
-)
-
-# Used when the clarification budget is spent. It must NOT be the question we
-# just gave up on: re-emitting that question invited another answer, which
-# arrived as a fresh turn and restarted the whole streak -- the loop that had
-# users answering "vegetarian" six times in a row.
-# Pseudo-field for the catch-all question, so it participates in the
-# "never ask the same thing twice" bookkeeping like any named gap.
-GENERIC_CLARIFICATION_FIELD = "__generic__"
-
-GIVE_UP_MESSAGE = (
-    "I don't have everything I'd like, so I'll work with what you've told me. "
-    "If the suggestion misses, just tell me what to change."
-)
-
-
-DECISION_PROMPT = """
-You are Cravr's decision agent. Decide whether the assistant is ready to recommend a food option to the user.
-
-You must inspect the user's latest message plus these profiles:
-- intent_profile
-- context_profile
-- history_profile
-- summary
-
-Rules:
-- Set ready_to_recommend to true only when the assistant has enough information to make a useful recommendation.
-- If important details are missing, set decision to "clarify" and provide a concise clarification_message.
-- Use history_profile as supporting context when it is meaningful, but do not require it if the other profiles already provide enough information.
-- Do not recommend if the request is vague or the profiles do not contain enough evidence.
-- Leave clarification_message empty when ready_to_recommend is true.
-""".strip()
+from .prompts import DECISION_PROMPT, GIVE_UP_MESSAGE, GENERIC_CLARIFICATION_FALLBACK
+from .utils import  CLARIFY_AND_RETRY, MAX_CLARIFICATION_ROUNDS, GENERIC_CLARIFICATION_FIELD
 
 
 def _coerce_profile(profile: Any) -> dict:
@@ -69,66 +25,6 @@ def _coerce_profile(profile: Any) -> dict:
 
 def _extract_latest_user_input(messages: Any) -> str:
     return latest_user_text(messages)
-
-
-def _build_summary(intent_profile: dict, context_profile: dict, history_profile: dict, preference_profile: dict, user_input: str) -> str:
-    """Create a single concise summary that captures the user's intent, context, and order history."""
-    parts: list[str] = []
-
-    if user_input:
-        parts.append(f"User asked: {user_input}")
-
-    intent_bits = []
-    if intent_profile.get("craving"):
-        intent_bits.append(f"craving={intent_profile['craving']}")
-    if intent_profile.get("cuisine"):
-        intent_bits.append(f"cuisine={intent_profile['cuisine']}")
-    dietary = intent_profile.get("dietary_preferences") or []
-    if dietary:
-        intent_bits.append(f"dietary_preferences={','.join(map(str, dietary))}")
-    budget = intent_profile.get("budget_inr")
-    if budget is not None:
-        intent_bits.append(f"budget_inr={budget}")
-    if intent_bits:
-        parts.append("intent:" + "; ".join(intent_bits))
-
-    context_bits = []
-    if context_profile.get("location"):
-        context_bits.append(f"location={context_profile['location']}")
-    if context_profile.get("delivery_area"):
-        context_bits.append(f"delivery_area={context_profile['delivery_area']}")
-    if context_profile.get("weather"):
-        context_bits.append(f"weather={context_profile['weather']}")
-    if context_bits:
-        parts.append("context:" + "; ".join(context_bits))
-
-    preferences = preference_profile.get("preferences") or {}
-    if isinstance(preferences, list):
-        preferences = preferences[0] if preferences else {}
-    preference_bits = []
-    if isinstance(preferences, dict):
-        if preferences.get("dietary_preference"):
-            preference_bits.append(f"saved_diet={preferences['dietary_preference']}")
-        if preferences.get("default_budget_inr") is not None:
-            preference_bits.append(f"saved_budget_inr={preferences['default_budget_inr']}")
-    if preference_bits:
-        parts.append("preferences:" + "; ".join(preference_bits))
-
-    history_bits = []
-    orders = history_profile.get("orders") or []
-    if orders:
-        history_bits.append(f"recent_orders={len(orders)}")
-        recent = orders[0]
-        if recent.get("restaurant_name"):
-            history_bits.append(f"last_restaurant={recent['restaurant_name']}")
-        if recent.get("item_name"):
-            history_bits.append(f"last_item={recent['item_name']}")
-    else:
-        history_bits.append("recent_orders=0")
-    if history_bits:
-        parts.append("history:" + "; ".join(history_bits))
-
-    return " | ".join(parts) if parts else "No additional context available."
 
 
 def _is_vague_request(user_input: str, intent_profile: dict, context_profile: dict) -> bool:
@@ -205,6 +101,66 @@ def _is_vague_request(user_input: str, intent_profile: dict, context_profile: di
 
     missing_text = " ".join(str(item or "") for item in missing_fields).lower()
     return any(term in missing_text for term in ["craving", "cuisine", "diet", "budget", "location"])
+
+
+def _build_summary(intent_profile: dict, context_profile: dict, history_profile: dict, preference_profile: dict, user_input: str) -> str:
+    """Create a single concise summary that captures the user's intent, context, and order history."""
+    parts: list[str] = []
+
+    if user_input:
+        parts.append(f"User asked: {user_input}")
+
+    intent_bits = []
+    if intent_profile.get("craving"):
+        intent_bits.append(f"craving={intent_profile['craving']}")
+    if intent_profile.get("cuisine"):
+        intent_bits.append(f"cuisine={intent_profile['cuisine']}")
+    dietary = intent_profile.get("dietary_preferences") or []
+    if dietary:
+        intent_bits.append(f"dietary_preferences={','.join(map(str, dietary))}")
+    budget = intent_profile.get("budget_inr")
+    if budget is not None:
+        intent_bits.append(f"budget_inr={budget}")
+    if intent_bits:
+        parts.append("intent:" + "; ".join(intent_bits))
+
+    context_bits = []
+    if context_profile.get("location"):
+        context_bits.append(f"location={context_profile['location']}")
+    if context_profile.get("delivery_area"):
+        context_bits.append(f"delivery_area={context_profile['delivery_area']}")
+    if context_profile.get("weather"):
+        context_bits.append(f"weather={context_profile['weather']}")
+    if context_bits:
+        parts.append("context:" + "; ".join(context_bits))
+
+    preferences = preference_profile.get("preferences") or {}
+    if isinstance(preferences, list):
+        preferences = preferences[0] if preferences else {}
+    preference_bits = []
+    if isinstance(preferences, dict):
+        if preferences.get("dietary_preference"):
+            preference_bits.append(f"saved_diet={preferences['dietary_preference']}")
+        if preferences.get("default_budget_inr") is not None:
+            preference_bits.append(f"saved_budget_inr={preferences['default_budget_inr']}")
+    if preference_bits:
+        parts.append("preferences:" + "; ".join(preference_bits))
+
+    history_bits = []
+    orders = history_profile.get("orders") or []
+    if orders:
+        history_bits.append(f"recent_orders={len(orders)}")
+        recent = orders[0]
+        if recent.get("restaurant_name"):
+            history_bits.append(f"last_restaurant={recent['restaurant_name']}")
+        if recent.get("item_name"):
+            history_bits.append(f"last_item={recent['item_name']}")
+    else:
+        history_bits.append("recent_orders=0")
+    if history_bits:
+        parts.append("history:" + "; ".join(history_bits))
+
+    return " | ".join(parts) if parts else "No additional context available."
 
 
 def _collect_clarification_targets(intent_profile: dict, context_profile: dict) -> list[tuple[str, str]]:
@@ -327,13 +283,9 @@ def decision_agent_node(state: CravrState) -> dict:
 
     debug("decision_agent", f"asking the decision LLM (exhausted={exhausted})")
     payload = {
-        "user_input": user_input,
-        "intent_profile": intent_profile,
-        "context_profile": context_profile,
-        "preference_profile": preference_profile,
-        "history_profile": history_profile,
         "summary": summary,
     }
+    debug("decision_agent", f"payload={payload}")
     try:
         structured_llm = get_llm().with_structured_output(DecisionOutput)
         decision_output = structured_llm.invoke([

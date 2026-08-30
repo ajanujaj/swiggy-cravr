@@ -7,7 +7,6 @@ import json
 import os
 from typing import Any
 
-from fastmcp import Client
 from ..debug_utils import debug
 from ..profile_utils import merge_profile
 from ..state import CravrState
@@ -18,6 +17,8 @@ DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
 def fetch_user_location(user_id: str | None) -> dict[str, Any]:
     """Fetch saved delivery location without asking the user for it."""
     async def _call_tool() -> Any:
+        from fastmcp import Client
+
         async with Client(DEFAULT_MCP_URL) as client:
             return await client.call_tool(name="user_location", arguments={"user_id": user_id})
 

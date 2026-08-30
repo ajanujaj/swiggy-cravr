@@ -1,18 +1,20 @@
 """Run with: `python -m cravr.run` (requires OPENAI_API_KEY)."""
 
 import uuid
-
-if __package__ in (None, ""):
-    # Support direct execution: `python cravr/run.py`.
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from cravr.graph import app
-else:
-    from .graph import app
-
 from langgraph.types import Command
+
+
+def _load_app():
+    if __package__ in (None, ""):
+        # Support direct execution: `python cravr/run.py`.
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from cravr.graph import app
+    else:
+        from .graph import app
+    return app
 
 
 def _print_assistant_reply(result: dict) -> None:
@@ -31,7 +33,7 @@ def _print_assistant_reply(result: dict) -> None:
         print("Assistant: (no response)")
 
 
-def _resume_until_complete(result: dict, config: dict) -> dict | None:
+def _resume_until_complete(result: dict, config: dict, app) -> dict | None:
     """Display graph questions and resume them until the current turn ends."""
     while result.get("__interrupt__"):
         pending = result["__interrupt__"][0]
@@ -62,6 +64,7 @@ def _resume_until_complete(result: dict, config: dict) -> dict | None:
 
 def main() -> None:
     print("Cravr CLI — type a message, or Ctrl-C/Ctrl-D to exit")
+    app = _load_app()
     # A checkpointer (configured on the compiled graph) persists state per
     # thread_id, so the conversation no longer needs to be replayed by hand —
     # each turn only sends the new message and the graph remembers the rest.
@@ -87,7 +90,7 @@ def main() -> None:
             result = None
 
         if result is not None:
-            _resume_until_complete(result, config)
+            _resume_until_complete(result, config, app)
 
         while True:
             user_msg = input("You: ").strip()
@@ -102,7 +105,7 @@ def main() -> None:
                 print("Error running graph:", exc)
                 continue
 
-            result = _resume_until_complete(result, config)
+            result = _resume_until_complete(result, config, app)
             if result is None:
                 continue
 

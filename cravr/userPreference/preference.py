@@ -7,8 +7,6 @@ import json
 import os
 from typing import Any
 
-from fastmcp import Client
-
 from ..debug_utils import debug
 from ..state import CravrState
 
@@ -19,6 +17,8 @@ target_url = DEFAULT_MCP_URL
 def _call_mcp_tool(tool_name: str, user_id: str | None) -> dict[str, Any]:
     """Call one user-scoped MCP tool and normalize FastMCP's response."""
     async def _call_tool() -> Any:
+        from fastmcp import Client
+
         async with Client(target_url) as client:
             return await client.call_tool(name=tool_name, arguments={"user_id": user_id})
 
