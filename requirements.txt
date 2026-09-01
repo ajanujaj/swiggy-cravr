@@ -4,3 +4,4 @@ langchain
 langgraph
 langchain-ollama
 pydantic
+streamlit

@@ -48,6 +48,25 @@ class DecisionOutput(BaseModel):
     decision: Literal["recommend", "clarify"]
     clarification_message: Optional[str] = None
 
+class SuggestedOptions(BaseModel):
+    """Short, tappable answer choices for a clarification question.
+
+    Used by `cravr.options.suggest_options` so any agent can turn a
+    free-text question into a numbered menu -- the whole point of a
+    recommender for someone who "doesn't know what to eat" is that they
+    should have to type as little as possible.
+    """
+
+    options: list[str] = Field(
+        default_factory=list,
+        description=(
+            "2 to 4 short (1-4 word), concrete, mutually exclusive answer "
+            "choices the user could pick instead of typing. Never include a "
+            "catch-all like 'other' or 'something else' -- that is added "
+            "separately."
+        ),
+    )
+
 class UserProfile(BaseModel):
     """Structured facts about the user, extracted from the conversation and/or
     fetched from the MCP.

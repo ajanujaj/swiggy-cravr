@@ -90,7 +90,16 @@ def main() -> None:
             result = None
 
         if result is not None:
-            _resume_until_complete(result, config, app)
+            # Cover the opening exchange too: intent_discovery can resolve
+            # every required field (and hand off to decision_agent) purely
+            # from the option-driven clarification rounds above, before the
+            # user ever reaches the free-typed loop below. Without printing
+            # here, whatever decision_agent (or recommendation_agent) says
+            # at the end of that first exchange was silently dropped and the
+            # user just saw a bare "You:" prompt.
+            result = _resume_until_complete(result, config, app)
+            if result is not None:
+                _print_assistant_reply(result)
 
         while True:
             user_msg = input("You: ").strip()
