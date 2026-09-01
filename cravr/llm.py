@@ -5,28 +5,43 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from dotenv import load_dotenv
+
 from .debug_utils import debug
+
+# Walks up from this file's directory to find the project's .env, so it
+# resolves correctly regardless of the working directory the CLI, tests, or
+# Streamlit were launched from.
+load_dotenv()
 
 _llm: Any | None = None
 
-# llama3.2:1b is too small to reliably follow structured-output/JSON
-# instructions (that's what caused the "predefined fallback response"
-# behavior). Default to a 7B instruction-tuned model that supports Ollama's
-# tool-calling, which `.with_structured_output()` relies on. Override with
-# `CRAVR_MODEL=<ollama-tag>` for anything else you've already pulled -- it
-# must support tool calling for structured output to work.
-DEFAULT_MODEL = "qwen2.5:7b-instruct"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+
+
+def _get_api_key() -> str:
+    # Accept the standard `GROQ_API_KEY` name and this project's existing
+    # `groq_apikey` .env entry, so nothing has to be renamed.
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_apikey")
+    if not api_key:
+        raise RuntimeError(
+            "Missing Groq API key. Set GROQ_API_KEY (or groq_apikey) in your "
+            ".env -- get a free key at https://console.groq.com/keys"
+        )
+    return api_key
 
 
 def get_llm() -> Any:
-    """Create the local Ollama-backed chat model only when the graph runs."""
+    """Create the Groq-backed chat model only when the graph runs."""
     global _llm
     if _llm is None:
         try:
-            from langchain_ollama import ChatOllama
+            from langchain_groq import ChatGroq
         except ImportError as error:
-            raise RuntimeError("Install requirements.txt to run Cravr's local Llama chat agent.") from error
+            raise RuntimeError(
+                "Install requirements.txt to run Cravr's Groq-backed chat agent."
+            ) from error
         model_name = os.getenv("CRAVR_MODEL", DEFAULT_MODEL)
-        _llm = ChatOllama(model=model_name, temperature=0.3)
-        debug("llm", f"created ChatOllama model={model_name!r} temperature=0.3")
+        _llm = ChatGroq(model=model_name, temperature=0.3, api_key=_get_api_key())
+        debug("llm", f"created ChatGroq model={model_name!r} temperature=0.3")
     return _llm

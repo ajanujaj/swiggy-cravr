@@ -60,8 +60,10 @@ class SuggestedOptions(BaseModel):
     options: list[str] = Field(
         default_factory=list,
         description=(
-            "2 to 4 short (1-4 word), concrete, mutually exclusive answer "
-            "choices the user could pick instead of typing. Never include a "
+            "Up to 5 short (1-4 word), concrete, mutually exclusive answer "
+            "choices the user could pick instead of typing -- use all 5 "
+            "when the context genuinely supports that many distinct, "
+            "plausible answers, fewer only when it doesn't. Never include a "
             "catch-all like 'other' or 'something else' -- that is added "
             "separately."
         ),

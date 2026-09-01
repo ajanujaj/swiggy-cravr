@@ -1,4 +1,16 @@
-"""Decision agent: uses the LLM to decide whether the request is ready for recommendations."""
+"""Decision agent: uses the LLM to decide whether the request is ready for recommendations.
+
+This node never calls `interrupt()` itself (see `DecisionAgentNeverAsksTests`
+in tests/test_decision_agent.py) -- only intent_discovery_node does, so the
+whole graph has exactly one interrupt site and one clarification round
+budget, never two competing ones. When decision_agent_node wants to ask
+something intent didn't already cover (e.g. a saved-preference conflict like
+"vegetarian or non-vegetarian?"), it hands the question off through
+`pending_decision_question` and routes back to intent_discovery_node via
+`CLARIFY_AND_RETRY`; intent_discovery_node asks it with tappable options the
+same way it asks its own fields, then folds the answer back in through the
+normal extraction pipeline before decision_agent_node is asked again.
+"""
 
 from __future__ import annotations
 
@@ -249,18 +261,25 @@ def _next_clarification_question(intent_profile: dict, context_profile: dict) ->
 
 
 def decision_agent_node(state: CravrState) -> dict:
-    """Judge whether the bot can recommend now. This node never asks.
+    """Judge whether the bot can recommend now. This node never calls `interrupt()`.
 
-    `intent_discovery_node` owns clarification: by the time control reaches
-    here the user has already been asked about every gap intent could name, up
-    to its own round budget. Asking again from a second node would mean two
-    interrupt sites competing over one conversation -- the user answering the
-    same gap twice, and two independent round budgets neither of which knows
-    about the other.
+    `intent_discovery_node` owns every actual `interrupt()` call: by the time
+    control reaches here the user has already been asked about every gap
+    intent could name, up to its own round budget. Calling `interrupt()` here
+    too would mean two interrupt sites competing over one conversation -- the
+    user answering the same gap twice, and two independent round budgets
+    neither of which knows about the other.
 
-    So a gap that survives intent is not a reason to stop; it is a reason to
-    recommend loosely and let the user steer. The only genuine dead end is a
-    profile with nothing filterable in it at all.
+    A gap that survives intent is therefore not automatically a reason to
+    stop -- it's usually a reason to recommend loosely and let the user
+    steer. The one case worth a fresh question is a *new* ambiguity intent
+    had no way to name (e.g. a saved dietary preference now conflicting with
+    what the user just asked for): that gets asked too, but via
+    `pending_decision_question` + `CLARIFY_AND_RETRY`, so intent_discovery_node
+    is still the only place `interrupt()` is ever called from, and its own
+    round budget (`clarification_rounds`, capped at `MAX_CLARIFICATION_ROUNDS`)
+    still applies. The only genuine dead end is a profile with nothing
+    filterable in it at all once that budget is spent.
     """
     intent_profile = _coerce_profile(state.get("intent_profile"))
     context_profile = _coerce_profile(state.get("context_profile"))
@@ -301,7 +320,16 @@ def decision_agent_node(state: CravrState) -> dict:
     ready_to_recommend = bool(result.get("ready_to_recommend"))
     decision = result.get("decision") if result.get("decision") in {"recommend", "clarify"} else "clarify"
 
-    if exhausted and not ready_to_recommend and _has_usable_signal(intent_profile):
+    # Decision-level round budget, separate from intent's own (tracked in
+    # `intent_profile["important_missing_information"]`/`exhausted` above).
+    # This is what caps *this* node's own ad hoc questions -- the ones intent
+    # never asked about, like a saved-preference conflict -- at
+    # MAX_CLARIFICATION_ROUNDS instead of letting the decision LLM invent a
+    # new question forever.
+    clarification_rounds = int(state.get("clarification_rounds") or 0)
+    give_up = exhausted or clarification_rounds >= MAX_CLARIFICATION_ROUNDS
+
+    if give_up and not ready_to_recommend and _has_usable_signal(intent_profile):
         # We've spent the clarification budget and the user did tell us
         # *something* usable. Ending the turn with another question is the
         # worst outcome; attempt a (deliberately loosely-filtered)
@@ -310,8 +338,30 @@ def decision_agent_node(state: CravrState) -> dict:
         ready_to_recommend = True
         decision = "recommend"
 
-    if exhausted:
-        # Out of clarification budget: never echo the question we just gave up
+    if not ready_to_recommend and not give_up:
+        # Ask with tappable options instead of ending the turn on a
+        # type-it-yourself question -- see the module docstring for why this
+        # hands the question to intent_discovery_node rather than asking it
+        # directly.
+        pending_question = result.get("clarification_message") or _next_clarification_question(
+            intent_profile, context_profile
+        )
+        debug(
+            "decision_agent",
+            f"handing question to intent_discovery (round {clarification_rounds + 1}/"
+            f"{MAX_CLARIFICATION_ROUNDS}): {pending_question!r}",
+        )
+        return {
+            "ready_to_recommend": False,
+            "decision": CLARIFY_AND_RETRY,
+            "pending_decision_question": pending_question,
+            "pending_clarification_field": GENERIC_CLARIFICATION_FIELD,
+            "clarification_rounds": clarification_rounds + 1,
+            "summary": summary,
+        }
+
+    if give_up:
+        # Out of clarification budget: never echo a question we just gave up
         # on, or the user's reply restarts the streak from scratch.
         fallback_message = GIVE_UP_MESSAGE
     else:
@@ -331,6 +381,7 @@ def decision_agent_node(state: CravrState) -> dict:
         "clarification_rounds": 0,
         "asked_clarification_fields": [],
         "pending_clarification_field": None,
+        "pending_decision_question": None,
     }
 
     if ready_to_recommend:

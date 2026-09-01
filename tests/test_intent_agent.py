@@ -288,6 +288,84 @@ class IntentFillLoopTests(unittest.TestCase):
         self.assertNotIn("messages", result)
 
 
+class PendingDecisionQuestionTests(unittest.TestCase):
+    """decision_agent_node never calls `interrupt()` itself (see
+    tests/test_decision_agent.py) -- it hands a question off via
+    `state["pending_decision_question"]`, and this node is the one that
+    actually asks it, with the same tappable-option treatment as its own
+    fields, before folding the answer into the profile the normal way."""
+
+    def test_asks_the_handed_off_question_first(self):
+        state = {
+            "messages": [{"role": "user", "content": "chinese or japanese"}],
+            "intent_profile": {
+                "cuisine": "Chinese or Japanese",
+                "meal_intent": "late_night_craving",
+                "flavor": "sweet",
+            },
+            "pending_decision_question": "Vegetarian or non-vegetarian today?",
+        }
+
+        result, spy = run_node(state, IntentExtraction(), answers=["non-veg"])
+
+        self.assertEqual(spy.call_count, 1)
+        payload = spy.call_args_list[0].args[0]
+        self.assertEqual(payload["question"], "Vegetarian or non-vegetarian today?")
+        self.assertEqual(payload["agent"], "decision_agent")
+        # important_missing_information/clarification_questions are already
+        # empty in this fixture (mirrors the real trigger: decision only
+        # hands off once intent has nothing left of its own to ask), so this
+        # is the only interrupt raised.
+        self.assertEqual(result["intent_profile"]["important_missing_information"], [])
+
+    def test_answer_is_folded_into_the_profile_and_the_handoff_is_cleared(self):
+        state = {
+            "messages": [{"role": "user", "content": "chinese or japanese"}],
+            "intent_profile": {
+                "cuisine": "Chinese or Japanese",
+                "meal_intent": "late_night_craving",
+                "flavor": "sweet",
+            },
+            "pending_decision_question": "Vegetarian or non-vegetarian today?",
+        }
+
+        result, _spy = run_node(state, IntentExtraction(), answers=["non-veg"])
+
+        self.assertEqual(result["intent_profile"]["dietary_preferences"], ["Non-Veg"])
+        self.assertIsNone(result["pending_decision_question"])
+        self.assertIsNone(result["pending_clarification_field"])
+
+    def test_question_and_answer_are_recorded_in_messages(self):
+        state = {
+            "messages": [{"role": "user", "content": "chinese or japanese"}],
+            "intent_profile": {
+                "cuisine": "Chinese or Japanese",
+                "meal_intent": "late_night_craving",
+                "flavor": "sweet",
+            },
+            "pending_decision_question": "Vegetarian or non-vegetarian today?",
+        }
+
+        result, _spy = run_node(state, IntentExtraction(), answers=["non-veg"])
+
+        contents = [m.content for m in result["messages"]]
+        self.assertEqual(contents[0], "Vegetarian or non-vegetarian today?")
+        self.assertEqual(contents[1], "non-veg")
+
+    def test_no_handoff_means_no_extra_interrupt(self):
+        """Without `pending_decision_question` set, behavior is unchanged --
+        this node's own loop still runs exactly as before."""
+        state = {
+            "messages": [{"role": "user", "content": "spicy biryani for dinner"}],
+            "intent_profile": {},
+        }
+
+        result, spy = run_node(state, IntentExtraction(meal_intent="dinner", craving="biryani"))
+
+        spy.assert_not_called()
+        self.assertIsNone(result.get("pending_decision_question"))
+
+
 class ExtractTastesTests(unittest.TestCase):
     def test_maps_synonyms_onto_menu_tags(self):
         self.assertIn("spicy", extract_tastes("make it fiery"))

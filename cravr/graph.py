@@ -42,9 +42,6 @@ def _route_after_decision(state: CravrState) -> str:
     if state.get("ready_to_recommend"):
         return RECOMMEND
     if state.get("decision") == CLARIFY_AND_RETRY:
-        # A clarification question was just answered (via interrupt/resume) —
-        # loop back through intent/context discovery so the answer is folded
-        # into the profiles by those nodes before deciding again.
         return CLARIFY_AND_RETRY
     return NEEDS_MORE_INFO
 

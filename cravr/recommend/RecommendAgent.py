@@ -161,6 +161,30 @@ def _numbered(dishes: list[dict[str, Any]]) -> str:
     return "\n".join(f"  {i}. {_describe(d)}" for i, d in enumerate(dishes, start=1))
 
 
+def _dish_pick_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Tappable buttons for a numbered dish list, matching `_numbered`'s order.
+
+    Values are the bare position ("1", "2", ...) -- the same thing a typed
+    digit already resolves to via `_resolve_choice` -- so tapping a button
+    and typing the number take the exact same path through `is_pure_feedback`
+    / `recommendation_agent_node`. Labels use the dish name so the button
+    itself says what you're picking, not just a number.
+    """
+    return [
+        {"value": str(i), "label": d.get("item_name") or f"Option {i}"}
+        for i, d in enumerate(dishes, start=1)
+    ]
+
+
+# Matches `ONLY_MATCH_PROMPT`'s two lines exactly -- kept as a single source
+# of truth so the buttons the UI renders can never drift out of sync with
+# the text describing them.
+ONLY_MATCH_OPTIONS = [
+    {"value": "1", "label": "Yes, I'll take it"},
+    {"value": "2", "label": "Widen the search"},
+]
+
+
 # Ordinals are matched before cardinals, and that ordering is load-bearing:
 # in "the third one", the word "one" is a filler noun, not a choice. Checking
 # cardinals first would silently select option 1 for "no, the second one".
@@ -663,6 +687,7 @@ def _serve_next_batch(
             f"{lead_in}\n{_numbered(batch)}\n{PICK_PROMPT}",
             awaiting_feedback=True, satisfied=False,
             last_recommendations=batch, alternates=rest, filters=filters,
+            options=_dish_pick_options(batch),
         )
 
     debug("recommendation_agent", "no alternates left to offer")
@@ -725,6 +750,7 @@ def recommendation_agent_node(state: CravrState) -> dict:
                     f"Here's what turns up with a wider search:\n{_numbered(batch)}\n{PICK_PROMPT}",
                     awaiting_feedback=True, satisfied=False,
                     last_recommendations=batch, alternates=rest, filters=brief_filters,
+                    options=_dish_pick_options(batch),
                 )
             return _reply(
                 "That really was the only close match — tell me what to change (cuisine, "
@@ -747,6 +773,7 @@ def recommendation_agent_node(state: CravrState) -> dict:
                 f"Which one would you like — {' or '.join(str(i) for i in range(1, len(offered) + 1))}?",
                 awaiting_feedback=True, satisfied=False,
                 last_recommendations=offered, alternates=alternates, filters=brief_filters,
+                options=_dish_pick_options(offered),
             )
 
         if _looks_like_rejection(user_input):
@@ -782,4 +809,5 @@ def recommendation_agent_node(state: CravrState) -> dict:
         _build_recommendation_text(batch),
         awaiting_feedback=True, satisfied=False,
         last_recommendations=batch, alternates=rest, filters=brief_filters,
+        options=ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch),
     )

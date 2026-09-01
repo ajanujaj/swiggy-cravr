@@ -1,10 +1,14 @@
 """Intent Discovery agent: turns a food-ordering request into structured intent.
 
-This node now owns *all* clarification. It extracts what it can from the
-conversation, derives what the clock and its own vocabulary can supply, and
-then pauses the graph with `interrupt()` -- once per still-missing field --
-until its required state is complete. `decision_agent` no longer asks
-questions; it only judges.
+This node owns *every* `interrupt()` call in the graph -- its own required
+fields, and any ad hoc question decision_agent_node hands off via
+`state["pending_decision_question"]` (a saved-preference conflict, say, that
+doesn't map to one of the fields below). It extracts what it can from the
+conversation, derives what the clock and its own vocabulary can supply, asks
+the hand-off question first if there is one, then pauses the graph with
+`interrupt()` -- once per still-missing field -- until its required state is
+complete. `decision_agent` never calls `interrupt()` itself; it only judges,
+and hands off the rare question it needs asked.
 """
 
 from __future__ import annotations
@@ -189,15 +193,39 @@ def _missing_fields(profile: dict) -> list[str]:
 # user still gets tappable choices instead of a bare "type anything" prompt.
 # Kept intentionally close to the follow-up phrasing below, per meal_intent.
 _CRAVING_OPTION_FALLBACKS = {
-    "breakfast": ["Something light", "Healthy meal", "Filling breakfast"],
-    "quick_bite": ["Something sweet", "Something spicy", "Something healthy"],
-    "lunch": ["Full meal", "Healthy meal", "Indian cuisine"],
-    "quick_lunch": ["Something light", "Something filling", "Easy to grab"],
-    "snack": ["Something spicy", "Something sweet", "Something healthy"],
-    "dinner": ["Full meal", "Healthy meal", "Indian cuisine"],
-    "late_night_craving": ["Something sweet", "Something savoury", "Something spicy"],
+    "breakfast": [
+        "Something light", "Healthy meal", "Filling breakfast",
+        "South Indian", "Continental",
+    ],
+    "quick_bite": [
+        "Something sweet", "Something spicy", "Something healthy",
+        "Something filling", "Something crunchy",
+    ],
+    "lunch": [
+        "Full meal", "Healthy meal", "Indian cuisine",
+        "Something light", "Comfort food",
+    ],
+    "quick_lunch": [
+        "Something light", "Something filling", "Easy to grab",
+        "Something healthy", "Something spicy",
+    ],
+    "snack": [
+        "Something spicy", "Something sweet", "Something healthy",
+        "Something crunchy", "Comfort food",
+    ],
+    "dinner": [
+        "Full meal", "Healthy meal", "Indian cuisine",
+        "Something light", "Comfort food",
+    ],
+    "late_night_craving": [
+        "Something sweet", "Something savoury", "Something spicy",
+        "Comfort food", "Something light",
+    ],
 }
-_DEFAULT_CRAVING_OPTION_FALLBACK = ["A dish in mind", "A cuisine", "Spicy or sweet"]
+_DEFAULT_CRAVING_OPTION_FALLBACK = [
+    "A dish in mind", "A cuisine", "Spicy or sweet",
+    "Healthy option", "Comfort food",
+]
 
 
 def _question_for(
@@ -313,8 +341,52 @@ def intent_discovery_node(state: CravrState) -> dict:
     replay. The one non-deterministic step -- the extraction call -- re-runs on
     each resume, which is harmless because `merge_profile` only ever adds
     non-empty values, though it does cost an extra model call per question.
+
+    This is also the *only* place in the graph that calls `interrupt()` --
+    including for a question decision_agent_node wants asked. decision_agent
+    never interrupts directly (see `DecisionAgentNeverAsksTests`); instead it
+    hands a question off via `state["pending_decision_question"]` and routes
+    back here. If that's set, it's asked first, with the same tappable-option
+    treatment as this node's own fields, and the answer is folded into
+    `messages` before the rest of this function runs -- so the extraction
+    call below sees it exactly like a fresh user message, and any signal in
+    it (a cuisine, a dietary word, a budget) gets picked up the normal way,
+    with no separate per-field parsing needed.
     """
     now = datetime.now()
+
+    pending_qa: list = []
+    pending_question = state.get("pending_decision_question")
+    if pending_question:
+        pending_options = suggest_options(
+            pending_question, context=state.get("intent_profile") or {}, fallback=[]
+        )
+        debug("intent_agent", f"asking decision_agent's handed-off question: {pending_question!r}")
+        raw_pending_answer = interrupt({
+            "question": pending_question,
+            "options": pending_options,
+            "agent": "decision_agent",
+            "field": "decision_clarification",
+        })
+        debug("intent_agent", f"got answer for decision_agent's question: {raw_pending_answer!r}")
+        pending_answer = resolve_option_choice(str(raw_pending_answer), pending_options)
+        if pending_answer == OTHER_VALUE:
+            follow_up = "Sure — go ahead and tell me in your own words."
+            other_pending_answer = interrupt({
+                "question": follow_up,
+                "options": [],
+                "agent": "decision_agent",
+                "field": "decision_clarification",
+            })
+            pending_answer = str(other_pending_answer)
+        pending_qa = [
+            AIMessage(content=pending_question, name="decision_agent"),
+            HumanMessage(content=str(pending_answer)),
+        ]
+        # Rebind the local `state` so every read below -- the extraction
+        # call's message list, `latest_user_text`, etc. -- sees the answer
+        # without having to touch each call site individually.
+        state = {**state, "messages": list(state.get("messages") or []) + pending_qa}
 
     # The CLI intentionally starts with no user message so it can offer a
     # meal choice first. Never ask the extraction model to infer preferences
@@ -356,7 +428,9 @@ def intent_discovery_node(state: CravrState) -> dict:
     profile = _derive(merged, now)
     debug("intent_agent", f"merged+derived profile={profile}")
 
-    transcript: list = []
+    # Seeded with the decision_agent hand-off Q&A (if any) so it's recorded
+    # in `messages` in the same update as this node's own questions.
+    transcript: list = list(pending_qa)
     asked: list[str] = []
 
     for round_number in range(1, MAX_INTENT_CLARIFICATION_ROUNDS + 1):
@@ -421,7 +495,14 @@ def intent_discovery_node(state: CravrState) -> dict:
         _question_for(field, now, profile)[0] for field in still_missing
     ]
 
-    updates: dict = {"intent_profile": profile}
+    updates: dict = {
+        "intent_profile": profile,
+        # Clear the hand-off now that it's been asked (or there was none to
+        # ask) -- otherwise the next turn would see a stale question and ask
+        # it again alongside anything decision_agent asks fresh.
+        "pending_decision_question": None,
+        "pending_clarification_field": None,
+    }
     if transcript:
         updates["messages"] = transcript
     return updates

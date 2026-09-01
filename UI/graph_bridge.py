@@ -76,13 +76,18 @@ def process_result(result: dict[str, Any] | None) -> None:
     source = getattr(last, "name", None) or "assistant"
 
     dishes = None
+    options = None
     if source == "recommendation_agent":
         rec_state = result.get("recommendation_state") or {}
         dishes = rec_state.get("last_recommendations") or None
+        # Tappable dish-pick / yes-widen buttons, built by RecommendAgent
+        # itself (see `_dish_pick_options`/`ONLY_MATCH_OPTIONS`) so they can
+        # never drift out of sync with the numbered text in `content`.
+        options = rec_state.get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
     st.session_state.history.append(
-        {"role": "assistant", "content": content, "source": source, "dishes": dishes}
+        {"role": "assistant", "content": content, "source": source, "dishes": dishes, "options": options}
     )
 
 

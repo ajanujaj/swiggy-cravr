@@ -3,9 +3,11 @@
 Run alongside the existing backend exactly the way `cravr/run.py` (the CLI)
 is run:
 
-    ollama pull qwen2.5:7b-instruct        # once
     python mcp_server/run_mcp.py           # terminal 1
     streamlit run UI/streamlit_app.py      # terminal 2
+
+(Needs GROQ_API_KEY / groq_apikey set in .env -- the LLM step calls
+Groq's hosted API, so no local Ollama install is required.)
 
 This file only wires the pieces together -- `state` (session-state setup),
 `graph_bridge` (the only module that talks to `cravr.graph.app`), `styles`
@@ -69,7 +71,7 @@ def main() -> None:
         st.error(
             "Something went wrong talking to the backend: "
             f"{st.session_state.error}\n\n"
-            "Make sure the MCP server (`python mcp_server/run_mcp.py`) and Ollama are both running."
+            "Make sure the MCP server (`python mcp_server/run_mcp.py`) is running and GROQ_API_KEY / groq_apikey is set in .env."
         )
 
     prompt = st.chat_input("Type a message...")

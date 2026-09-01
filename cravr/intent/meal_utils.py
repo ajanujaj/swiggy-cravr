@@ -29,6 +29,7 @@ MILD_WORDS = ("mild", "bland")
 
 VEG_ANSWERS = ("vegetarian", "veg", "pure veg", "no meat", "veggie")
 NON_VEG_ANSWERS = ("non-veg", "non veg", "nonveg", "non-vegetarian", "non vegetarian",
+                   "no-veg", "no veg", "noveg",
                    "meat", "chicken", "mutton", "fish", "egg", "eggetarian")
 
 CRAVING_TAG_CUES = {
