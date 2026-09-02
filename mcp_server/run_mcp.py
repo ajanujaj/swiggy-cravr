@@ -8,7 +8,7 @@ app = FastMCP("recommendation-server")
 DATA_DIR = Path(__file__).resolve().parent / "data"
 recommendations_data = pd.read_csv(DATA_DIR / "menu.csv")
 order_history_data = pd.read_csv(DATA_DIR / "order_history.csv")
-
+user_data = pd.read_csv(DATA_DIR / "user.csv")
 
 @app.tool()
 def recommendation(
@@ -122,11 +122,14 @@ def order_history(user_id: str) -> dict:
         how="left",
     )
 
-    user_orders["order_date"] = pd.to_datetime(user_orders["order_date"], errors="coerce")
-    user_orders = user_orders.sort_values("order_date", ascending=False, na_position="last").head(10)
+    user_orders["ordered_at"] = pd.to_datetime(
+        user_orders["order_date"] + " " + user_orders["order_time"],
+        errors="coerce",
+    )
+    user_orders = user_orders.sort_values("ordered_at", ascending=False, na_position="last").head(10)
 
     orders = user_orders[
-        ["restaurant_name", "cuisine", "item_name", "meal_type", "tags"]
+        ["restaurant_name", "cuisine", "item_name", "meal_type", "order_date", "order_time", "tags"]
     ].to_dict("records")
 
     return {
@@ -134,6 +137,53 @@ def order_history(user_id: str) -> dict:
         "count": len(orders),
         "orders": orders
     }
+
+@app.tool()
+def user_preferences(user_id: str) -> dict:
+    """
+    Get the user preferences for a specific user.
+    
+    Args:
+        user_id: Unique identifier for the user
+    """
+
+    user_prefs = user_data[user_data['user_id'] == user_id]
+
+    if user_prefs.empty:
+        return {"status": "no_results", "message": "No user preferences found for the given user ID"}
+
+    preferences = user_prefs[
+        [
+            "default_budget_inr",
+            "dietary_preference",
+            "allergies",
+            "preferred_cuisines",
+            "preferred_flavors",
+        ]
+    ].iloc[0].to_dict()
+
+    return {
+        "preferences": preferences
+    }
+
+
+@app.tool()
+def user_location(user_id: str) -> dict:
+    """Get the saved city and delivery area for a user.
+
+    This is intentionally separate from ``user_preferences`` so the context
+    agent can obtain delivery context without handling dietary or budget data.
+    """
+    user = user_data[user_data["user_id"] == user_id]
+    if user.empty:
+        return {"status": "no_results", "message": "No saved location found for the given user ID"}
+
+    location = user[["default_city", "default_delivery_area"]].iloc[0].to_dict()
+    return {
+        "location": location["default_city"],
+        "delivery_area": location["default_delivery_area"],
+    }
+
 
 if __name__ == "__main__":
     app.run(

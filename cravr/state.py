@@ -10,7 +10,12 @@ class CravrState(TypedDict):
 
     messages: Annotated[list, add_messages]
     intent_profile: dict
-    # context_profile: dict | None
+    # Ambient facts pulled from MCP (e.g. saved delivery location). These are
+    # never user-facing requirements.
+    context_profile: dict
+    # Persistent dietary/budget/allergy preferences returned by the user
+    # profile MCP endpoint.
+    preference_profile: dict
     history_profile: dict
     user_id: str
     recommendation_state: dict
@@ -32,6 +37,18 @@ class CravrState(TypedDict):
     # unreliable) extraction model to infer which question a bare reply like
     # "Indian" or "1000" was answering. Cleared once consumed.
     pending_clarification_field: str
+    # A free-text question decision_agent_node wants asked with tappable
+    # options, because it doesn't map to one of intent_discovery_node's own
+    # fixed fields (e.g. "I see both vegetarian and non-vegetarian saved --
+    # which did you mean?"). decision_agent_node never calls `interrupt()`
+    # itself -- only intent_discovery_node does, so there's exactly one
+    # interrupt site and one round budget in the whole graph (see
+    # `DecisionAgentNeverAsksTests`) -- so it hands the question off through
+    # this field instead. intent_discovery_node asks it (via
+    # `cravr.options.suggest_options` for the choices, same as its own
+    # fields) before running its usual extraction pass, folds the answer into
+    # `messages` so the normal pipeline picks it up, and clears this field.
+    pending_decision_question: str
     # Fields already asked about in this streak. A field is never asked twice:
     # if the answer couldn't be captured, we move on rather than badgering the
     # user with the same question until MAX_CLARIFICATION_ROUNDS runs out.

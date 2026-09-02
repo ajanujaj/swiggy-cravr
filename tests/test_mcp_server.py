@@ -87,6 +87,7 @@ class OrderHistoryTests(unittest.TestCase):
                     "item_name": "Butter Chicken",
                     "meal_type": "All Day",
                     "order_date": "2026-01-12",
+                    "order_time": "20:14",
                     "quantity": 1,
                     "unit_price_inr": 420,
                     "line_total_inr": 420,
@@ -103,6 +104,8 @@ class OrderHistoryTests(unittest.TestCase):
         self.assertEqual(result["orders"][0]["cuisine"], "North Indian")
         self.assertEqual(result["orders"][0]["item_name"], "Butter Chicken")
         self.assertEqual(result["orders"][0]["meal_type"], "All Day")
+        self.assertEqual(result["orders"][0]["order_date"], "2026-01-12")
+        self.assertEqual(result["orders"][0]["order_time"], "20:14")
         self.assertEqual(result["orders"][0]["tags"], "high-protein")
         self.assertNotIn("price_inr", result["orders"][0])
         self.assertNotIn("rating", result["orders"][0])
@@ -134,6 +137,7 @@ class OrderHistoryTests(unittest.TestCase):
                     "order_status": "Delivered",
                     "meal_type": "Dinner",
                     "order_date": f"2024-01-{i:02d}",
+                    "order_time": "20:00",
                 }
                 for i in range(1, 13)
             ]
@@ -145,6 +149,22 @@ class OrderHistoryTests(unittest.TestCase):
         self.assertEqual(len(result["orders"]), 10)
         self.assertEqual(result["orders"][0]["item_name"], "Item 12")
         self.assertEqual(result["orders"][-1]["item_name"], "Item 3")
+
+
+class UserProfileTests(unittest.TestCase):
+    def test_user_preferences_returns_saved_profile(self):
+        result = run_mcp.user_preferences("USR-001")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["preferences"]["dietary_preference"], "Non-Veg")
+        self.assertEqual(result["preferences"]["allergies"], "Peanuts")
+
+    def test_user_location_returns_saved_delivery_context(self):
+        result = run_mcp.user_location("USR-002")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["location"], "Bengaluru")
+        self.assertEqual(result["delivery_area"], "Indiranagar")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,16 @@
-"""Decision agent: uses the LLM to decide whether the request is ready for recommendations."""
+"""Decision agent: uses the LLM to decide whether the request is ready for recommendations.
+
+This node never calls `interrupt()` itself (see `DecisionAgentNeverAsksTests`
+in tests/test_decision_agent.py) -- only intent_discovery_node does, so the
+whole graph has exactly one interrupt site and one clarification round
+budget, never two competing ones. When decision_agent_node wants to ask
+something intent didn't already cover (e.g. a saved-preference conflict like
+"vegetarian or non-vegetarian?"), it hands the question off through
+`pending_decision_question` and routes back to intent_discovery_node via
+`CLARIFY_AND_RETRY`; intent_discovery_node asks it with tappable options the
+same way it asks its own fields, then folds the answer back in through the
+normal extraction pipeline before decision_agent_node is asked again.
+"""
 
 from __future__ import annotations
 
@@ -6,60 +18,15 @@ import json
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langgraph.types import interrupt
 
-from .RecommendAgent import build_recommendation_brief
-from .debug_utils import debug
-from .llm import get_llm
-from .profile_utils import latest_user_text
-from .schemas import DecisionOutput
-from .state import CravrState
-
-
-# `decision` value that tells graph.py to route back to intent_discovery
-# (rather than END) after a clarification round, so the human's answer gets
-# folded into the profiles by the normal, reliably-committed graph nodes.
-CLARIFY_AND_RETRY = "clarify_and_retry"
-
-# Upper bound on how many clarification round-trips (tracked in graph state,
-# not a local loop) we'll ask for before giving up gracefully.
-MAX_CLARIFICATION_ROUNDS = 3
-
-GENERIC_CLARIFICATION_FALLBACK = (
-    "I can help with that, but I need a bit more detail such as your craving, "
-    "cuisine, dietary preference, or budget."
-)
-
-# Used when the clarification budget is spent. It must NOT be the question we
-# just gave up on: re-emitting that question invited another answer, which
-# arrived as a fresh turn and restarted the whole streak -- the loop that had
-# users answering "vegetarian" six times in a row.
-# Pseudo-field for the catch-all question, so it participates in the
-# "never ask the same thing twice" bookkeeping like any named gap.
-GENERIC_CLARIFICATION_FIELD = "__generic__"
-
-GIVE_UP_MESSAGE = (
-    "I don't have everything I'd like, so I'll work with what you've told me. "
-    "If the suggestion misses, just tell me what to change."
-)
-
-
-DECISION_PROMPT = """
-You are Cravr's decision agent. Decide whether the assistant is ready to recommend a food option to the user.
-
-You must inspect the user's latest message plus these profiles:
-- intent_profile
-- context_profile
-- history_profile
-- summary
-
-Rules:
-- Set ready_to_recommend to true only when the assistant has enough information to make a useful recommendation.
-- If important details are missing, set decision to "clarify" and provide a concise clarification_message.
-- Use history_profile as supporting context when it is meaningful, but do not require it if the other profiles already provide enough information.
-- Do not recommend if the request is vague or the profiles do not contain enough evidence.
-- Leave clarification_message empty when ready_to_recommend is true.
-""".strip()
+from ..debug_utils import debug
+from ..llm import get_llm
+from ..profile_utils import latest_user_text
+from ..recommend import build_recommendation_brief
+from ..schemas import DecisionOutput
+from ..state import CravrState
+from .prompts import DECISION_PROMPT, GIVE_UP_MESSAGE, GENERIC_CLARIFICATION_FALLBACK
+from .utils import  CLARIFY_AND_RETRY, MAX_CLARIFICATION_ROUNDS, GENERIC_CLARIFICATION_FIELD
 
 
 def _coerce_profile(profile: Any) -> dict:
@@ -70,52 +37,6 @@ def _coerce_profile(profile: Any) -> dict:
 
 def _extract_latest_user_input(messages: Any) -> str:
     return latest_user_text(messages)
-
-
-def _build_summary(intent_profile: dict, context_profile: dict, history_profile: dict, user_input: str) -> str:
-    """Create a single concise summary that captures the user's intent, context, and order history."""
-    parts: list[str] = []
-
-    if user_input:
-        parts.append(f"User asked: {user_input}")
-
-    intent_bits = []
-    if intent_profile.get("craving"):
-        intent_bits.append(f"craving={intent_profile['craving']}")
-    if intent_profile.get("cuisine"):
-        intent_bits.append(f"cuisine={intent_profile['cuisine']}")
-    dietary = intent_profile.get("dietary_preferences") or []
-    if dietary:
-        intent_bits.append(f"dietary_preferences={','.join(map(str, dietary))}")
-    budget = intent_profile.get("budget_inr")
-    if budget is not None:
-        intent_bits.append(f"budget_inr={budget}")
-    if intent_bits:
-        parts.append("intent:" + "; ".join(intent_bits))
-
-    context_bits = []
-    if context_profile.get("location"):
-        context_bits.append(f"location={context_profile['location']}")
-    if context_profile.get("weather"):
-        context_bits.append(f"weather={context_profile['weather']}")
-    if context_bits:
-        parts.append("context:" + "; ".join(context_bits))
-
-    history_bits = []
-    orders = history_profile.get("orders") or []
-    if orders:
-        history_bits.append(f"recent_orders={len(orders)}")
-        recent = orders[0]
-        if recent.get("restaurant_name"):
-            history_bits.append(f"last_restaurant={recent['restaurant_name']}")
-        if recent.get("item_name"):
-            history_bits.append(f"last_item={recent['item_name']}")
-    else:
-        history_bits.append("recent_orders=0")
-    if history_bits:
-        parts.append("history:" + "; ".join(history_bits))
-
-    return " | ".join(parts) if parts else "No additional context available."
 
 
 def _is_vague_request(user_input: str, intent_profile: dict, context_profile: dict) -> bool:
@@ -194,6 +115,66 @@ def _is_vague_request(user_input: str, intent_profile: dict, context_profile: di
     return any(term in missing_text for term in ["craving", "cuisine", "diet", "budget", "location"])
 
 
+def _build_summary(intent_profile: dict, context_profile: dict, history_profile: dict, preference_profile: dict, user_input: str) -> str:
+    """Create a single concise summary that captures the user's intent, context, and order history."""
+    parts: list[str] = []
+
+    if user_input:
+        parts.append(f"User asked: {user_input}")
+
+    intent_bits = []
+    if intent_profile.get("craving"):
+        intent_bits.append(f"craving={intent_profile['craving']}")
+    if intent_profile.get("cuisine"):
+        intent_bits.append(f"cuisine={intent_profile['cuisine']}")
+    dietary = intent_profile.get("dietary_preferences") or []
+    if dietary:
+        intent_bits.append(f"dietary_preferences={','.join(map(str, dietary))}")
+    budget = intent_profile.get("budget_inr")
+    if budget is not None:
+        intent_bits.append(f"budget_inr={budget}")
+    if intent_bits:
+        parts.append("intent:" + "; ".join(intent_bits))
+
+    context_bits = []
+    if context_profile.get("location"):
+        context_bits.append(f"location={context_profile['location']}")
+    if context_profile.get("delivery_area"):
+        context_bits.append(f"delivery_area={context_profile['delivery_area']}")
+    if context_profile.get("weather"):
+        context_bits.append(f"weather={context_profile['weather']}")
+    if context_bits:
+        parts.append("context:" + "; ".join(context_bits))
+
+    preferences = preference_profile.get("preferences") or {}
+    if isinstance(preferences, list):
+        preferences = preferences[0] if preferences else {}
+    preference_bits = []
+    if isinstance(preferences, dict):
+        if preferences.get("dietary_preference"):
+            preference_bits.append(f"saved_diet={preferences['dietary_preference']}")
+        if preferences.get("default_budget_inr") is not None:
+            preference_bits.append(f"saved_budget_inr={preferences['default_budget_inr']}")
+    if preference_bits:
+        parts.append("preferences:" + "; ".join(preference_bits))
+
+    history_bits = []
+    orders = history_profile.get("orders") or []
+    if orders:
+        history_bits.append(f"recent_orders={len(orders)}")
+        recent = orders[0]
+        if recent.get("restaurant_name"):
+            history_bits.append(f"last_restaurant={recent['restaurant_name']}")
+        if recent.get("item_name"):
+            history_bits.append(f"last_item={recent['item_name']}")
+    else:
+        history_bits.append("recent_orders=0")
+    if history_bits:
+        parts.append("history:" + "; ".join(history_bits))
+
+    return " | ".join(parts) if parts else "No additional context available."
+
+
 def _collect_clarification_targets(intent_profile: dict, context_profile: dict) -> list[tuple[str, str]]:
     """Pair each still-missing field with the follow-up question for it.
 
@@ -251,13 +232,16 @@ def _needs_clarification(user_input: str, intent_profile: dict, context_profile:
 
 
 def _has_usable_signal(intent_profile: dict) -> bool:
-    """True when the profile carries at least one thing we can filter a menu on."""
+    """True when the profile carries at least one thing we can filter a menu on.
+
+    Tracks `IntentExtraction`: craving/cuisine/craving_tag are the filterable
+    fields. `meal_intent` alone does not count -- "dinner" narrows nothing on
+    its own, since 48 of the 80 menu rows are All Day.
+    """
     return bool(
         intent_profile.get("craving")
         or intent_profile.get("cuisine")
-        or intent_profile.get("taste_preference")
-        or intent_profile.get("dietary_preferences")
-        or intent_profile.get("budget_inr") is not None
+        or intent_profile.get("craving_tag")
     )
 
 
@@ -277,92 +261,50 @@ def _next_clarification_question(intent_profile: dict, context_profile: dict) ->
 
 
 def decision_agent_node(state: CravrState) -> dict:
-    """Decide whether the bot can recommend now.
+    """Judge whether the bot can recommend now. This node never calls `interrupt()`.
 
-    Whenever required information is missing, this node pauses the graph with
-    LangGraph's `interrupt()` and asks the user a *specific* question (e.g.
-    "What's your budget for this order in INR?") instead of a generic
-    clarification message, then routes back to `intent_discovery` (via
-    `CLARIFY_AND_RETRY`) so the answer is folded into the profiles by the
-    normal, reliably-committed graph nodes.
+    `intent_discovery_node` owns every actual `interrupt()` call: by the time
+    control reaches here the user has already been asked about every gap
+    intent could name, up to its own round budget. Calling `interrupt()` here
+    too would mean two interrupt sites competing over one conversation -- the
+    user answering the same gap twice, and two independent round budgets
+    neither of which knows about the other.
 
-    Important: this node calls `interrupt()` at most once per execution.
-    LangGraph re-executes a node's code from the top on every resume, so
-    looping through multiple `interrupt()` calls *within one node call* would
-    re-derive the merged profile from the last checkpointed (stale) state on
-    every resume and silently drop facts learned in earlier rounds. Doing one
-    round per full graph pass avoids that: each round's profile update is
-    committed by intent_discovery_node/context_discovery_node before this
-    node runs again.
+    A gap that survives intent is therefore not automatically a reason to
+    stop -- it's usually a reason to recommend loosely and let the user
+    steer. The one case worth a fresh question is a *new* ambiguity intent
+    had no way to name (e.g. a saved dietary preference now conflicting with
+    what the user just asked for): that gets asked too, but via
+    `pending_decision_question` + `CLARIFY_AND_RETRY`, so intent_discovery_node
+    is still the only place `interrupt()` is ever called from, and its own
+    round budget (`clarification_rounds`, capped at `MAX_CLARIFICATION_ROUNDS`)
+    still applies. The only genuine dead end is a profile with nothing
+    filterable in it at all once that budget is spent.
     """
     intent_profile = _coerce_profile(state.get("intent_profile"))
     context_profile = _coerce_profile(state.get("context_profile"))
     history_profile = _coerce_profile(state.get("history_profile"))
+    preference_profile = _coerce_profile(state.get("preference_profile"))
     messages = state.get("messages") or []
     user_input = _extract_latest_user_input(messages)
-    summary = _build_summary(intent_profile, context_profile, history_profile, user_input)
+    summary = _build_summary(
+        intent_profile, context_profile, history_profile, preference_profile, user_input
+    )
 
     debug("decision_agent", f"user_input={user_input!r}")
     debug("decision_agent", f"intent_profile={intent_profile}")
     debug("decision_agent", f"context_profile={context_profile}")
-    debug("decision_agent", f"clarification_rounds so far={state.get('clarification_rounds') or 0}")
-
-    asked_fields = list(state.get("asked_clarification_fields") or [])
-    exhausted = False
-
-    if _needs_clarification(user_input, intent_profile, context_profile):
-        rounds = int(state.get("clarification_rounds") or 0)
-        field, question = _next_clarification(intent_profile, context_profile, asked_fields)
-        debug("decision_agent", f"needs_clarification=True (already asked: {asked_fields})")
-
-        if field is None:
-            # Every gap has already been put to the user once. Asking again
-            # would just repeat ourselves, so proceed with what we have.
-            debug("decision_agent", "no unasked gaps left — proceeding with the profile as-is")
-            exhausted = True
-        elif rounds >= MAX_CLARIFICATION_ROUNDS:
-            debug("decision_agent", f"MAX_CLARIFICATION_ROUNDS ({MAX_CLARIFICATION_ROUNDS}) reached — proceeding anyway")
-            exhausted = True
-        else:
-            debug(
-                "decision_agent",
-                f"asking (round {rounds + 1}/{MAX_CLARIFICATION_ROUNDS}) about {field!r}: {question!r}",
-            )
-            answer = interrupt({
-                "question": question,
-                "agent": "decision_agent",
-                "field": field,
-                "intent_profile": intent_profile,
-                "context_profile": context_profile,
-            })
-            debug("decision_agent", f"got answer for {field!r}: {answer!r}")
-            return {
-                # The question itself must also land in `messages`, not just
-                # the answer -- a bare reply like "Indian" or "500" carries no
-                # context when intent_discovery_node re-reads the history.
-                # `pending_clarification_field` is the belt-and-braces version
-                # of that: it lets intent_discovery apply the answer to the
-                # right field without the model having to infer anything.
-                "messages": [
-                    AIMessage(content=question, name="decision_agent"),
-                    HumanMessage(content=str(answer)),
-                ],
-                "ready_to_recommend": False,
-                "decision": CLARIFY_AND_RETRY,
-                "summary": summary,
-                "clarification_rounds": rounds + 1,
-                "pending_clarification_field": field,
-                "asked_clarification_fields": asked_fields + [field],
-            }
+    debug("decision_agent", f"preference_profile={preference_profile}")
+    # Whatever intent could not fill, it has already asked about and given up
+    # on. Treat that as spent rather than as a fresh reason to interrogate.
+    exhausted = bool(intent_profile.get("important_missing_information"))
+    debug("decision_agent", f"gaps left by intent={intent_profile.get('important_missing_information')}")
 
     debug("decision_agent", f"asking the decision LLM (exhausted={exhausted})")
     payload = {
-        "user_input": user_input,
-        "intent_profile": intent_profile,
-        # "context_profile": context_profile,
-        "history_profile": history_profile,
         "summary": summary,
     }
+    debug("decision_agent", f"payload={payload}")
     try:
         structured_llm = get_llm().with_structured_output(DecisionOutput)
         decision_output = structured_llm.invoke([
@@ -378,7 +320,16 @@ def decision_agent_node(state: CravrState) -> dict:
     ready_to_recommend = bool(result.get("ready_to_recommend"))
     decision = result.get("decision") if result.get("decision") in {"recommend", "clarify"} else "clarify"
 
-    if exhausted and not ready_to_recommend and _has_usable_signal(intent_profile):
+    # Decision-level round budget, separate from intent's own (tracked in
+    # `intent_profile["important_missing_information"]`/`exhausted` above).
+    # This is what caps *this* node's own ad hoc questions -- the ones intent
+    # never asked about, like a saved-preference conflict -- at
+    # MAX_CLARIFICATION_ROUNDS instead of letting the decision LLM invent a
+    # new question forever.
+    clarification_rounds = int(state.get("clarification_rounds") or 0)
+    give_up = exhausted or clarification_rounds >= MAX_CLARIFICATION_ROUNDS
+
+    if give_up and not ready_to_recommend and _has_usable_signal(intent_profile):
         # We've spent the clarification budget and the user did tell us
         # *something* usable. Ending the turn with another question is the
         # worst outcome; attempt a (deliberately loosely-filtered)
@@ -387,8 +338,30 @@ def decision_agent_node(state: CravrState) -> dict:
         ready_to_recommend = True
         decision = "recommend"
 
-    if exhausted:
-        # Out of clarification budget: never echo the question we just gave up
+    if not ready_to_recommend and not give_up:
+        # Ask with tappable options instead of ending the turn on a
+        # type-it-yourself question -- see the module docstring for why this
+        # hands the question to intent_discovery_node rather than asking it
+        # directly.
+        pending_question = result.get("clarification_message") or _next_clarification_question(
+            intent_profile, context_profile
+        )
+        debug(
+            "decision_agent",
+            f"handing question to intent_discovery (round {clarification_rounds + 1}/"
+            f"{MAX_CLARIFICATION_ROUNDS}): {pending_question!r}",
+        )
+        return {
+            "ready_to_recommend": False,
+            "decision": CLARIFY_AND_RETRY,
+            "pending_decision_question": pending_question,
+            "pending_clarification_field": GENERIC_CLARIFICATION_FIELD,
+            "clarification_rounds": clarification_rounds + 1,
+            "summary": summary,
+        }
+
+    if give_up:
+        # Out of clarification budget: never echo a question we just gave up
         # on, or the user's reply restarts the streak from scratch.
         fallback_message = GIVE_UP_MESSAGE
     else:
@@ -408,12 +381,15 @@ def decision_agent_node(state: CravrState) -> dict:
         "clarification_rounds": 0,
         "asked_clarification_fields": [],
         "pending_clarification_field": None,
+        "pending_decision_question": None,
     }
 
     if ready_to_recommend:
         # Freeze the request exactly once, at the moment we commit to
         # recommending. Everything downstream reads this and only this.
-        brief = build_recommendation_brief(intent_profile, history_profile)
+        brief = build_recommendation_brief(
+            intent_profile, history_profile, preference_profile
+        )
         debug("decision_agent", f"brief filters={brief['filters']} history={brief['history']}")
         debug("decision_agent", f"brief summary={brief['summary']!r}")
         updates["recommendation_brief"] = brief

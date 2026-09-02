@@ -4,8 +4,10 @@ from unittest.mock import patch
 from langchain_core.messages import HumanMessage
 
 from cravr.graph import FEEDBACK, NEW_REQUEST, _route_entry, app
-from cravr.RecommendAgent import (
+from cravr.recommend.RecommendAgent import (
+    ONLY_MATCH_OPTIONS,
     _build_recommendation_filters,
+    _dish_pick_options,
     build_recommendation_brief,
     _filter_variants,
     _looks_like_acceptance,
@@ -118,7 +120,7 @@ class FilterRelaxationTests(unittest.TestCase):
                 return []
             return [{"item_name": "Pad Thai", "cuisine": "Thai", "rating": 4.3, "tags": "spicy"}]
 
-        with patch("cravr.RecommendAgent._call_recommendation_tool", side_effect=fake_call):
+        with patch("cravr.recommend.RecommendAgent._call_recommendation_tool", side_effect=fake_call):
             results = fetch_recommendations(build_recommendation_brief({"cuisine": "Indian", "taste_preference": ["spicy"]}, {}))
 
         # main+cuisine, then main,side+cuisine, then cuisine dropped.
@@ -140,7 +142,7 @@ class FilterRelaxationTests(unittest.TestCase):
             # Nothing carries the tag (e.g. a stale menu), forcing relaxation.
             return [] if "tags" in filters or "cuisine" in filters else whole_menu
 
-        with patch("cravr.RecommendAgent._call_recommendation_tool", side_effect=fake_call):
+        with patch("cravr.recommend.RecommendAgent._call_recommendation_tool", side_effect=fake_call):
             results = fetch_recommendations(build_recommendation_brief({"cuisine": "Indian", "taste_preference": ["spicy"], "dietary_preferences": ["vegetarian"]}, {}))
 
         self.assertEqual(results[0]["item_name"], "Chole Bhature")
@@ -152,7 +154,7 @@ class FilterRelaxationTests(unittest.TestCase):
         ]
         history = {"orders": [{"cuisine": "South Indian", "item_name": "Idli"}]}
 
-        with patch("cravr.RecommendAgent._call_recommendation_tool", return_value=menu):
+        with patch("cravr.recommend.RecommendAgent._call_recommendation_tool", return_value=menu):
             results = fetch_recommendations(build_recommendation_brief({"taste_preference": ["spicy"]}, history))
 
         self.assertEqual(results[0]["item_name"], "Masala Dosa")
@@ -204,7 +206,7 @@ class CourseTests(unittest.TestCase):
             {"item_name": "Garlic Naan", "course": "side", "rating": 4.9, "tags": "savory", "cuisine": "North Indian"},
             {"item_name": "Dal Makhani", "course": "main", "rating": 4.2, "tags": "savory", "cuisine": "North Indian"},
         ]
-        with patch("cravr.RecommendAgent._call_recommendation_tool", return_value=results):
+        with patch("cravr.recommend.RecommendAgent._call_recommendation_tool", return_value=results):
             ranked = fetch_recommendations(build_recommendation_brief({"taste_preference": ["savory"]}, {}))
         self.assertEqual(ranked[0]["item_name"], "Dal Makhani")
 
@@ -242,12 +244,15 @@ class RecommendationAgentTests(unittest.TestCase):
             }
         ]
 
-        with patch("cravr.RecommendAgent.fetch_recommendations", return_value=recommendations):
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=recommendations):
             result = recommendation_agent_node(state)
 
         self.assertIn("Plain Idli", result["messages"][0].content)
         self.assertTrue(result["recommendation_state"]["awaiting_feedback"])
         self.assertEqual(result["recommendation_state"]["last_recommendations"], recommendations)
+        # A single match offers yes/widen buttons, not a dish-pick list --
+        # there's only one dish, nothing to pick between.
+        self.assertEqual(result["recommendation_state"]["options"], ONLY_MATCH_OPTIONS)
 
     def test_confirms_when_user_accepts_recommendation(self):
         state = {
@@ -274,7 +279,7 @@ class RecommendationAgentTests(unittest.TestCase):
             },
         }
 
-        with patch("cravr.RecommendAgent.fetch_recommendations", return_value=[]):
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=[]):
             result = recommendation_agent_node(state)
 
         self.assertIn("Plain Idli", result["messages"][0].content)
@@ -322,7 +327,7 @@ class BriefHandoffTests(unittest.TestCase):
             "history_profile": {"orders": []},
             "recommendation_brief": {"filters": {"cuisine": "Thai"}, "history": {}, "summary": "thai"},
         }
-        with patch("cravr.RecommendAgent.fetch_recommendations", side_effect=fake_fetch):
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", side_effect=fake_fetch):
             recommendation_agent_node(state)
 
         self.assertEqual(seen["filters"], {"cuisine": "Thai"})
@@ -343,7 +348,7 @@ class ThreeSuggestionTests(unittest.TestCase):
     def _offer(self, menu=None):
         state = {"messages": [{"role": "user", "content": "something spicy"}],
                  "recommendation_brief": {"filters": {}, "history": {}, "summary": ""}}
-        with patch("cravr.RecommendAgent.fetch_recommendations", return_value=menu or self.MENU):
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=menu or self.MENU):
             return recommendation_agent_node(state)
 
     def _follow_up(self, offered, reply, alternates=()):
@@ -353,7 +358,7 @@ class ThreeSuggestionTests(unittest.TestCase):
             "recommendation_state": {"awaiting_feedback": True, "satisfied": False,
                                      "last_recommendations": offered, "alternates": list(alternates)},
         }
-        with patch("cravr.RecommendAgent.fetch_recommendations", return_value=[]):
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=[]):
             return recommendation_agent_node(state)
 
     def test_offers_three_and_keeps_the_rest_as_alternates(self):
@@ -445,9 +450,88 @@ class ThreeSuggestionTests(unittest.TestCase):
         }
         fresh = [{"item_name": "Butter Chicken", "restaurant_name": "Punjab Grill",
                   "cuisine": "North Indian", "price_inr": 420, "rating": 4.5, "course": "main"}]
-        with patch("cravr.RecommendAgent.fetch_recommendations", return_value=fresh):
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=fresh):
             result = recommendation_agent_node(state)
         self.assertIn("Butter Chicken", result["messages"][0].content)
+
+
+class RecommendationOptionsTests(unittest.TestCase):
+    """UI/components.py renders `recommendation_state["options"]` as tappable
+    buttons (see UI/graph_bridge.py's process_result), same treatment as a
+    clarification question's options -- these check RecommendAgent builds
+    the right buttons for each branch, kept in sync with the numbered text
+    by construction (`_dish_pick_options`/`ONLY_MATCH_OPTIONS` are the single
+    source of truth for both)."""
+
+    MENU = ThreeSuggestionTests.MENU
+
+    def _offer(self, menu=None):
+        state = {"messages": [{"role": "user", "content": "something spicy"}],
+                 "recommendation_brief": {"filters": {}, "history": {}, "summary": ""}}
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=menu or self.MENU):
+            return recommendation_agent_node(state)
+
+    def _follow_up(self, offered, reply, alternates=()):
+        state = {
+            "messages": [{"role": "user", "content": reply}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": {"awaiting_feedback": True, "satisfied": False,
+                                     "last_recommendations": offered, "alternates": list(alternates)},
+        }
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=[]):
+            return recommendation_agent_node(state)
+
+    def test_a_fresh_batch_of_three_gets_one_button_per_dish(self):
+        result = self._offer()
+        offered = result["recommendation_state"]["last_recommendations"]
+        self.assertEqual(result["recommendation_state"]["options"], _dish_pick_options(offered))
+        self.assertEqual(
+            [o["value"] for o in result["recommendation_state"]["options"]], ["1", "2", "3"],
+        )
+        self.assertEqual(
+            [o["label"] for o in result["recommendation_state"]["options"]],
+            ["Hyderabadi Veg Biryani", "Schezwan Paneer", "Green Curry with Rice"],
+        )
+
+    def test_fewer_than_three_still_gets_a_button_per_dish(self):
+        result = self._offer(self.MENU[:2])
+        self.assertEqual(len(result["recommendation_state"]["options"]), 2)
+
+    def test_more_request_carries_options_for_the_new_batch(self):
+        result = self._follow_up(self.MENU[:3], "more", alternates=self.MENU[3:])
+        self.assertEqual(
+            [o["label"] for o in result["recommendation_state"]["options"]], ["Chole Bhature"],
+        )
+
+    def test_ambiguous_yes_against_three_offers_the_same_three_as_buttons(self):
+        result = self._follow_up(self.MENU[:3], "yes")
+        self.assertEqual(result["recommendation_state"]["options"], _dish_pick_options(self.MENU[:3]))
+
+    def test_confirmed_pick_has_no_more_options(self):
+        """Once a dish is chosen there's nothing left to pick -- no stale
+        buttons should linger under the confirmation message."""
+        result = self._follow_up(self.MENU[:3], "2")
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertNotIn("options", result["recommendation_state"])
+
+    def test_declining_the_only_match_offers_the_widened_batch_as_buttons(self):
+        result = self._offer(self.MENU[:1])
+        self.assertEqual(result["recommendation_state"]["options"], ONLY_MATCH_OPTIONS)
+
+        state = {
+            "messages": [{"role": "user", "content": "widen the search"}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": {
+                "awaiting_feedback": True, "satisfied": False,
+                "last_recommendations": self.MENU[:1], "alternates": [],
+            },
+        }
+        with patch("cravr.recommend.RecommendAgent.widen_recommendations", return_value=self.MENU[1:4]):
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(
+            result["recommendation_state"]["options"], _dish_pick_options(self.MENU[1:4]),
+        )
 
 
 class FeedbackShortcutTests(unittest.TestCase):

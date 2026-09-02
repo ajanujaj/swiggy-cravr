@@ -9,14 +9,13 @@ import re
 from collections import Counter
 from typing import Any
 
-from fastmcp import Client
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from .debug_utils import debug
-from .intentAgent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
-from .llm import get_llm
-from .profile_utils import latest_user_text
-from .state import CravrState
+from ..debug_utils import debug
+from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
+from ..llm import get_llm
+from ..profile_utils import latest_user_text
+from ..state import CravrState
 
 
 DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
@@ -142,7 +141,7 @@ def _build_recommendation_text(recommendations: list[dict[str, Any]]) -> str:
     if len(recommendations) == 1:
         return (
             f"I’d suggest {_describe(recommendations[0])} — that's the only match "
-            f"for what you asked. Want it, or shall I widen the search?"
+            f"for what you asked.\n{ONLY_MATCH_PROMPT}"
         )
 
     return (
@@ -152,9 +151,38 @@ def _build_recommendation_text(recommendations: list[dict[str, Any]]) -> str:
 
 PICK_PROMPT = "Pick one by number or name, ask for more, or tell me what to change."
 
+# Numbered so the single-match confirmation costs one keystroke too, same as
+# the multi-dish list above -- "Want it, or shall I widen the search?" used
+# to be a plain yes/no the user had to type out in full.
+ONLY_MATCH_PROMPT = "    1. Yes, I'll take it\n    2. Widen the search"
+
 
 def _numbered(dishes: list[dict[str, Any]]) -> str:
     return "\n".join(f"  {i}. {_describe(d)}" for i, d in enumerate(dishes, start=1))
+
+
+def _dish_pick_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Tappable buttons for a numbered dish list, matching `_numbered`'s order.
+
+    Values are the bare position ("1", "2", ...) -- the same thing a typed
+    digit already resolves to via `_resolve_choice` -- so tapping a button
+    and typing the number take the exact same path through `is_pure_feedback`
+    / `recommendation_agent_node`. Labels use the dish name so the button
+    itself says what you're picking, not just a number.
+    """
+    return [
+        {"value": str(i), "label": d.get("item_name") or f"Option {i}"}
+        for i, d in enumerate(dishes, start=1)
+    ]
+
+
+# Matches `ONLY_MATCH_PROMPT`'s two lines exactly -- kept as a single source
+# of truth so the buttons the UI renders can never drift out of sync with
+# the text describing them.
+ONLY_MATCH_OPTIONS = [
+    {"value": "1", "label": "Yes, I'll take it"},
+    {"value": "2", "label": "Widen the search"},
+]
 
 
 # Ordinals are matched before cardinals, and that ordering is load-bearing:
@@ -334,8 +362,30 @@ def _brief_summary(filters: dict[str, Any], history: dict[str, Any]) -> str:
     return "; ".join(parts) + "."
 
 
+def _apply_saved_preferences(
+    intent_profile: dict[str, Any], preference_profile: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Apply durable defaults only where this request did not specify one."""
+    merged = dict(intent_profile)
+    preferences = _coerce_profile(preference_profile).get("preferences") or {}
+    # Support the older MCP response shape while clients migrate to one
+    # profile object per user.
+    if isinstance(preferences, list):
+        preferences = preferences[0] if preferences else {}
+    if not isinstance(preferences, dict):
+        return merged
+
+    if merged.get("budget_inr") is None and preferences.get("default_budget_inr") is not None:
+        merged["budget_inr"] = preferences["default_budget_inr"]
+    if not merged.get("dietary_preferences") and preferences.get("dietary_preference"):
+        merged["dietary_preferences"] = [preferences["dietary_preference"]]
+    return merged
+
+
 def build_recommendation_brief(
-    intent_profile: dict[str, Any], history_profile: dict[str, Any]
+    intent_profile: dict[str, Any],
+    history_profile: dict[str, Any],
+    preference_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Freeze a request into everything the recommender needs, and nothing more.
 
@@ -344,7 +394,10 @@ def build_recommendation_brief(
     vocabulary, tag vocabulary, course inference) happens exactly once, rather
     than being re-derived -- or worse, re-parsed out of prose -- downstream.
     """
-    filters = _build_recommendation_filters(_coerce_profile(intent_profile))
+    effective_intent = _apply_saved_preferences(
+        _coerce_profile(intent_profile), preference_profile
+    )
+    filters = _build_recommendation_filters(effective_intent)
     history = _summarise_history(_coerce_profile(history_profile))
     return {"filters": filters, "history": history, "summary": _brief_summary(filters, history)}
 
@@ -450,6 +503,8 @@ def _unwrap_tool_result(result: Any) -> list[dict[str, Any]]:
 
 def _call_recommendation_tool(filters: dict[str, Any]) -> list[dict[str, Any]]:
     async def _call_tool() -> Any:
+        from fastmcp import Client
+
         async with Client(DEFAULT_MCP_URL) as client:
             return await client.call_tool(name="recommendation", arguments=filters)
 
@@ -503,6 +558,42 @@ def fetch_recommendations(brief: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def widen_recommendations(
+    brief: dict[str, Any], exclude_items: set[str] | None = None
+) -> list[dict[str, Any]]:
+    """Deliberately relax the search beyond the strict match.
+
+    For when `fetch_recommendations` only turned up a single result and the
+    user asked to see more rather than take it. Reuses the exact same
+    relaxation cascade (`_filter_variants`), just starting one step past the
+    strict variant that already ran -- so `dietary_type` and budget are still
+    never relaxed, only cuisine/tags/course, same as any other fallback.
+    """
+    brief = _coerce_profile(brief)
+    filters = dict(brief.get("filters") or {})
+    history = _coerce_profile(brief.get("history"))
+    exclude = {str(name).strip().lower() for name in (exclude_items or set())}
+
+    desired_tags = [t for t in str(filters.get("tags") or "").split(",") if t]
+    desired_cuisine = filters.get("cuisine")
+    desired_course = filters.get("course")
+
+    # [0] is the exact-match variant that produced the single result already
+    # shown; skip straight to the first relaxed one.
+    for attempt, variant in enumerate(_filter_variants(filters)[1:], start=1):
+        recommendations = _call_recommendation_tool(variant)
+        recommendations = [
+            item for item in recommendations
+            if str(item.get("item_name") or "").strip().lower() not in exclude
+        ]
+        debug("recommendation_agent", f"widen attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
+        if recommendations:
+            return _rank_candidates(recommendations, desired_tags, desired_cuisine, desired_course, history)
+
+    debug("recommendation_agent", "widen found nothing beyond the original match")
+    return []
+
+
 def _carries_new_constraints(user_input: str) -> bool:
     """True when the message changes the request rather than just reacting to it."""
     normalized = (user_input or "").strip().lower()
@@ -514,6 +605,20 @@ def _carries_new_constraints(user_input: str) -> bool:
     if any(word in normalized for word in KNOWN_CUISINE_WORDS):
         return True
     return _mentions(normalized, VEG_ANSWERS + NON_VEG_ANSWERS)
+
+
+# The single-match confirmation offers exactly two numbered choices (see
+# `ONLY_MATCH_PROMPT`); "2" only means "widen the search" in that specific
+# context -- against a real multi-dish list "2" still means "the second
+# one", handled separately by `_resolve_choice`.
+WIDEN_TOKENS = ("widen", "broaden", "expand", "wider")
+
+
+def _looks_like_decline_only_offer(user_input: str) -> bool:
+    normalized = (user_input or "").strip().lower().rstrip(".!")
+    if normalized == "2":
+        return True
+    return _looks_like_rejection(user_input) or _mentions(user_input, WIDEN_TOKENS)
 
 
 def is_pure_feedback(user_input: str, recommendation_state: dict[str, Any] | None) -> bool:
@@ -536,6 +641,16 @@ def is_pure_feedback(user_input: str, recommendation_state: dict[str, Any] | Non
 
     # An explicit pick is unambiguous even if it collides with other vocabulary.
     if _resolve_choice(user_input, offered):
+        return True
+    # Same reasoning for the single-match confirmation's "2": there's no
+    # dish #2 to resolve above, but a bare "2" is just as unambiguous a click
+    # as a real positional pick, so it skips the new-constraints gate too --
+    # otherwise this one reply would take the full intent/context/decision
+    # round-trip just to land back on the widen branch in
+    # `recommendation_agent_node`. A typed-out "widen the search" isn't
+    # this unambiguous (it could be riding along with a real new
+    # constraint), so it still goes the long way round via that gate below.
+    if len(offered) == 1 and (user_input or "").strip().rstrip(".!") == "2":
         return True
     if _carries_new_constraints(user_input):
         return False
@@ -572,6 +687,7 @@ def _serve_next_batch(
             f"{lead_in}\n{_numbered(batch)}\n{PICK_PROMPT}",
             awaiting_feedback=True, satisfied=False,
             last_recommendations=batch, alternates=rest, filters=filters,
+            options=_dish_pick_options(batch),
         )
 
     debug("recommendation_agent", "no alternates left to offer")
@@ -619,6 +735,29 @@ def recommendation_agent_node(state: CravrState) -> dict:
                 awaiting_feedback=False, satisfied=True, last_recommendations=[chosen],
             )
 
+        # The single-match confirmation's own "2" (see `ONLY_MATCH_PROMPT`),
+        # or a typed-out decline/widen, actually broadens the search rather
+        # than just asking the user to spell out a change -- checked ahead of
+        # the generic rejection branch below, which only offers to change,
+        # never to search again itself.
+        if len(offered) == 1 and _looks_like_decline_only_offer(user_input):
+            debug("recommendation_agent", "user declined the only match — widening the search")
+            already_shown = {str(d.get("item_name") or "") for d in offered}
+            widened = widen_recommendations(brief, exclude_items=already_shown)
+            if widened:
+                batch, rest = widened[:DISPLAY_COUNT], widened[DISPLAY_COUNT:]
+                return _reply(
+                    f"Here's what turns up with a wider search:\n{_numbered(batch)}\n{PICK_PROMPT}",
+                    awaiting_feedback=True, satisfied=False,
+                    last_recommendations=batch, alternates=rest, filters=brief_filters,
+                    options=_dish_pick_options(batch),
+                )
+            return _reply(
+                "That really was the only close match — tell me what to change (cuisine, "
+                "budget, or dietary preference) and I'll look again.",
+                awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+            )
+
         if _looks_like_more_request(user_input):
             debug("recommendation_agent", "user asked for more")
             return _serve_next_batch("Here are a few more:", offered, alternates, brief_filters)
@@ -634,6 +773,7 @@ def recommendation_agent_node(state: CravrState) -> dict:
                 f"Which one would you like — {' or '.join(str(i) for i in range(1, len(offered) + 1))}?",
                 awaiting_feedback=True, satisfied=False,
                 last_recommendations=offered, alternates=alternates, filters=brief_filters,
+                options=_dish_pick_options(offered),
             )
 
         if _looks_like_rejection(user_input):
@@ -669,4 +809,5 @@ def recommendation_agent_node(state: CravrState) -> dict:
         _build_recommendation_text(batch),
         awaiting_feedback=True, satisfied=False,
         last_recommendations=batch, alternates=rest, filters=brief_filters,
+        options=ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch),
     )

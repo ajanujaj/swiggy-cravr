@@ -1,0 +1,3 @@
+user_id,user_name,default_city,default_delivery_area,default_budget_inr,dietary_preference,allergies,preferred_cuisines,preferred_flavors
+USR-001,Aarav Sharma,Bengaluru,Koramangala,500,Non-Veg,Peanuts,North Indian;Chinese;Japanese,spicy;savory
+USR-002,Sara Sharma,Bengaluru,Indiranagar,400,Veg,Dairy,South Indian;Italian;Continental,sweet;lightweight
