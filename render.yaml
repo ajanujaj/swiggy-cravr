@@ -1,0 +1,68 @@
+# Render blueprint for Cravr's two independent services. Deploy via Render's
+# "New +" -> "Blueprint" pointing at this repo, or create each web service
+# by hand using the settings below.
+#
+# IMPORTANT: Render assigns each service's *.onrender.com URL from whatever
+# name you actually give it at creation time, and that name must be
+# globally unique across every Render account -- the names below may
+# already be taken, in which case Render appends a random suffix and your
+# real URL differs from the one guessed here. Create the "cravr-app"
+# service first, copy the URL Render actually shows you, THEN set
+# SWIGGY_REDIRECT_URI to match it if it differs, and submit that exact URL
+# (with /oauth/callback appended) to Swiggy for whitelisting -- not a
+# guessed one.
+services:
+  # The chat UI + the Swiggy OAuth callback, combined (see server.py). This
+  # is the service whose URL gets whitelisted with Swiggy.
+  - type: web
+    name: cravr-app
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      # Where this service reaches the mock-data tool server (see the
+      # cravr-mock-mcp service below). Defaults to localhost, which only
+      # works when both run on one machine -- once cravr-mock-mcp is
+      # deployed on Render too, this must point at its real public URL +
+      # "/mcp", or every tool call (recommendations, order history,
+      # preferences) will fail even though the chat UI itself loads fine.
+      - key: CRAVR_MCP_URL
+        sync: false
+      # Only matters for whitelisting -- it's what /oauth/login sends to
+      # Swiggy and must exactly match what's on file with Builders Club.
+      # Leave unset until you know this service's real Render URL (see the
+      # note above); it defaults to https://cravr-swiggy-mcp.onrender.com/oauth/callback,
+      # a name chosen before this service was split out, so it almost
+      # certainly needs to be set explicitly now.
+      - key: SWIGGY_REDIRECT_URI
+        sync: false
+      # The rest can stay unset for now -- /oauth/callback is live and
+      # whitelist-able without them. Fill them in once Builders Club grants
+      # production credentials; /oauth/login and the token exchange start
+      # working the moment they're set, no code change needed.
+      - key: SWIGGY_CLIENT_ID
+        sync: false
+      - key: SWIGGY_CLIENT_SECRET
+        sync: false
+      - key: SWIGGY_AUTHORIZE_URL
+        sync: false
+      - key: SWIGGY_TOKEN_URL
+        sync: false
+      - key: SWIGGY_SCOPES
+        sync: false
+
+  # The mock-data MCP tool server -- stands in for Swiggy's real MCP tools
+  # while building/testing. Deliberately separate and Swiggy-agnostic: no
+  # public whitelisting, no OAuth, nothing riding on it. Once real Swiggy
+  # MCP access exists, delete this service (and, if you like, the
+  # mcp_server/ directory) and point cravr-app's CRAVR_MCP_URL at Swiggy's
+  # real endpoint instead -- that's the entire migration.
+  - type: web
+    name: cravr-mock-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp_server/run_mcp.py

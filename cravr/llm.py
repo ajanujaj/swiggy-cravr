@@ -11,7 +11,7 @@ from .debug_utils import debug
 
 # Walks up from this file's directory to find the project's .env, so it
 # resolves correctly regardless of the working directory the CLI, tests, or
-# Streamlit were launched from.
+# the chat UI's server process were launched from.
 load_dotenv()
 
 _llm: Any | None = None

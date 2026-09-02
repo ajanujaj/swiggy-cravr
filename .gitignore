@@ -11,3 +11,6 @@ htmlcov/
 .DS_Store
 *.log
 .env
+mcp_server/data/swiggy_tokens.json
+.chainlit/.files
+chainlit.db

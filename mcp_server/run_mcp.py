@@ -1,8 +1,15 @@
+import os
 from pathlib import Path
 
 import pandas as pd
 from fastmcp import FastMCP
 
+# Deliberately just the mock-data tool server -- no OAuth, no LLM calls, no
+# other env vars. The Swiggy OAuth callback lives on server.py instead (see
+# mcp_server/oauth.py, mounted there alongside the chat UI) precisely so
+# this file has nothing else riding on it: once real Swiggy MCP access
+# exists, deleting this directory and pointing CRAVR_MCP_URL at Swiggy's
+# real endpoint is the entire migration -- nothing here to untangle first.
 app = FastMCP("recommendation-server")
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -186,9 +193,13 @@ def user_location(user_id: str) -> dict:
 
 
 if __name__ == "__main__":
+    # 0.0.0.0 + $PORT so this same script is what Render (or any host that
+    # assigns its own port) runs -- locally $PORT is unset, so this still
+    # binds 127.0.0.1-reachable 8000, matching CRAVR_MCP_URL's default in
+    # cravr/client.py.
     app.run(
         transport="streamable-http",
-        host="127.0.0.1",
-        port=8000,
+        host="localhost",
+        port=int(os.environ.get("PORT", 8000)),
         path="/mcp",
     )

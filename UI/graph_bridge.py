@@ -1,9 +1,23 @@
-"""Bridge between Streamlit session state and the compiled Cravr LangGraph app.
+"""Bridge between the Chainlit chat session and the compiled Cravr LangGraph app.
 
 Owns every call into `cravr.graph.app` -- starting a thread, sending a
-free-text message, and resuming an `interrupt()` -- and translates each
-result into `st.session_state.history` entries. `components.py` only reads
-what this module writes; no other UI module calls into the graph directly.
+free-text message, and resuming an `interrupt()` -- and turns each result
+directly into chat message(s) via `components.py`. No other UI module
+calls into the graph directly.
+
+Ported from the Streamlit version of this file 1:1 in *responsibility*:
+the exact same invoke/interrupt/resume contract `cravr/run.py` (the CLI)
+already uses. What changes is *mechanics* -- Streamlit reran this whole
+script on every click and read `st.session_state.history` back in a
+separate render pass; Chainlit is message-stream-native, so this module
+sends messages itself, via `components.py`, the moment each result is
+ready -- no rerun, no separate render step.
+
+`cravr.graph.app.invoke(...)` is still the exact same *synchronous* call
+the CLI and Streamlit both used, unchanged -- wrapped in `cl.make_async` so
+it runs on a worker thread instead of blocking Chainlit's asyncio event
+loop (and every other connected user's session) for however long an LLM
+call takes.
 """
 
 from __future__ import annotations
@@ -12,33 +26,49 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import streamlit as st
+import chainlit as cl
 from langgraph.types import Command
 
 # UI/ lives one level below the repo root, next to the `cravr` package.
 # Adding the repo root to sys.path here (rather than relying on however
-# Streamlit resolves the launched script's directory) means `import cravr`
-# resolves the same way whether Streamlit is started from the repo root,
-# from inside UI/, or anywhere else.
+# Chainlit resolves the launched app file's directory) means `import cravr`
+# resolves the same way whether this is run via `chainlit run`, mounted
+# into `server.py` via `mount_chainlit`, or anything else.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from cravr.debug_utils import debug  # noqa: E402
 from cravr.graph import app as cravr_app  # noqa: E402
-from cravr.options import OTHER_VALUE  # noqa: E402
 
-DEFAULT_USER_ID = "USR-002"
+import components  # noqa: E402
+import state  # noqa: E402
+
+# Wrapped once, at import time -- cl.make_async just builds a thread-pool
+# wrapper around the function reference, no per-call cost to redo that.
+_ainvoke = cl.make_async(cravr_app.invoke)
+
+_BACKEND_ERROR_HINT = (
+    "\n\nMake sure the mock MCP server (`python mcp_server/run_mcp.py`) is "
+    "running and GROQ_API_KEY / groq_apikey is set."
+)
 
 
-def process_result(result: dict[str, Any] | None) -> None:
-    """Turn one `app.invoke(...)` result into a chat-history entry.
+async def _report_backend_error(exc: Exception) -> None:
+    await cl.Message(
+        content=f"Something went wrong talking to the backend: {exc}{_BACKEND_ERROR_HINT}",
+        author="Cravr",
+    ).send()
+
+
+async def process_result(result: dict[str, Any] | None) -> None:
+    """Turn one `app.invoke(...)` result into chat message(s).
 
     Mirrors `cravr/run.py`'s `_resume_until_complete` / `_print_assistant_reply`
-    exactly, just writing into `st.session_state.history` instead of stdout,
+    exactly, just sending Chainlit messages instead of printing to stdout,
     and stopping at the first interrupt instead of blocking on `input()` --
     the next interrupt (if any) is handled the same way on the *next* user
-    action, one Streamlit rerun at a time.
+    action, one graph invocation at a time.
     """
     if result is None:
         return
@@ -54,13 +84,11 @@ def process_result(result: dict[str, Any] | None) -> None:
             question, source, options = payload, "assistant", []
 
         debug("ui", f"interrupt from {source!r}: {question!r} options={[o.get('value') for o in options]}")
-        st.session_state.awaiting_interrupt = True
-        st.session_state.history.append(
-            {"role": "assistant", "content": question, "source": source, "options": options}
-        )
+        state.set_awaiting_interrupt(True)
+        await components.send_option_message(question, options)
         return
 
-    st.session_state.awaiting_interrupt = False
+    state.set_awaiting_interrupt(False)
 
     messages = result.get("messages") or []
     if not messages:
@@ -86,48 +114,55 @@ def process_result(result: dict[str, Any] | None) -> None:
         options = rec_state.get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
-    st.session_state.history.append(
-        {"role": "assistant", "content": content, "source": source, "dishes": dishes, "options": options}
-    )
+
+    if dishes:
+        await components.send_dish_cards(content, dishes, options)
+    else:
+        await components.send_assistant_message(content, options)
 
 
-def send(value: str, display_label: str | None = None) -> None:
-    """Send one turn to the graph: either a resume value or a fresh message."""
-    st.session_state.history.append({"role": "user", "content": display_label or value})
-    st.session_state.error = None
+async def send(value: str, display_label: str | None = None) -> None:
+    """Send one turn to the graph: either a resume value or a fresh message.
+
+    `display_label` is accepted for symmetry with the old Streamlit bridge
+    (a dish's name vs. the bare position number it resolves to) but isn't
+    used here -- `chainlit_app.on_pick` already echoes the picked label as
+    its own user-facing message before calling this, since Chainlit (unlike
+    Streamlit's full-history rerender) doesn't otherwise show what a button
+    click "said" at all.
+    """
     try:
-        if st.session_state.awaiting_interrupt:
+        if state.is_awaiting_interrupt():
             debug("ui", f"resuming interrupt with {value!r}")
-            result = cravr_app.invoke(Command(resume=value), config=st.session_state.config)
+            result = await _ainvoke(Command(resume=value), config=state.get_config())
         else:
             debug("ui", f"sending new message {value!r}")
-            result = cravr_app.invoke(
+            result = await _ainvoke(
                 {"messages": [{"role": "user", "content": value}]},
-                config=st.session_state.config,
+                config=state.get_config(),
             )
-    except Exception as exc:  # noqa: BLE001 -- surface backend errors in the UI, not a stack trace
+    except Exception as exc:  # noqa: BLE001 -- surface backend errors in the chat, not a stack trace
         debug("ui", f"invoke failed: {type(exc).__name__}: {exc}")
-        st.session_state.error = str(exc)
+        await _report_backend_error(exc)
         return
-    process_result(result)
+    await process_result(result)
 
 
-def start_conversation() -> None:
-    debug("ui", f"starting conversation thread={st.session_state.config['configurable']['thread_id']!r}")
-    st.session_state.error = None
+async def start_conversation() -> None:
+    debug("ui", f"starting conversation thread={state.get_config()['configurable']['thread_id']!r}")
     try:
-        result = cravr_app.invoke(
+        result = await _ainvoke(
             {
                 "messages": [],
                 "intent_profile": {},
                 "context_profile": {},
                 "history_profile": {},
-                "user_id": DEFAULT_USER_ID,
+                "user_id": state.DEFAULT_USER_ID,
             },
-            config=st.session_state.config,
+            config=state.get_config(),
         )
     except Exception as exc:  # noqa: BLE001
         debug("ui", f"invoke failed: {type(exc).__name__}: {exc}")
-        st.session_state.error = str(exc)
+        await _report_backend_error(exc)
         return
-    process_result(result)
+    await process_result(result)
