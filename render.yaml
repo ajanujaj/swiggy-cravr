@@ -33,24 +33,22 @@ services:
         sync: false
       # Only matters for whitelisting -- it's what /oauth/login sends to
       # Swiggy and must exactly match what's on file with Builders Club.
-      # Leave unset until you know this service's real Render URL (see the
-      # note above); it defaults to https://cravr-swiggy-mcp.onrender.com/oauth/callback,
-      # a name chosen before this service was split out, so it almost
-      # certainly needs to be set explicitly now.
+      # Defaults to https://cravr-app.onrender.com/oauth/callback (see
+      # mcp_server/oauth.py) -- only set this if your actual Render URL for
+      # this service ends up different from that.
       - key: SWIGGY_REDIRECT_URI
         sync: false
-      # The rest can stay unset for now -- /oauth/callback is live and
-      # whitelist-able without them. Fill them in once Builders Club grants
-      # production credentials; /oauth/login and the token exchange start
-      # working the moment they're set, no code change needed.
-      - key: SWIGGY_CLIENT_ID
+      # Base URL of Swiggy's MCP server -- where /oauth/login starts OAuth
+      # metadata discovery (RFC 9728 / RFC 8414) and dynamic client
+      # registration (RFC 7591). Swiggy confirmed only the redirect URI
+      # above needs to be whitelisted -- no client_id/secret/endpoint URLs
+      # are issued manually, so this is the only OAuth value left to set.
+      # Same URL you'll likely also use for CRAVR_MCP_URL once real tool
+      # calls replace the mock server.
+      - key: SWIGGY_MCP_URL
         sync: false
-      - key: SWIGGY_CLIENT_SECRET
-        sync: false
-      - key: SWIGGY_AUTHORIZE_URL
-        sync: false
-      - key: SWIGGY_TOKEN_URL
-        sync: false
+      # Optional -- space-separated OAuth scopes to request, if Swiggy's
+      # docs specify any. Leave unset to request none.
       - key: SWIGGY_SCOPES
         sync: false
 

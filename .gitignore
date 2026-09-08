@@ -12,5 +12,6 @@ htmlcov/
 *.log
 .env
 mcp_server/data/swiggy_tokens.json
+mcp_server/data/swiggy_client.json
 .chainlit/.files
 chainlit.db

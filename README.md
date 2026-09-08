@@ -89,6 +89,8 @@ Environment variables:
 
 ## Deploying
 
+Both services need Python 3.12, same as local dev (see "Run" above) -- Render's own default (3.14.3 as of writing) hits the exact same Chainlit/gevent build failure documented there. A `.python-version` file at the repo root pins this for Render automatically; nothing else to configure for it.
+
 Two Render services (see `render.yaml` -- deploy both via Render's "New +" -> "Blueprint" pointing at this repo, or create them by hand with the settings below):
 
 **`cravr-app`** — the chat UI and the Swiggy OAuth callback, combined into one process by `server.py`. This is the service whose URL matters to Swiggy.
@@ -127,28 +129,38 @@ isn't exactly `https://cravr-app.onrender.com`, also set `cravr-app`'s
 same URI you registered.
 
 `/oauth/callback` is live the moment `cravr-app` is deployed, independent
-of whether you have real Swiggy credentials yet -- it's safe to submit for
-whitelisting before the rest of the OAuth env vars exist. Once Builders
-Club grants production access, set these on `cravr-app` (Render's
-Environment tab) to turn on the actual login flow:
+of whether `/oauth/login` can do anything yet -- it's why it was safe to
+submit for whitelisting right away.
 
+Builders Club confirmed that whitelisting the redirect URI above is the
+**entire** setup on their side -- no client_id, secret, authorize URL, or
+token URL gets issued manually. That's Dynamic Client Registration (RFC
+7591): `/oauth/login` discovers Swiggy's OAuth endpoints itself from
+standard `.well-known` metadata (RFC 8414 / RFC 9728) and registers Cravr
+as a client on the fly the first time it runs, caching the result in
+`mcp_server/data/swiggy_client.json` (also `.gitignore`d). See
+`mcp_server/oauth.py` for the discovery + registration + PKCE flow.
+
+The one env var this still needs is:
+
+- `SWIGGY_MCP_URL` — the base URL of Swiggy's MCP server, where discovery
+  starts. Set this on `cravr-app` (Render's Environment tab) once you have
+  it; it's likely the same URL you'll eventually use for `CRAVR_MCP_URL`
+  once real tool calls replace the mock server.
 - `SWIGGY_REDIRECT_URI` — only needed if your Render URL isn't
   `https://cravr-app.onrender.com/oauth/callback`; must exactly match
   what's whitelisted.
-- `SWIGGY_CLIENT_ID`, `SWIGGY_AUTHORIZE_URL`, `SWIGGY_TOKEN_URL` — from
-  Builders Club once approved.
-- `SWIGGY_CLIENT_SECRET` — only if Swiggy issues a confidential client;
-  omit for a public/PKCE-only client.
-- `SWIGGY_SCOPES` — space-separated, per whatever Builders Club's docs ask
-  for.
+- `SWIGGY_SCOPES` — optional, space-separated, only if Swiggy's docs call
+  for specific scopes.
 
-With those set, visiting `/oauth/login` starts the PKCE flow; Swiggy
-redirects back to `/oauth/callback`, which exchanges the code for a token
-and writes it to `mcp_server/data/swiggy_tokens.json` (already
-`.gitignore`d -- never commit it). That token isn't read by anything yet --
-getting the callback deployed and whitelisted now just means the eventual
-switch to Swiggy's real MCP tools won't be blocked on infrastructure
-later.
+With `SWIGGY_MCP_URL` set, visiting `/oauth/login` discovers Swiggy's
+endpoints, registers Cravr as a client (first time only), and starts the
+PKCE flow; Swiggy redirects back to `/oauth/callback`, which exchanges the
+code for a token and writes it to `mcp_server/data/swiggy_tokens.json`
+(already `.gitignore`d -- never commit it). That token isn't read by
+anything yet -- getting the callback deployed and whitelisted now just
+means the eventual switch to Swiggy's real MCP tools won't be blocked on
+infrastructure later.
 
 Both Render free-tier services spin down when idle and cold-start on the
 next request (tens of seconds) -- so the first message after either has
