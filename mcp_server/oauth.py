@@ -22,11 +22,11 @@ first time `/oauth/login` runs; the redirect URI is the actual security
 boundary, which is exactly why it's the one thing that has to be
 pre-approved. See `_bootstrap()` for the discovery + registration flow.
 
-That means the only thing this file still needs from you is where to
-discover from: SWIGGY_MCP_URL, the base URL of Swiggy's MCP server. The
-`/oauth/callback` route itself is live the moment this is deployed
-regardless -- it's `/oauth/login` that needs SWIGGY_MCP_URL set before it
-can do anything.
+Discovery starts from Swiggy's MCP base URL, confirmed at
+https://mcp.swiggy.com/builders/docs/start/authenticate/ and hardcoded as
+the default below (`_mcp_url()`) -- override with SWIGGY_MCP_URL only if
+that ever changes. Nothing else needs to be set for `/oauth/login` to
+work.
 
 `login()` and `callback()` are plain Starlette request-in, response-out
 functions -- not tied to any particular server framework. `server.py`
@@ -79,14 +79,15 @@ def redirect_uri() -> str:
     return _env("SWIGGY_REDIRECT_URI") or "https://cravr-app.onrender.com/oauth/callback"
 
 
-def _mcp_url() -> str | None:
+def _mcp_url() -> str:
     """Base URL of Swiggy's MCP server -- where OAuth discovery starts.
-    Almost certainly the same URL you'll eventually point CRAVR_MCP_URL at
-    once real tool calls replace the mock server; kept as its own env var
-    for now since that cutover hasn't happened yet and this needs to be
-    testable independently of it.
+    Confirmed at https://mcp.swiggy.com/builders/docs/start/authenticate/
+    (discovery lives at its .well-known paths; SWIGGY_MCP_URL only needs
+    setting if that ever changes or you want to point this at a sandbox).
+    Also likely the eventual value for CRAVR_MCP_URL once real tool calls
+    replace the mock server.
     """
-    return _env("SWIGGY_MCP_URL")
+    return _env("SWIGGY_MCP_URL") or "https://mcp.swiggy.com"
 
 
 def _new_pkce_pair() -> tuple[str, str]:
@@ -241,14 +242,6 @@ async def login(request: Request):
     """
     _prune_expired_pending()
     mcp_url = _mcp_url()
-    if not mcp_url:
-        return HTMLResponse(
-            "<p>SWIGGY_MCP_URL isn't set yet -- it's the one thing this "
-            "still needs: the base URL of Swiggy's MCP server, used to "
-            "discover its OAuth endpoints. The callback route is already "
-            "live and whitelisted either way.</p>",
-            status_code=503,
-        )
 
     async with httpx.AsyncClient(timeout=15) as http_client:
         try:
@@ -272,7 +265,7 @@ async def login(request: Request):
             "state": state,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "scope": _env("SWIGGY_SCOPES", "") or "",
+            "scope": _env("SWIGGY_SCOPES") or "mcp:tools mcp:resources mcp:prompts",
         }
     )
     return RedirectResponse(f"{authorize_endpoint}?{query}")
@@ -301,8 +294,6 @@ async def callback(request: Request):
         )
 
     mcp_url = _mcp_url()
-    if not mcp_url:
-        return HTMLResponse("<p>SWIGGY_MCP_URL isn't set -- see /oauth/login.</p>", status_code=503)
 
     async with httpx.AsyncClient(timeout=15) as http_client:
         try:

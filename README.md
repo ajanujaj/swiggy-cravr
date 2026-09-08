@@ -141,26 +141,33 @@ as a client on the fly the first time it runs, caching the result in
 `mcp_server/data/swiggy_client.json` (also `.gitignore`d). See
 `mcp_server/oauth.py` for the discovery + registration + PKCE flow.
 
-The one env var this still needs is:
+Swiggy's docs (https://mcp.swiggy.com/builders/docs/start/authenticate/)
+confirm the base MCP URL is `https://mcp.swiggy.com`, discovery lives at
+its `.well-known/oauth-authorization-server` / `.well-known/oauth-protected-resource`
+paths, and registration is Dynamic Client Registration (RFC 7591) via
+`POST /auth/register` -- `mcp_server/oauth.py` hardcodes that base URL as
+its default, so no env var is required to make this work. Two are
+available only as overrides, both optional:
 
-- `SWIGGY_MCP_URL` — the base URL of Swiggy's MCP server, where discovery
-  starts. Set this on `cravr-app` (Render's Environment tab) once you have
-  it; it's likely the same URL you'll eventually use for `CRAVR_MCP_URL`
-  once real tool calls replace the mock server.
+- `SWIGGY_MCP_URL` — only if Swiggy's base URL ever changes, or you want
+  to point at a sandbox. Defaults to `https://mcp.swiggy.com`.
 - `SWIGGY_REDIRECT_URI` — only needed if your Render URL isn't
   `https://cravr-app.onrender.com/oauth/callback`; must exactly match
   what's whitelisted.
-- `SWIGGY_SCOPES` — optional, space-separated, only if Swiggy's docs call
-  for specific scopes.
+- `SWIGGY_SCOPES` — space-separated. Defaults to Swiggy's three documented
+  scopes: `mcp:tools mcp:resources mcp:prompts`.
 
-With `SWIGGY_MCP_URL` set, visiting `/oauth/login` discovers Swiggy's
-endpoints, registers Cravr as a client (first time only), and starts the
-PKCE flow; Swiggy redirects back to `/oauth/callback`, which exchanges the
-code for a token and writes it to `mcp_server/data/swiggy_tokens.json`
-(already `.gitignore`d -- never commit it). That token isn't read by
-anything yet -- getting the callback deployed and whitelisted now just
-means the eventual switch to Swiggy's real MCP tools won't be blocked on
-infrastructure later.
+Visiting `/oauth/login` discovers Swiggy's endpoints, registers Cravr as a
+client (first time only, cached in `mcp_server/data/swiggy_client.json`),
+and starts the PKCE flow; Swiggy redirects back to `/oauth/callback`, which
+exchanges the code for a token and writes it to
+`mcp_server/data/swiggy_tokens.json` (both already `.gitignore`d -- never
+commit them). Swiggy's docs note access tokens last 5 days and refresh
+tokens aren't issued yet in v1 -- expiry just means going through
+`/oauth/login` again, nothing to build for that yet. That token isn't read
+by anything else yet -- getting the callback deployed and whitelisted now
+just means the eventual switch to Swiggy's real MCP tools won't be
+blocked on infrastructure later.
 
 Both Render free-tier services spin down when idle and cold-start on the
 next request (tens of seconds) -- so the first message after either has

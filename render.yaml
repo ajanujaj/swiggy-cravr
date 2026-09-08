@@ -38,17 +38,15 @@ services:
       # this service ends up different from that.
       - key: SWIGGY_REDIRECT_URI
         sync: false
-      # Base URL of Swiggy's MCP server -- where /oauth/login starts OAuth
+      # Base URL of Swiggy's MCP server, where /oauth/login starts OAuth
       # metadata discovery (RFC 9728 / RFC 8414) and dynamic client
-      # registration (RFC 7591). Swiggy confirmed only the redirect URI
-      # above needs to be whitelisted -- no client_id/secret/endpoint URLs
-      # are issued manually, so this is the only OAuth value left to set.
-      # Same URL you'll likely also use for CRAVR_MCP_URL once real tool
-      # calls replace the mock server.
+      # registration (RFC 7591). Defaults to https://mcp.swiggy.com in code
+      # (mcp_server/oauth.py) -- leave unset unless that changes.
       - key: SWIGGY_MCP_URL
         sync: false
-      # Optional -- space-separated OAuth scopes to request, if Swiggy's
-      # docs specify any. Leave unset to request none.
+      # Space-separated OAuth scopes. Defaults to Swiggy's three documented
+      # scopes ("mcp:tools mcp:resources mcp:prompts") in code -- leave
+      # unset unless you need something different.
       - key: SWIGGY_SCOPES
         sync: false
 
