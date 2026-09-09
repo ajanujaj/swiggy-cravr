@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from collections import Counter
@@ -9,7 +10,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from ..client import call_tool_sync
+from .. import food_mcp
+from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
 from ..llm import get_llm
@@ -497,7 +499,17 @@ def _unwrap_tool_result(result: Any) -> list[dict[str, Any]]:
     return []
 
 
+@functools.lru_cache(maxsize=1)
+def _cached_address_id() -> str | None:
+    """Resolved once per process -- Cravr's OAuth token is tied to one
+    Swiggy account, so the delivery address doesn't change mid-session."""
+    return food_mcp.get_saved_address().get("address_id")
+
+
 def _call_recommendation_tool(filters: dict[str, Any]) -> list[dict[str, Any]]:
+    if using_real_food_mcp():
+        return food_mcp.search_dishes(filters, address_id=_cached_address_id())
+
     try:
         result = call_tool_sync("recommendation", filters)
     except Exception as exc:

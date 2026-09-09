@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..client import call_tool_sync
+from .. import food_mcp
+from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..state import CravrState
 
@@ -39,10 +40,17 @@ def _call_mcp_tool(tool_name: str, user_id: str | None) -> dict[str, Any]:
 
 def fetch_order_history(user_id: str | None) -> dict[str, Any]:
     """Fetch a user's recent orders from MCP."""
+    if using_real_food_mcp():
+        return food_mcp.get_order_history()
     return _call_mcp_tool("order_history", user_id)
 
 def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
-    """Fetch a user's saved preference profile from MCP."""
+    """Fetch a user's saved preference profile from MCP.
+
+    No Swiggy Food MCP tool exposes this (checked all 20) -- stays on the
+    mock server's data even once CRAVR_MCP_URL points at Swiggy for
+    everything else. A future version could derive rough preferences from
+    get_food_orders instead of a dedicated tool call."""
     return _call_mcp_tool("user_preferences", user_id)
 
 

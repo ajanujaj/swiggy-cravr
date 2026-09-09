@@ -20,6 +20,13 @@ from fastmcp import Client
 DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
 
 
+def using_real_food_mcp() -> bool:
+    """True once CRAVR_MCP_URL points at Swiggy's real Food MCP server --
+    its tool names/schemas differ from the mock server, so agents branch
+    on this to decide which tools to call. See cravr/food_mcp.py."""
+    return "mcp.swiggy.com" in DEFAULT_MCP_URL
+
+
 def _bearer_token() -> str | None:
     try:
         from mcp_server.oauth import load_tokens

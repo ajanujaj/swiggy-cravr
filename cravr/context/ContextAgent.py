@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..client import call_tool_sync
+from .. import food_mcp
+from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..profile_utils import merge_profile
 from ..state import CravrState
@@ -13,6 +14,9 @@ from ..state import CravrState
 
 def fetch_user_location(user_id: str | None) -> dict[str, Any]:
     """Fetch saved delivery location without asking the user for it."""
+    if using_real_food_mcp():
+        return food_mcp.get_saved_address()
+
     try:
         result = call_tool_sync("user_location", {"user_id": user_id})
     except Exception as exc:  # pragma: no cover - runtime/network failure
