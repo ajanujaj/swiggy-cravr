@@ -1,10 +1,5 @@
-"""Chainlit session state for the Cravr chat UI.
-
-Chainlit gives each connected chat session its own `cl.user_session`
-key-value store -- like Streamlit's `st.session_state`, but scoped to one
-websocket connection rather than reset on every script rerun. This module
-is the one place that owns the keys the rest of the UI depends on, so no
-other module invents a key name that drifts from what's initialised here.
+"""Chainlit session state for the Cravr chat UI -- the one place that owns
+the `cl.user_session` keys the rest of the UI depends on.
 """
 
 from __future__ import annotations
@@ -22,13 +17,8 @@ _LIVE_OPTION_MESSAGES_KEY = "cravr_live_option_messages"
 
 
 def init_state() -> None:
-    """Populate this session's keys. Call once, from `@cl.on_chat_start` --
-    Chainlit calls that again for every new chat a person starts from its
-    own UI, so a fresh LangGraph thread_id (and therefore a clean
-    MemorySaver-backed conversation) falls out of that for free, the same
-    way the old Streamlit sidebar's "Start a new conversation" button used
-    to reset `st.session_state` by hand.
-    """
+    """Call once from `@cl.on_chat_start` -- gives each new chat a fresh
+    LangGraph thread_id."""
     cl.user_session.set(_THREAD_CONFIG_KEY, {"configurable": {"thread_id": str(uuid.uuid4())}})
     cl.user_session.set(_AWAITING_INTERRUPT_KEY, False)
     cl.user_session.set(_LIVE_OPTION_MESSAGES_KEY, [])
@@ -55,20 +45,11 @@ def set_live_option_messages(messages: list[cl.Message]) -> None:
 
 
 async def clear_live_options() -> None:
-    """Remove every button from the most recent turn's option message(s),
-    so a superseded or already-answered question can never be tapped
-    twice. Call this before handling *any* new user action (a click or a
-    typed message) -- safe to call even when nothing is pending.
-
-    Chainlit has no "only render the last history entry's buttons" concept
-    the way re-rendering the whole page on every Streamlit rerun gave us
-    for free -- once a message is sent with actions attached, they stay
-    clickable until something explicitly removes them. This is that
-    something.
-    """
+    """Remove buttons from the last turn's option message(s) so they can't
+    be tapped twice. Call before handling any new user action."""
     for message in get_live_option_messages():
         try:
             await message.remove()
-        except Exception:  # noqa: BLE001 -- best-effort cleanup; a message the client already dropped shouldn't block the new turn
+        except Exception:  # noqa: BLE001 -- best-effort cleanup
             pass
     set_live_option_messages([])

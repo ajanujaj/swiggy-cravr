@@ -1,37 +1,7 @@
-"""Swiggy OAuth 2.1 + PKCE: the `/oauth/callback` route Swiggy redirects the
-user back to once they approve, the `/oauth/login` link that starts that
-approval, and small on-disk stores for the registered client and the token.
-
-This is the *client* side of OAuth -- Cravr authenticating itself against
-Swiggy's authorization server so it can call Swiggy's real Food/Instamart/
-Dineout MCP tools once Builders Club grants production access. It is not
-about Cravr protecting its own MCP server (that would be FastMCP's
-`OAuthProxy`, a different tool for the reverse situation, and not what this
-project needs).
-
-The one URI Swiggy actually needs to whitelist is:
-
-    {redirect_uri()} -- see SWIGGY_REDIRECT_URI below
-
-Swiggy's Builders Club team confirmed directly that whitelisting the
-redirect URI is the *only* setup needed on their side -- no manually issued
-client_id, secret, or endpoint URLs. That's Dynamic Client Registration
-(RFC 7591): Cravr discovers Swiggy's OAuth endpoints from its own metadata
-(RFC 8414 / RFC 9728) and registers itself as a client on the fly, the
-first time `/oauth/login` runs; the redirect URI is the actual security
-boundary, which is exactly why it's the one thing that has to be
-pre-approved. See `_bootstrap()` for the discovery + registration flow.
-
-Discovery starts from Swiggy's MCP base URL, confirmed at
-https://mcp.swiggy.com/builders/docs/start/authenticate/ and hardcoded as
-the default below (`_mcp_url()`) -- override with SWIGGY_MCP_URL only if
-that ever changes. Nothing else needs to be set for `/oauth/login` to
-work.
-
-`login()` and `callback()` are plain Starlette request-in, response-out
-functions -- not tied to any particular server framework. `server.py`
-(repo root) registers them directly on its FastAPI app, alongside the
-mounted Chainlit chat UI.
+"""Swiggy OAuth 2.1 + PKCE client: /oauth/login starts it, /oauth/callback
+finishes it. Uses Dynamic Client Registration (RFC 7591) + metadata
+discovery (RFC 8414 / RFC 9728), so the only thing Swiggy needs to
+whitelist is the redirect URI -- no static client_id/secret.
 """
 
 from __future__ import annotations
@@ -53,40 +23,21 @@ from starlette.responses import HTMLResponse, RedirectResponse
 TOKENS_PATH = Path(__file__).resolve().parent / "data" / "swiggy_tokens.json"
 CLIENT_PATH = Path(__file__).resolve().parent / "data" / "swiggy_client.json"
 
-# Which PKCE verifier a given `state` belongs to, kept in memory only. A
-# server restart mid-approval just forces the user to click "Connect to
-# Swiggy" again -- an acceptable trade-off for a value that's dead the
-# instant it's consumed anyway, and far simpler than persisting a secret
-# that only needs to live for the ~seconds between redirect and callback.
+# PKCE verifier per pending login `state`, in-memory only -- a restart just
+# means the user clicks "Connect to Swiggy" again.
 _PENDING: dict[str, dict[str, Any]] = {}
 _PENDING_TTL_SECONDS = 600
 
 
 def _env(name: str, default: str | None = None) -> str | None:
-    value = os.environ.get(name, default)
-    return value or None
+    return os.environ.get(name, default) or None
 
 
 def redirect_uri() -> str:
-    """The exact URI to register with Swiggy as the OAuth redirect_uri.
-
-    Defaults to this project's Render URL; override with SWIGGY_REDIRECT_URI
-    if that domain ever changes (custom domain, a staging deploy, ...) --
-    whatever this returns must match, character for character, what's
-    whitelisted with Swiggy and what the authorize call and the client
-    registration below both send.
-    """
     return _env("SWIGGY_REDIRECT_URI") or "https://cravr-app.onrender.com/oauth/callback"
 
 
 def _mcp_url() -> str:
-    """Base URL of Swiggy's MCP server -- where OAuth discovery starts.
-    Confirmed at https://mcp.swiggy.com/builders/docs/start/authenticate/
-    (discovery lives at its .well-known paths; SWIGGY_MCP_URL only needs
-    setting if that ever changes or you want to point this at a sandbox).
-    Also likely the eventual value for CRAVR_MCP_URL once real tool calls
-    replace the mock server.
-    """
     return _env("SWIGGY_MCP_URL") or "https://mcp.swiggy.com"
 
 
@@ -104,10 +55,6 @@ def _prune_expired_pending() -> None:
 
 
 def load_tokens() -> dict[str, Any] | None:
-    """Whatever `callback()` last stored -- access/refresh token, expiry,
-    scope, exactly as Swiggy's token endpoint returned it, plus an
-    `obtained_at` timestamp. `cravr/client.py` (or whatever eventually talks
-    to Swiggy's real MCP servers) reads this to authenticate its calls."""
     if not TOKENS_PATH.exists():
         return None
     return json.loads(TOKENS_PATH.read_text())
@@ -130,14 +77,8 @@ def _save_client(payload: dict[str, Any]) -> None:
 
 
 def _well_known_candidates(base_url: str, well_known_name: str) -> list[str]:
-    """RFC 8414 (authorization server metadata) and RFC 9728 (protected
-    resource metadata) both insert the well-known segment *before* the
-    resource's own path, and both require an origin-root fallback too --
-    so for https://mcp.swiggy.com/food, the metadata could be at either
-    https://mcp.swiggy.com/.well-known/<name>/food (the path-aware form)
-    or plain https://mcp.swiggy.com/.well-known/<name>. Try the more
-    specific one first.
-    """
+    # RFC 8414 / RFC 9728 metadata can live at either the path-aware form
+    # or the origin root -- try path-aware first.
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path.rstrip("/")
@@ -161,17 +102,6 @@ async def _fetch_first(http_client: httpx.AsyncClient, urls: list[str]) -> dict[
 
 
 async def _discover_metadata(http_client: httpx.AsyncClient, mcp_url: str) -> dict[str, Any]:
-    """Follow the MCP Authorization spec's discovery chain: the MCP
-    resource's own protected-resource metadata names the authorization
-    server(s) that issue tokens for it; that server's own metadata then
-    gives the actual authorize/token/registration endpoints. Falls back to
-    treating `mcp_url` itself as the authorization server if no protected-
-    resource document is found (some gateways skip that indirection and
-    are their own authorization server), and to OpenID Connect discovery
-    if the OAuth-specific well-known name comes back empty -- same
-    metadata shape, different conventional name, and a common fallback in
-    practice.
-    """
     resource_meta = await _fetch_first(http_client, _well_known_candidates(mcp_url, "oauth-protected-resource"))
     authz_server_url = mcp_url
     if resource_meta and resource_meta.get("authorization_servers"):
@@ -181,24 +111,13 @@ async def _discover_metadata(http_client: httpx.AsyncClient, mcp_url: str) -> di
     if not metadata:
         metadata = await _fetch_first(http_client, _well_known_candidates(authz_server_url, "openid-configuration"))
     if not metadata:
-        raise RuntimeError(
-            f"Could not discover OAuth metadata starting from {mcp_url} "
-            f"(tried oauth-protected-resource there, then "
-            f"oauth-authorization-server / openid-configuration on {authz_server_url})."
-        )
+        raise RuntimeError(f"Could not discover OAuth metadata from {mcp_url} / {authz_server_url}.")
     return metadata
 
 
 async def _bootstrap(http_client: httpx.AsyncClient, mcp_url: str) -> dict[str, Any]:
-    """Discover Swiggy's OAuth endpoints and register Cravr as a client if
-    that hasn't happened yet (Dynamic Client Registration, RFC 7591 --
-    this is what makes "just whitelist the redirect URI" true), caching
-    the combined result so this only touches the network once. Called
-    from both `login()` (which needs it to build the authorize URL) and
-    `callback()` (normally just reads what `login()` already cached
-    seconds earlier; redoes discovery only if that cache is somehow
-    missing -- e.g. the very first callback right after a fresh deploy).
-    """
+    """Discover Swiggy's OAuth endpoints and register Cravr as a client
+    (RFC 7591) if that hasn't happened yet, caching the result."""
     cached = _load_client()
     if cached and cached.get("client_id") and cached.get("metadata"):
         return cached
@@ -206,11 +125,7 @@ async def _bootstrap(http_client: httpx.AsyncClient, mcp_url: str) -> dict[str, 
     metadata = await _discover_metadata(http_client, mcp_url)
     registration_endpoint = metadata.get("registration_endpoint")
     if not registration_endpoint:
-        raise RuntimeError(
-            "Swiggy's OAuth metadata has no registration_endpoint -- Dynamic "
-            "Client Registration doesn't look supported here after all, so "
-            "this will need a manually issued SWIGGY_CLIENT_ID."
-        )
+        raise RuntimeError("Swiggy's OAuth metadata has no registration_endpoint.")
 
     response = await http_client.post(
         registration_endpoint,
@@ -236,10 +151,6 @@ async def _bootstrap(http_client: httpx.AsyncClient, mcp_url: str) -> dict[str, 
 
 
 async def login(request: Request):
-    """GET /oauth/login -- discovers Swiggy's OAuth endpoints, registers
-    Cravr as a client if it hasn't already, and sends the browser to
-    Swiggy's consent screen. See `_bootstrap()`.
-    """
     _prune_expired_pending()
     mcp_url = _mcp_url()
 
@@ -272,10 +183,6 @@ async def login(request: Request):
 
 
 async def callback(request: Request):
-    """GET /oauth/callback -- this is the URI Swiggy has whitelisted.
-    Verifies `state` against a pending PKCE login, exchanges the
-    authorization `code` for tokens, and stores them via `_save_tokens`.
-    """
     error = request.query_params.get("error")
     if error:
         return HTMLResponse(f"<p>Swiggy declined authorization: {error}</p>", status_code=400)
@@ -293,11 +200,9 @@ async def callback(request: Request):
             status_code=400,
         )
 
-    mcp_url = _mcp_url()
-
     async with httpx.AsyncClient(timeout=15) as http_client:
         try:
-            client = await _bootstrap(http_client, mcp_url)
+            client = await _bootstrap(http_client, _mcp_url())
         except RuntimeError as exc:
             return HTMLResponse(f"<p>{exc}</p>", status_code=502)
 
@@ -319,8 +224,7 @@ async def callback(request: Request):
 
     if response.status_code >= 400:
         return HTMLResponse(
-            f"<p>Swiggy's token endpoint rejected the exchange "
-            f"({response.status_code}): {response.text}</p>",
+            f"<p>Swiggy's token endpoint rejected the exchange ({response.status_code}): {response.text}</p>",
             status_code=502,
         )
 

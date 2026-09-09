@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import re
 from collections import Counter
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from ..client import call_tool_sync
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
 from ..llm import get_llm
 from ..profile_utils import latest_user_text
 from ..state import CravrState
-
-
-DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
 
 # The only values the menu's `dietary_type` column actually holds. The MCP tool
 # compares with `==`, so anything outside this set silently matches zero rows --
@@ -502,19 +498,13 @@ def _unwrap_tool_result(result: Any) -> list[dict[str, Any]]:
 
 
 def _call_recommendation_tool(filters: dict[str, Any]) -> list[dict[str, Any]]:
-    async def _call_tool() -> Any:
-        from fastmcp import Client
-
-        async with Client(DEFAULT_MCP_URL) as client:
-            return await client.call_tool(name="recommendation", arguments=filters)
-
     try:
-        result = asyncio.run(_call_tool())
+        result = call_tool_sync("recommendation", filters)
     except Exception as exc:
         # This used to be a bare `return []`, which made "the MCP server isn't
         # running" indistinguishable from "no dish matched". Both surfaced to
         # the user as the same shrug.
-        debug("recommendation_agent", f"MCP call FAILED ({type(exc).__name__}: {exc}) at {DEFAULT_MCP_URL}")
+        debug("recommendation_agent", f"MCP call FAILED ({type(exc).__name__}: {exc})")
         return []
 
     return _unwrap_tool_result(result)

@@ -2,30 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 from typing import Any
 
+from ..client import call_tool_sync
 from ..debug_utils import debug
 from ..state import CravrState
 
 
-DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
-target_url = DEFAULT_MCP_URL
-
 def _call_mcp_tool(tool_name: str, user_id: str | None) -> dict[str, Any]:
     """Call one user-scoped MCP tool and normalize FastMCP's response."""
-    async def _call_tool() -> Any:
-        from fastmcp import Client
-
-        async with Client(target_url) as client:
-            return await client.call_tool(name=tool_name, arguments={"user_id": user_id})
-
     try:
-        result = asyncio.run(_call_tool())
+        result = call_tool_sync(tool_name, {"user_id": user_id})
     except Exception as exc:  # pragma: no cover - exercised through runtime failures
-        debug("preference_agent", f"MCP {tool_name} FAILED ({type(exc).__name__}: {exc}) at {target_url}")
+        debug("preference_agent", f"MCP {tool_name} FAILED ({type(exc).__name__}: {exc})")
         return {"status": "error", "message": f"Unable to retrieve {tool_name}: {exc}"}
 
     if isinstance(result, dict):
