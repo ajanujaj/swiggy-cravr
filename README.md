@@ -52,7 +52,8 @@ Environment variables:
 - `CRAVR_MODEL` — Groq model id (must support tool calling). Default `openai/gpt-oss-120b`. See https://console.groq.com/docs/models.
 - `GROQ_API_KEY` (or `groq_apikey`) — required, read from `.env`.
 - `CRAVR_DEBUG=1` — print agent traces to stderr.
-- `CRAVR_MCP_URL` — MCP server URL. Defaults to `http://127.0.0.1:8000/mcp` (mock); production should point at `https://mcp.swiggy.com/food`.
+- `CRAVR_MCP_URL` — MCP server URL for location/recommendations/order history. Defaults to `http://127.0.0.1:8000/mcp` (mock); production should point at `https://mcp.swiggy.com/food`.
+- `CRAVR_MOCK_MCP_URL` — MCP server URL for `user_preferences` specifically (no real Food MCP equivalent exists). Defaults to `http://127.0.0.1:8000/mcp`.
 
 ## Architecture
 
@@ -113,4 +114,6 @@ Cravr targets only Swiggy's Food MCP server (`https://mcp.swiggy.com/food`) -- I
 
 `fetch_user_preferences` stays on the mock server -- no Food MCP tool covers it.
 
-Swiggy's docs don't publish exact response schemas, so `food_mcp.py`'s field-name guesses (`_first(...)` fallback lists) are unverified. Run with `CRAVR_DEBUG=1` the first time this hits the real server and check the `[debug:food_mcp] raw ... response` lines against what's actually returned; adjust the key lists if they differ. Cart/coupon/payment/`place_food_order`/`track_food_order` aren't wired up yet -- that's real-money territory and a separate phase.
+Confirmed against a real call: `get_addresses` returns a natural-language block for display (numbered addresses, `(ID: ...)` markers, a `Suggested/preselected address ID: ...` line) -- not JSON. `get_saved_address` parses this with regex. `search_restaurants`/`get_restaurant_menu`/`get_food_orders` are unverified and likely follow the same text-first convention rather than clean JSON; `_normalize_item`'s field-name guesses in `food_mcp.py` are still speculative. Run with `CRAVR_DEBUG=1` and check the `[debug:food_mcp] raw ... response` lines against what's actually returned.
+
+Cart/coupon/payment/`place_food_order`/`track_food_order` aren't wired up yet -- that's real-money territory and a separate phase.

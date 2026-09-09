@@ -4,17 +4,20 @@ get_restaurant_menu, get_food_orders). Used instead of the mock server's
 `user_location`/`recommendation`/`order_history` tools once
 `client.using_real_food_mcp()` is true.
 
-Swiggy's docs (https://mcp.swiggy.com/builders/docs/reference/food/) list
-tool names and one-line descriptions but not exact response schemas, so
-the field names in `_normalize_item`/`_first(...)` below are inferred, not
-confirmed. Run with CRAVR_DEBUG=1 and check the "raw restaurant/menu/order
-response" lines the first time this hits the real server, and adjust the
-`_first(...)` key lists here if the actual keys differ.
+Confirmed against a real response: `get_addresses` returns a
+natural-language block for display to the user (numbered addresses with
+"(ID: ...)" markers and a "Suggested/preselected address ID: ..." line),
+not JSON -- so `get_saved_address` parses it with regex. `search_restaurants`
+/ `get_restaurant_menu` / `get_food_orders` are UNVERIFIED and likely follow
+the same text-first convention; `_normalize_item`'s field-name guesses are
+still speculative pending a real sample (CRAVR_DEBUG=1 prints the raw
+response for each).
 """
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .client import call_tool_sync
@@ -43,25 +46,49 @@ def _unwrap(result: Any) -> Any:
     return result
 
 
+_ADDRESS_LINE_RE = re.compile(
+    r"^\d+\.\s*\[(?P<label>[^\]]+)\]\s*[^:]*:\s*(?P<address>.+?)\s*\(ID:\s*(?P<id>[^)]+)\)\s*$",
+    re.MULTILINE,
+)
+_SUGGESTED_ID_RE = re.compile(r"Suggested/preselected address ID:\s*([^\s.,]+)")
+
+
 def get_saved_address() -> dict[str, Any]:
     """-> {"location", "delivery_area", "address_id", "status"}, matching
-    ContextAgent.fetch_user_location's contract."""
+    ContextAgent.fetch_user_location's contract.
+
+    get_addresses returns a natural-language block for display, e.g.:
+        1. [Baba] Anuj Jain: 307, third floor, ... (ID: abc123)
+        ...
+        Suggested/preselected address ID: abc123. Ask the user to confirm...
+    Parsed with regex rather than JSON; uses the suggested ID Swiggy itself
+    provides so this stays ambient (no clarification question), matching
+    ContextAgent's existing "don't ask the user for it" contract.
+    """
     try:
         raw = _unwrap(call_tool_sync("get_addresses", {}))
     except Exception as exc:
         return {"status": "error", "message": f"Unable to retrieve saved address: {exc}"}
 
     debug("food_mcp", f"raw get_addresses response: {raw!r}")
-    addresses = raw.get("addresses") if isinstance(raw, dict) else raw
+    text = raw if isinstance(raw, str) else json.dumps(raw)
+
+    addresses = {
+        m.group("id"): (m.group("label"), m.group("address"))
+        for m in _ADDRESS_LINE_RE.finditer(text)
+    }
     if not addresses:
         return {"status": "no_results", "message": "No saved addresses found"}
 
-    address = addresses[0]
+    suggested = _SUGGESTED_ID_RE.search(text)
+    address_id = suggested.group(1) if suggested and suggested.group(1) in addresses else next(iter(addresses))
+    label, address_line = addresses[address_id]
+
     return {
         "status": "success",
-        "location": _first(address, "city", "area", "label"),
-        "delivery_area": _first(address, "addressLine", "display", "label"),
-        "address_id": _first(address, "addressId", "id"),
+        "location": label,
+        "delivery_area": address_line,
+        "address_id": address_id,
     }
 
 

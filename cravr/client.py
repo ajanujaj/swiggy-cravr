@@ -19,6 +19,13 @@ from fastmcp import Client
 
 DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
 
+# Separate from CRAVR_MCP_URL on purpose: user_preferences has no real Food
+# MCP equivalent, so it must keep reaching the mock server even once
+# CRAVR_MCP_URL is switched to Swiggy for everything else. Defaults to the
+# same local mock URL; set explicitly on Render once cravr-mock-mcp is
+# deployed (e.g. https://cravr-mock-mcp.onrender.com/mcp).
+MOCK_MCP_URL = os.getenv("CRAVR_MOCK_MCP_URL", "http://127.0.0.1:8000/mcp")
+
 
 def using_real_food_mcp() -> bool:
     """True once CRAVR_MCP_URL points at Swiggy's real Food MCP server --

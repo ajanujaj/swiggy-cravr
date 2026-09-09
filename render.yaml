@@ -15,9 +15,14 @@ services:
     envVars:
       - key: GROQ_API_KEY
         sync: false
-      # Points at cravr-mock-mcp's URL + "/mcp" for now; switch to
-      # https://mcp.swiggy.com/food once real Swiggy access is live.
+      # Set to https://mcp.swiggy.com/food for real recommendations/location/
+      # order history, or cravr-mock-mcp's URL + "/mcp" to use mock data.
       - key: CRAVR_MCP_URL
+        sync: false
+      # user_preferences has no Food MCP equivalent, so it always targets
+      # this URL regardless of CRAVR_MCP_URL above. Set to cravr-mock-mcp's
+      # URL + "/mcp".
+      - key: CRAVR_MOCK_MCP_URL
         sync: false
       # Must match what's whitelisted with Swiggy. Defaults to
       # https://cravr-app.onrender.com/oauth/callback in code.

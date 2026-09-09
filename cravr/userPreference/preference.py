@@ -6,15 +6,15 @@ import json
 from typing import Any
 
 from .. import food_mcp
-from ..client import call_tool_sync, using_real_food_mcp
+from ..client import MOCK_MCP_URL, call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..state import CravrState
 
 
-def _call_mcp_tool(tool_name: str, user_id: str | None) -> dict[str, Any]:
+def _call_mcp_tool(tool_name: str, user_id: str | None, *, mcp_url: str | None = None) -> dict[str, Any]:
     """Call one user-scoped MCP tool and normalize FastMCP's response."""
     try:
-        result = call_tool_sync(tool_name, {"user_id": user_id})
+        result = call_tool_sync(tool_name, {"user_id": user_id}, mcp_url=mcp_url)
     except Exception as exc:  # pragma: no cover - exercised through runtime failures
         debug("preference_agent", f"MCP {tool_name} FAILED ({type(exc).__name__}: {exc})")
         return {"status": "error", "message": f"Unable to retrieve {tool_name}: {exc}"}
@@ -47,11 +47,11 @@ def fetch_order_history(user_id: str | None) -> dict[str, Any]:
 def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
     """Fetch a user's saved preference profile from MCP.
 
-    No Swiggy Food MCP tool exposes this (checked all 20) -- stays on the
-    mock server's data even once CRAVR_MCP_URL points at Swiggy for
+    No Swiggy Food MCP tool exposes this (checked all 20) -- always targets
+    MOCK_MCP_URL explicitly, since CRAVR_MCP_URL may point at Swiggy for
     everything else. A future version could derive rough preferences from
     get_food_orders instead of a dedicated tool call."""
-    return _call_mcp_tool("user_preferences", user_id)
+    return _call_mcp_tool("user_preferences", user_id, mcp_url=MOCK_MCP_URL)
 
 
 def history_discovery_node(state: CravrState) -> dict:
