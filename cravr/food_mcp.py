@@ -4,14 +4,21 @@ get_restaurant_menu, get_food_orders). Used instead of the mock server's
 `user_location`/`recommendation`/`order_history` tools once
 `client.using_real_food_mcp()` is true.
 
-Confirmed against a real response: `get_addresses` returns a
-natural-language block for display to the user (numbered addresses with
-"(ID: ...)" markers and a "Suggested/preselected address ID: ..." line),
-not JSON -- so `get_saved_address` parses it with regex. `search_restaurants`
-/ `get_restaurant_menu` / `get_food_orders` are UNVERIFIED and likely follow
-the same text-first convention; `_normalize_item`'s field-name guesses are
-still speculative pending a real sample (CRAVR_DEBUG=1 prints the raw
-response for each).
+Confirmed against real responses:
+- `get_addresses` returns a natural-language block for display (numbered
+  addresses with "(ID: ...)" markers and a "Suggested/preselected address
+  ID: ..." line), not JSON -- `get_saved_address` parses it with regex.
+- `search_restaurants` returns JSON (a `{"restaurants": [...], "dishes": [],
+  ...}` object) *followed by* trailing human-readable text (a UI-widget
+  disclaimer) appended after it with no separator json.loads recognizes --
+  `_parse_leading_json` uses `json.JSONDecoder.raw_decode` to parse just the
+  JSON prefix rather than choking on "Extra data". Restaurant objects use
+  "id" (not "restaurantId") and "cuisines" (a list, not singular "cuisine").
+- `get_restaurant_menu` / `get_food_orders` are still UNVERIFIED -- assumed
+  to follow the same JSON-plus-trailing-text convention (now handled by
+  `_parse_leading_json` either way); `_normalize_item`'s field-name guesses
+  for menu items are still speculative pending a real sample (CRAVR_DEBUG=1
+  prints the raw response for each).
 """
 
 from __future__ import annotations
@@ -39,11 +46,29 @@ def _unwrap(result: Any) -> Any:
         for item in content:
             text = getattr(item, "text", None)
             if isinstance(text, str):
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    return text
+                return _parse_leading_json(text)
     return result
+
+
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _parse_leading_json(text: str) -> Any:
+    """Swiggy's tools return a JSON object/array followed by trailing
+    human-readable text -- e.g. search_restaurants' response ends with
+    "\n\n\u26a0\ufe0f A rich UI widget may be shown...". Plain
+    `json.loads` chokes on that with "Extra data" and silently falls back
+    to the raw string, which downstream code then iterates character by
+    character (0 results, no error). `raw_decode` parses just the JSON
+    prefix and ignores whatever follows. If the text isn't JSON at all
+    (get_addresses' plain-language response), this falls back to the raw
+    text unchanged, same as before."""
+    stripped = text.lstrip()
+    try:
+        value, _end = _JSON_DECODER.raw_decode(stripped)
+        return value
+    except json.JSONDecodeError:
+        return text
 
 
 _ADDRESS_LINE_RE = re.compile(
@@ -132,12 +157,13 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
         return []
 
     debug("food_mcp", f"raw search_restaurants response: {raw!r}")
-    restaurants = raw.get("restaurants") if isinstance(raw, dict) else raw
+    restaurants = raw.get("restaurants") if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
     if not restaurants:
         return []
 
     open_restaurants = [
-        r for r in restaurants if _first(r, "availabilityStatus", default="OPEN") == "OPEN"
+        r for r in restaurants
+        if isinstance(r, dict) and _first(r, "availabilityStatus", default="OPEN") == "OPEN"
     ][:limit_restaurants]
 
     dishes: list[dict[str, Any]] = []
@@ -152,9 +178,15 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
             debug("food_mcp", f"get_restaurant_menu FAILED for {restaurant_id}: {exc}")
             continue
         debug("food_mcp", f"raw get_restaurant_menu response for {restaurant_id}: {menu_raw!r}")
-        items = menu_raw.get("items") if isinstance(menu_raw, dict) else menu_raw
+        items = menu_raw.get("items") if isinstance(menu_raw, dict) else (menu_raw if isinstance(menu_raw, list) else [])
+        # Swiggy's search_restaurants shape uses "cuisines" (a list), not
+        # "cuisine" -- join it into a readable string for _apply_filters'
+        # substring match against the user's requested cuisine.
+        restaurant_cuisine = _first(restaurant, "cuisine", "cuisines")
+        if isinstance(restaurant_cuisine, list):
+            restaurant_cuisine = ", ".join(str(c) for c in restaurant_cuisine)
         for item in items or []:
-            dishes.append(_normalize_item(item, restaurant_name, restaurant.get("cuisine") if isinstance(restaurant, dict) else None))
+            dishes.append(_normalize_item(item, restaurant_name, restaurant_cuisine))
 
     return _apply_filters(dishes, filters)
 
@@ -198,7 +230,7 @@ def get_order_history() -> dict[str, Any]:
         return {"status": "error", "message": f"Unable to retrieve order history: {exc}"}
 
     debug("food_mcp", f"raw get_food_orders response: {raw!r}")
-    orders = raw.get("orders") if isinstance(raw, dict) else raw
+    orders = raw.get("orders") if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
     if not orders:
         return {"status": "no_results", "message": "No order history found"}
 
