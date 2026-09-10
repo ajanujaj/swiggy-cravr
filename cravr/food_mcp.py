@@ -92,12 +92,41 @@ def get_saved_address() -> dict[str, Any]:
     }
 
 
+# Tags (from RecommendAgent.KNOWN_TAGS) that mean "diet food" in Swiggy's
+# own EATRIGHT collection sense -- vegan/vegetarian excluded, those map to
+# dietary_type/cuisine concerns rather than "healthy eating" as such.
+_EATRIGHT_TAGS = {"low-calorie", "high-protein", "low-carb", "gluten-free", "sugar-free-option", "organic"}
+
+
+def _infer_collection(filters: dict[str, Any]) -> str | None:
+    """Optional `collection` scope for search_restaurants -- no BOLT signal
+    exists yet (nothing in Cravr captures "make it fast")."""
+    tags = {t.strip() for t in str(filters.get("tags") or "").split(",") if t.strip()}
+    if tags & _EATRIGHT_TAGS:
+        return "EATRIGHT"
+    max_price = filters.get("max_price_inr")
+    if isinstance(max_price, (int, float)) and max_price <= 99:
+        return "STORE_99"
+    return None
+
+
 def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaurants: int = 5) -> list[dict[str, Any]]:
     """search_restaurants -> get_restaurant_menu -> flatten -> filter
-    locally, since Swiggy's tools don't filter by dish attributes."""
-    query = filters.get("cuisine") or filters.get("tags") or ""
+    locally, since Swiggy's tools don't filter by dish attributes.
+
+    `query` is required by the real tool and rejected if empty --
+    `_filter_variants` (RecommendAgent.py) progressively drops cuisine/tags
+    to relax the search, so by the last attempt(s) neither survives. Falls
+    back to dietary_type, then a generic term, rather than failing outright.
+    """
+    query = filters.get("cuisine") or filters.get("tags") or filters.get("dietary_type") or "restaurants"
+    arguments: dict[str, Any] = {"addressId": address_id, "query": query}
+    collection = _infer_collection(filters)
+    if collection:
+        arguments["collection"] = collection
+
     try:
-        raw = _unwrap(call_tool_sync("search_restaurants", {"addressId": address_id, "query": query}))
+        raw = _unwrap(call_tool_sync("search_restaurants", arguments))
     except Exception as exc:
         debug("food_mcp", f"search_restaurants FAILED: {exc}")
         return []

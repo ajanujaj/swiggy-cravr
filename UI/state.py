@@ -46,10 +46,12 @@ def set_live_option_messages(messages: list[cl.Message]) -> None:
 
 async def clear_live_options() -> None:
     """Remove buttons from the last turn's option message(s) so they can't
-    be tapped twice. Call before handling any new user action."""
+    be tapped twice -- `remove_actions()`, not `remove()`: the latter
+    deletes the whole message (the agent's question), not just its
+    buttons. Call before handling any new user action."""
     for message in get_live_option_messages():
         try:
-            await message.remove()
+            await message.remove_actions()
         except Exception:  # noqa: BLE001 -- best-effort cleanup
             pass
     set_live_option_messages([])
