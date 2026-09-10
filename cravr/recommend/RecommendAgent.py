@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import functools
 import json
 import re
 from collections import Counter
@@ -499,16 +498,30 @@ def _unwrap_tool_result(result: Any) -> list[dict[str, Any]]:
     return []
 
 
-@functools.lru_cache(maxsize=1)
-def _cached_address_id() -> str | None:
-    """Resolved once per process -- Cravr's OAuth token is tied to one
-    Swiggy account, so the delivery address doesn't change mid-session."""
+def _resolve_address_id(address_id: str | None) -> str | None:
+    """Look up the delivery address for this call when the caller didn't
+    already have one on hand (e.g. a direct/test invocation).
+
+    Deliberately NOT cached across calls. The previous implementation used a
+    module-level `functools.lru_cache(maxsize=1)`, which memoized the *first*
+    result -- success or failure -- for the lifetime of the whole server
+    process, shared by every user's request. Once that first call happened to
+    fail (or ran before a session's address was ready), every subsequent
+    `search_restaurants` call, for every user, silently sent
+    `addressId: null` forever -- which Swiggy's tool rejects with "addressId
+    is required". The normal path is `recommendation_agent_node` passing in
+    the address already resolved per-turn by context_agent
+    (`context_profile["address_id"]`); this fallback only matters for a
+    direct/test invocation that skips the node.
+    """
+    if address_id:
+        return address_id
     return food_mcp.get_saved_address().get("address_id")
 
 
-def _call_recommendation_tool(filters: dict[str, Any]) -> list[dict[str, Any]]:
+def _call_recommendation_tool(filters: dict[str, Any], address_id: str | None = None) -> list[dict[str, Any]]:
     if using_real_food_mcp():
-        return food_mcp.search_dishes(filters, address_id=_cached_address_id())
+        return food_mcp.search_dishes(filters, address_id=_resolve_address_id(address_id))
 
     try:
         result = call_tool_sync("recommendation", filters)
@@ -522,11 +535,12 @@ def _call_recommendation_tool(filters: dict[str, Any]) -> list[dict[str, Any]]:
     return _unwrap_tool_result(result)
 
 
-def fetch_recommendations(brief: dict[str, Any]) -> list[dict[str, Any]]:
+def fetch_recommendations(brief: dict[str, Any], address_id: str | None = None) -> list[dict[str, Any]]:
     """Call the MCP recommendation tool, relaxing preference filters until something matches.
 
     Takes only the frozen brief from decision_agent -- no profiles, no
-    re-derivation.
+    re-derivation -- plus the delivery address already resolved for this
+    request/user by context_agent.
     """
     brief = _coerce_profile(brief)
     filters = dict(brief.get("filters") or {})
@@ -539,7 +553,7 @@ def fetch_recommendations(brief: dict[str, Any]) -> list[dict[str, Any]]:
     desired_course = filters.get("course")
 
     for attempt, variant in enumerate(_filter_variants(filters), start=1):
-        recommendations = _call_recommendation_tool(variant)
+        recommendations = _call_recommendation_tool(variant, address_id=address_id)
         debug("recommendation_agent", f"attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
             ranked = _rank_candidates(
@@ -561,7 +575,7 @@ def fetch_recommendations(brief: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def widen_recommendations(
-    brief: dict[str, Any], exclude_items: set[str] | None = None
+    brief: dict[str, Any], address_id: str | None = None, exclude_items: set[str] | None = None
 ) -> list[dict[str, Any]]:
     """Deliberately relax the search beyond the strict match.
 
@@ -583,7 +597,7 @@ def widen_recommendations(
     # [0] is the exact-match variant that produced the single result already
     # shown; skip straight to the first relaxed one.
     for attempt, variant in enumerate(_filter_variants(filters)[1:], start=1):
-        recommendations = _call_recommendation_tool(variant)
+        recommendations = _call_recommendation_tool(variant, address_id=address_id)
         recommendations = [
             item for item in recommendations
             if str(item.get("item_name") or "").strip().lower() not in exclude
@@ -717,6 +731,9 @@ def recommendation_agent_node(state: CravrState) -> dict:
         )
 
     brief_filters = dict(brief.get("filters") or {})
+    # Resolved once per turn by context_agent (ContextAgent.py), scoped to
+    # this user's request -- not the old process-wide cached lookup.
+    address_id = _coerce_profile(state.get("context_profile")).get("address_id")
     recommendation_state = dict(state.get("recommendation_state") or {})
     awaiting_feedback = bool(recommendation_state.get("awaiting_feedback"))
     offered = recommendation_state.get("last_recommendations") or []
@@ -745,7 +762,7 @@ def recommendation_agent_node(state: CravrState) -> dict:
         if len(offered) == 1 and _looks_like_decline_only_offer(user_input):
             debug("recommendation_agent", "user declined the only match — widening the search")
             already_shown = {str(d.get("item_name") or "") for d in offered}
-            widened = widen_recommendations(brief, exclude_items=already_shown)
+            widened = widen_recommendations(brief, address_id=address_id, exclude_items=already_shown)
             if widened:
                 batch, rest = widened[:DISPLAY_COUNT], widened[DISPLAY_COUNT:]
                 return _reply(
@@ -797,7 +814,7 @@ def recommendation_agent_node(state: CravrState) -> dict:
             debug("recommendation_agent", "unrecognised reply, filters unchanged — treating as 'more'")
             return _serve_next_batch("Here are a few more:", offered, alternates, brief_filters)
 
-    ranked = fetch_recommendations(brief)
+    ranked = fetch_recommendations(brief, address_id=address_id)
     if not ranked:
         return _reply(
             "I’m not finding a strong match right now. Tell me your cuisine, budget, "

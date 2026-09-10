@@ -47,7 +47,7 @@ def context_discovery_node(state: CravrState) -> dict:
     location_result = fetch_user_location(user_id)
     extracted = {
         key: location_result[key]
-        for key in ("location", "delivery_area")
+        for key in ("location", "delivery_area", "address_id")
         if location_result.get(key)
     }
 
