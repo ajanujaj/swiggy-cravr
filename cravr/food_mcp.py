@@ -54,6 +54,75 @@ _ADDRESS_LINE_RE = re.compile(
 )
 _SUGGESTED_ID_RE = re.compile(r"Suggested/preselected address ID:\s*([^\s.,]+)")
 
+# get_restaurant_menu's text-based response inlines "[image: <url>]" after
+# almost every line (the restaurant header and every dish) -- long, noisy,
+# and nothing downstream (parsing or display) needs it.
+_IMAGE_REF_RE = re.compile(r"\s*\[image:[^\]]*\]")
+
+# get_restaurant_menu's real shape (confirmed against a live response):
+# markdown-ish text with "##"/"###" category headers and dish lines like
+# "  - Aloo Paratha ... -- \u20b9105 | Veg, Bestseller, has addons (ID: 200268099)".
+# "###" subcategory headers are indented (e.g. "  ### Veg Main Course") --
+# the leading "[ \t]*" is required, a bare "^(#{2,3})" misses every one of
+# them and silently drops every subcategory attribution.
+_MENU_HEADER_RE = re.compile(r"^[ \t]*(#{2,3})\s*(.+?)\s*$", re.MULTILINE)
+_MENU_ITEM_RE = re.compile(
+    r"^[ \t]*-[ \t]*(?P<name>.+?)(?:[ \t]*\u2014[ \t]*\u20b9(?P<price>[\d,]+(?:\.\d+)?))?"
+    r"[ \t]*\|[ \t]*(?P<tags>[^()\n]*?)[ \t]*\(ID:[ \t]*(?P<id>[^)]+)\)[ \t]*$",
+    re.MULTILINE,
+)
+_DIETARY_TAGS = {"veg", "non-veg", "nonveg", "non veg", "egg"}
+
+
+def _parse_menu_items(text: str, restaurant_name: str, restaurant_cuisine: Any) -> list[dict[str, Any]]:
+    """Parse get_restaurant_menu's text response into dish records shaped
+    like _normalize_item's output. Category attribution: walk the header
+    positions once and, for each item, take whichever header (## resets
+    the subcategory, ### sets it) most recently preceded that item's
+    position -- category/tag text never contains ")" so matching by
+    absolute offset is reliable without a line-by-line state machine.
+    """
+    headers = [(m.start(), len(m.group(1)), m.group(2)) for m in _MENU_HEADER_RE.finditer(text)]
+
+    def _category_path(pos: int) -> tuple[str, str]:
+        category, subcategory = "", ""
+        for start, level, title in headers:
+            if start >= pos:
+                break
+            if level == 2:
+                category, subcategory = title, ""
+            else:
+                subcategory = title
+        return category, subcategory
+
+    items: list[dict[str, Any]] = []
+    for m in _MENU_ITEM_RE.finditer(text):
+        raw_tags = [t.strip() for t in m.group("tags").split(",") if t.strip()]
+        dietary_tag = next((t for t in raw_tags if t.lower() in _DIETARY_TAGS), "")
+        category, subcategory = _category_path(m.start())
+        # Semicolon-joined: _rank_candidates (RecommendAgent.py) splits an
+        # item's "tags" field on ";", not ",".
+        tags = "; ".join(t for t in (category, subcategory, *raw_tags) if t)
+
+        price_text = m.group("price")
+        try:
+            price_inr: float | int = float(price_text.replace(",", "")) if price_text else 0
+        except ValueError:
+            price_inr = 0
+
+        items.append(
+            {
+                "item_name": m.group("name").strip(),
+                "restaurant_name": restaurant_name,
+                "cuisine": restaurant_cuisine or "",
+                "price_inr": price_inr,
+                "rating": None,
+                "tags": tags,
+                "dietary_type": "Veg" if dietary_tag.lower() == "veg" else ("Non-Veg" if dietary_tag else ""),
+            }
+        )
+    return items
+
 
 def get_saved_address() -> dict[str, Any]:
     """-> {"location", "delivery_area", "address_id", "status"}, matching
@@ -162,16 +231,31 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
         except Exception as exc:
             debug("food_mcp", f"get_restaurant_menu FAILED for {restaurant_id}: {exc}")
             continue
+        # Confirmed real shape: markdown-ish text (headers + "- Name --
+        # ₹price | tags [image: url] (ID: ...)" lines), not JSON with an
+        # "items" list -- same text-first convention as get_addresses.
+        # Strip the "[image: ...]" segments immediately, before anything
+        # else (including the debug log below) touches this text -- they're
+        # long, noisy, and nothing downstream needs them.
+        if isinstance(menu_raw, str):
+            menu_raw = _IMAGE_REF_RE.sub("", menu_raw)
         debug("food_mcp", f"raw get_restaurant_menu response for {restaurant_id}: {menu_raw!r}")
-        items = menu_raw.get("items") if isinstance(menu_raw, dict) else (menu_raw if isinstance(menu_raw, list) else [])
         # Swiggy's search_restaurants shape uses "cuisines" (a list), not
         # "cuisine" -- join it into a readable string for _apply_filters'
         # substring match against the user's requested cuisine.
         restaurant_cuisine = _first(restaurant, "cuisine", "cuisines")
         if isinstance(restaurant_cuisine, list):
             restaurant_cuisine = ", ".join(str(c) for c in restaurant_cuisine)
-        for item in items or []:
-            dishes.append(_normalize_item(item, restaurant_name, restaurant_cuisine))
+
+        if isinstance(menu_raw, str):
+            dishes.extend(_parse_menu_items(menu_raw, restaurant_name, restaurant_cuisine))
+        else:
+            # Defensive fallback only -- the real response is text, not JSON
+            # (see _parse_menu_items' docstring), but keep this path working
+            # in case that ever changes.
+            raw_items = menu_raw.get("items") if isinstance(menu_raw, dict) else (menu_raw if isinstance(menu_raw, list) else [])
+            for item in raw_items or []:
+                dishes.append(_normalize_item(item, restaurant_name, restaurant_cuisine))
 
     return _apply_filters(dishes, filters)
 
