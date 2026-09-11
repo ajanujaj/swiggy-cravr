@@ -8,6 +8,7 @@ from typing import Any
 from .. import food_mcp
 from ..client import MOCK_MCP_URL, call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
+from ..profile_utils import merge_profile
 from ..state import CravrState
 
 
@@ -76,7 +77,26 @@ def history_discovery_node(state: CravrState) -> dict:
 def user_preference_node(state: CravrState) -> dict:
     """First workflow node: load saved profile facts and recent orders."""
     user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
-    address_id = (state.get("context_profile") or {}).get("address_id")
+    context_profile = dict(state.get("context_profile") or {})
+    address_id = context_profile.get("address_id")
+
+    # This node runs before context_discovery_node, so address_id is
+    # normally still unresolved here -- but get_food_orders needs one.
+    # Resolve it once (real Food MCP only; the mock order_history tool
+    # doesn't need an address) and forward the *same* result via
+    # context_profile so context_discovery_node reuses it instead of
+    # calling get_addresses a second time for the same Swiggy account.
+    context_update: dict[str, Any] = {}
+    if using_real_food_mcp() and not address_id:
+        location_result = food_mcp.get_saved_address()
+        address_id = location_result.get("address_id")
+        if location_result.get("status") == "success":
+            context_update = {
+                key: location_result[key]
+                for key in ("location", "delivery_area", "address_id")
+                if location_result.get(key)
+            }
+
     preference_profile = fetch_user_preferences(user_id)
     history_profile = fetch_order_history(user_id, address_id=address_id)
     debug(
@@ -86,10 +106,13 @@ def user_preference_node(state: CravrState) -> dict:
         f"history_status={history_profile.get('status')!r} "
         f"orders={len(history_profile.get('orders') or [])}",
     )
-    return {
+    result: dict[str, Any] = {
         "preference_profile": preference_profile,
         "history_profile": history_profile,
         "user_id": user_id,
     }
+    if context_update:
+        result["context_profile"] = merge_profile(context_profile, context_update)
+    return result
 
 

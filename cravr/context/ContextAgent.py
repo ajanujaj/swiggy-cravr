@@ -44,14 +44,24 @@ def context_discovery_node(state: CravrState) -> dict:
     unavailable.
     """
     user_id = state.get("user_id")
-    location_result = fetch_user_location(user_id)
+    existing_profile = state.get("context_profile") or {}
+
+    if existing_profile.get("address_id"):
+        # user_preference_node (runs first, needs an address for
+        # get_food_orders) already resolved this earlier in the same turn
+        # -- reuse it instead of calling get_addresses a second time for
+        # the same Swiggy account.
+        location_result = {"status": "success", **existing_profile}
+    else:
+        location_result = fetch_user_location(user_id)
+
     extracted = {
         key: location_result[key]
         for key in ("location", "delivery_area", "address_id")
         if location_result.get(key)
     }
 
-    profile = merge_profile(state.get("context_profile"), extracted)
+    profile = merge_profile(existing_profile, extracted)
     profile["important_missing_information"] = []
     profile["clarification_questions"] = []
 
