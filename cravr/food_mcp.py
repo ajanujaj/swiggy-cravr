@@ -1,26 +1,3 @@
-"""Real Swiggy Food MCP adapter -- maps Cravr's existing agent contracts
-onto Swiggy's actual Food MCP tools (get_addresses, search_restaurants,
-get_restaurant_menu, get_food_orders). Used instead of the mock server's
-`user_location`/`recommendation`/`order_history` tools once
-`client.using_real_food_mcp()` is true.
-
-Confirmed against real responses:
-- `get_addresses` returns a natural-language block for display (numbered
-  addresses with "(ID: ...)" markers and a "Suggested/preselected address
-  ID: ..." line), not JSON -- `get_saved_address` parses it with regex.
-- `search_restaurants` returns JSON (a `{"restaurants": [...], "dishes": [],
-  ...}` object) *followed by* trailing human-readable text (a UI-widget
-  disclaimer) appended after it with no separator json.loads recognizes --
-  `_parse_leading_json` uses `json.JSONDecoder.raw_decode` to parse just the
-  JSON prefix rather than choking on "Extra data". Restaurant objects use
-  "id" (not "restaurantId") and "cuisines" (a list, not singular "cuisine").
-- `get_restaurant_menu` / `get_food_orders` are still UNVERIFIED -- assumed
-  to follow the same JSON-plus-trailing-text convention (now handled by
-  `_parse_leading_json` either way); `_normalize_item`'s field-name guesses
-  for menu items are still speculative pending a real sample (CRAVR_DEBUG=1
-  prints the raw response for each).
-"""
-
 from __future__ import annotations
 
 import json
@@ -93,6 +70,8 @@ def get_saved_address() -> dict[str, Any]:
     try:
         raw = _unwrap(call_tool_sync("get_addresses", {}))
     except Exception as exc:
+        
+        debug("food_mcp", f"get_addresses FAILED ({type(exc).__name__}: {exc})")
         return {"status": "error", "message": f"Unable to retrieve saved address: {exc}"}
 
     debug("food_mcp", f"raw get_addresses response: {raw!r}")
@@ -173,7 +152,13 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
         if not restaurant_id:
             continue
         try:
-            menu_raw = _unwrap(call_tool_sync("get_restaurant_menu", {"restaurantId": restaurant_id}))
+            # get_restaurant_menu requires addressId too, same as
+            # search_restaurants (Swiggy's docs table confirms this) --
+            # omitting it was the direct cause of every menu fetch failing
+            # with "addressId is required".
+            menu_raw = _unwrap(
+                call_tool_sync("get_restaurant_menu", {"restaurantId": restaurant_id, "addressId": address_id})
+            )
         except Exception as exc:
             debug("food_mcp", f"get_restaurant_menu FAILED for {restaurant_id}: {exc}")
             continue
@@ -221,12 +206,28 @@ def _apply_filters(dishes: list[dict[str, Any]], filters: dict[str, Any]) -> lis
     return [d for d in dishes if keep(d)]
 
 
-def get_order_history() -> dict[str, Any]:
+def get_order_history(address_id: str | None = None) -> dict[str, Any]:
     """-> {"status", "count", "orders"}, matching preference.py's
-    fetch_order_history contract."""
+    fetch_order_history contract.
+
+    get_food_orders requires addressId too (Swiggy's docs confirm it, same
+    as search_restaurants/get_restaurant_menu) -- the original version
+    called it with no arguments at all, which is why it always failed.
+    preference.py's history node runs before context_agent resolves the
+    address, so address_id usually isn't available yet at the call site;
+    when the caller doesn't have one on hand, resolve it here directly
+    (deliberately uncached -- see _resolve_address_id in RecommendAgent.py
+    for why a process-wide cache burned us before).
+    """
+    if not address_id:
+        address_id = get_saved_address().get("address_id")
+    if not address_id:
+        return {"status": "error", "message": "No saved address available to fetch order history"}
+
     try:
-        raw = _unwrap(call_tool_sync("get_food_orders", {}))
+        raw = _unwrap(call_tool_sync("get_food_orders", {"addressId": address_id}))
     except Exception as exc:
+        debug("food_mcp", f"get_food_orders FAILED: {exc}")
         return {"status": "error", "message": f"Unable to retrieve order history: {exc}"}
 
     debug("food_mcp", f"raw get_food_orders response: {raw!r}")

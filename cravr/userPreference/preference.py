@@ -38,10 +38,17 @@ def _call_mcp_tool(tool_name: str, user_id: str | None, *, mcp_url: str | None =
     return {"status": "error", "message": f"Unexpected {tool_name} response format"}
 
 
-def fetch_order_history(user_id: str | None) -> dict[str, Any]:
-    """Fetch a user's recent orders from MCP."""
+def fetch_order_history(user_id: str | None, address_id: str | None = None) -> dict[str, Any]:
+    """Fetch a user's recent orders from MCP.
+
+    `address_id` is optional -- history_discovery_node/user_preference_node
+    run before context_agent resolves the address, so it's usually None
+    here; food_mcp.get_order_history() falls back to its own fresh lookup
+    when that happens. Passed through when a caller does have it on hand
+    (e.g. context_agent has already run) to avoid the extra call.
+    """
     if using_real_food_mcp():
-        return food_mcp.get_order_history()
+        return food_mcp.get_order_history(address_id=address_id)
     return _call_mcp_tool("order_history", user_id)
 
 def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
@@ -57,7 +64,8 @@ def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
 def history_discovery_node(state: CravrState) -> dict:
     """Fetch order history for the current user and store it in state."""
     user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
-    history_profile = fetch_order_history(user_id)
+    address_id = (state.get("context_profile") or {}).get("address_id")
+    history_profile = fetch_order_history(user_id, address_id=address_id)
     debug(
         "history_agent",
         f"user_id={user_id!r} status={history_profile.get('status')!r} "
@@ -68,8 +76,9 @@ def history_discovery_node(state: CravrState) -> dict:
 def user_preference_node(state: CravrState) -> dict:
     """First workflow node: load saved profile facts and recent orders."""
     user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
+    address_id = (state.get("context_profile") or {}).get("address_id")
     preference_profile = fetch_user_preferences(user_id)
-    history_profile = fetch_order_history(user_id)
+    history_profile = fetch_order_history(user_id, address_id=address_id)
     debug(
         "preference_agent",
         f"user_id={user_id!r} status={preference_profile.get('status')!r} "
