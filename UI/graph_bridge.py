@@ -114,11 +114,15 @@ async def start_conversation() -> None:
     try:
         result = await _ainvoke(
             {
+                # No hardcoded user_id -- Swiggy's OAuth token already scopes
+                # everything to one real account (address_id is the anchor
+                # now, not an internal USR-xxx identity). Nodes that still
+                # take a user_id (the mock-only fallback branches) tolerate
+                # None fine; they're unreachable once using_real_food_mcp().
                 "messages": [],
                 "intent_profile": {},
                 "context_profile": {},
                 "history_profile": {},
-                "user_id": state.DEFAULT_USER_ID,
             },
             config=state.get_config(),
         )

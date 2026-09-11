@@ -77,11 +77,13 @@ def main() -> None:
         try:
             result = app.invoke(
                 {
+                    # No hardcoded user_id -- same reasoning as
+                    # UI/graph_bridge.py: it's vestigial now that Swiggy's
+                    # OAuth token is the real, single identity.
                     "messages": [],
                     "intent_profile": {},
                     "context_profile": {},
                     "history_profile": {},
-                    "user_id": "USR-002",
                 },
                 config=config,
             )

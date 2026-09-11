@@ -17,7 +17,9 @@ class CravrState(TypedDict):
     # profile MCP endpoint.
     preference_profile: dict
     history_profile: dict
-    user_id: str
+    # Optional now -- no hardcoded default identity is seeded anymore
+    # (see UI/graph_bridge.py); Swiggy's OAuth token is the real identity.
+    user_id: str | None
     recommendation_state: dict
     summary: str
     # The single, frozen hand-off from decision_agent to recommendation_agent,

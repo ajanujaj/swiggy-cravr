@@ -9,7 +9,6 @@ from typing import Any
 
 import chainlit as cl
 
-DEFAULT_USER_ID = "USR-002"
 
 _THREAD_CONFIG_KEY = "cravr_config"
 _AWAITING_INTERRUPT_KEY = "cravr_awaiting_interrupt"
