@@ -4,12 +4,9 @@ from pathlib import Path
 import pandas as pd
 from fastmcp import FastMCP
 
-# Deliberately just the mock-data tool server -- no OAuth, no LLM calls, no
-# other env vars. The Swiggy OAuth callback lives on server.py instead (see
-# mcp_server/oauth.py, mounted there alongside the chat UI) precisely so
-# this file has nothing else riding on it: once real Swiggy MCP access
-# exists, deleting this directory and pointing CRAVR_MCP_URL at Swiggy's
-# real endpoint is the entire migration -- nothing here to untangle first.
+# Mock-data tool server only -- no OAuth/LLM calls. Real Swiggy OAuth lives in
+# mcp_server/oauth.py/server.py, so switching to real MCP access is just
+# deleting this dir and pointing CRAVR_MCP_URL at Swiggy's endpoint.
 app = FastMCP("recommendation-server")
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -60,17 +57,12 @@ def recommendation(
         filtered_df = filtered_df[filtered_df['restaurant_name'].str.lower().str.contains(restaurant_name.lower(), na=False)]
     
     if tags:
-        # Support comma-separated tags with AND semantics (a dish must carry
-        # every requested tag), while staying backward-compatible with a
-        # single free-text tag string (e.g. a craving phrase).
+        # Comma-separated tags use AND semantics (must carry every tag); a single free-text tag still works.
         for tag in [t.strip() for t in tags.split(",") if t.strip()]:
             filtered_df = filtered_df[filtered_df['tags'].str.lower().str.contains(tag.lower(), na=False)]
 
     if dietary_type:
-        # Exact match, not substring: dietary_type is a closed set ('Veg' /
-        # 'Non-Veg'), and .str.contains('veg') would also match 'non-veg'
-        # (it contains the substring 'veg'), silently letting a vegetarian
-        # request return meat dishes.
+        # Exact match, not substring -- .str.contains('veg') would also match 'non-veg'.
         filtered_df = filtered_df[filtered_df['dietary_type'].str.lower() == dietary_type.lower()]
 
     if meal_type:
@@ -78,10 +70,8 @@ def recommendation(
             filtered_df['meal_type'].str.lower().str.contains(meal_type.lower(), na=False)
         ]
 
-    # `course` is OR semantics (unlike tags): "main,side" means either is
-    # acceptable, because a caller widening the course is loosening a
-    # constraint, not adding one. Guarded on column presence so older menu
-    # files without the column keep working instead of raising KeyError.
+    # `course` is OR semantics (unlike tags): "main,side" means either is acceptable (widening, not narrowing).
+    # Guarded on column presence so older menu files without it don't raise KeyError.
     if course and 'course' in filtered_df.columns:
         wanted_courses = {c.strip().lower() for c in course.split(",") if c.strip()}
         if wanted_courses:
@@ -193,13 +183,11 @@ def user_location(user_id: str) -> dict:
 
 
 if __name__ == "__main__":
-    # 0.0.0.0 + $PORT so this same script is what Render (or any host that
-    # assigns its own port) runs -- locally $PORT is unset, so this still
-    # binds 127.0.0.1-reachable 8000, matching CRAVR_MCP_URL's default in
-    # cravr/client.py.
+    # $PORT so Render (or any host assigning its own port) can run this unchanged;
+    # locally $PORT is unset, so this falls back to 8000 (matches CRAVR_MCP_URL's default).
     app.run(
         transport="streamable-http",
-        host="localhost",
+        host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
         path="/mcp",
     )

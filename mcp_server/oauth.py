@@ -153,6 +153,7 @@ async def _bootstrap(http_client: httpx.AsyncClient, mcp_url: str) -> dict[str, 
 async def login(request: Request):
     _prune_expired_pending()
     mcp_url = _mcp_url()
+    next_path = request.query_params.get("next") or "/"
 
     async with httpx.AsyncClient(timeout=15) as http_client:
         try:
@@ -166,7 +167,7 @@ async def login(request: Request):
 
     state = secrets.token_urlsafe(24)
     verifier, challenge = _new_pkce_pair()
-    _PENDING[state] = {"verifier": verifier, "created_at": time.time()}
+    _PENDING[state] = {"verifier": verifier, "created_at": time.time(), "next": next_path}
 
     query = urlencode(
         {
@@ -229,4 +230,4 @@ async def callback(request: Request):
         )
 
     _save_tokens(response.json())
-    return HTMLResponse("<p>Swiggy is connected. You can close this tab.</p>")
+    return RedirectResponse(pending.get("next") or "/")
