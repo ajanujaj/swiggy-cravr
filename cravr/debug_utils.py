@@ -1,12 +1,7 @@
-"""Lightweight, opt-in tracing for the agent pipeline.
-
-Set `CRAVR_DEBUG=1` before running (`export CRAVR_DEBUG=1` or
-`CRAVR_DEBUG=1 python -m cravr.run`) to print what each node actually saw
-and decided -- raw LLM output, merged profiles, and routing choices -- to
-stderr. This is the fastest way to tell "the model returned garbage" apart
-from "the code's logic picked the wrong branch" when a live local model
-behaves unexpectedly.
-"""
+"""Lightweight, opt-in tracing for the agent pipeline. Set `CRAVR_DEBUG=1`
+to print what each node saw and decided -- raw LLM output, merged profiles,
+routing choices -- to stderr. Fastest way to tell "the model returned
+garbage" apart from "the code picked the wrong branch"."""
 
 from __future__ import annotations
 

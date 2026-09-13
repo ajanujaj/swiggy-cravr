@@ -1,18 +1,13 @@
-"""Pydantic schemas for each agent's LLM output.
+"""Pydantic schemas for each agent's LLM output. Passed to
+`.with_structured_output(...)` so LangChain enforces the shape via the
+model's native tool-calling/JSON-schema support -- a model either returns a
+schema-valid object or raises loudly, never silent malformed JSON.
 
-Passed to `.with_structured_output(...)` so LangChain enforces the shape via
-the model's native tool-calling/JSON-schema support, instead of us asking the
-model to print JSON text and hoping `json.loads` doesn't blow up on it. This
-is what actually eliminates the "predefined fallback response" failure mode:
-a model that supports structured output either returns a schema-valid object
-or the call raises loudly, so we're never silently working with malformed
-free-text pretending to be JSON.
-
-Fields the code computes itself (missing_information, important_missing_*,
-clarification_questions) are deliberately NOT part of these schemas -- the
-model only has to describe what's in the current message, and decisionAgent
-/ intentAgent / ContextAgent figure out what's still missing deterministically
-from the merged profile (see profile_utils.merge_profile).
+Computed fields (missing_information, important_missing_*,
+clarification_questions) are deliberately not part of these schemas -- the
+model only describes what's in the message; decisionAgent/intentAgent/
+ContextAgent derive what's missing deterministically (see
+profile_utils.merge_profile).
 """
 
 from __future__ import annotations
@@ -49,13 +44,8 @@ class DecisionOutput(BaseModel):
     clarification_message: Optional[str] = None
 
 class SuggestedOptions(BaseModel):
-    """Short, tappable answer choices for a clarification question.
-
-    Used by `cravr.options.suggest_options` so any agent can turn a
-    free-text question into a numbered menu -- the whole point of a
-    recommender for someone who "doesn't know what to eat" is that they
-    should have to type as little as possible.
-    """
+    """Short, tappable answer choices for a clarification question, used by
+    `cravr.options.suggest_options` to turn free text into a numbered menu."""
 
     options: list[str] = Field(
         default_factory=list,

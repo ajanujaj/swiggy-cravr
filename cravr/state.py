@@ -10,55 +10,32 @@ class CravrState(TypedDict):
 
     messages: Annotated[list, add_messages]
     intent_profile: dict
-    # Ambient facts pulled from MCP (e.g. saved delivery location). These are
-    # never user-facing requirements.
-    context_profile: dict
-    # Persistent dietary/budget/allergy preferences returned by the user
-    # profile MCP endpoint.
-    preference_profile: dict
+    context_profile: dict  # ambient MCP facts (e.g. saved address), never user-facing requirements
+    preference_profile: dict  # persistent dietary/budget/allergy prefs from the user profile MCP endpoint
     history_profile: dict
-    # Optional now -- no hardcoded default identity is seeded anymore
-    # (see UI/graph_bridge.py); Swiggy's OAuth token is the real identity.
-    user_id: str | None
+    user_id: str | None  # optional; no default identity is seeded -- Swiggy's OAuth token is the real one
     recommendation_state: dict
     summary: str
-    # The single, frozen hand-off from decision_agent to recommendation_agent,
-    # built once at the moment the decision becomes "recommend":
-    #   {"filters": {...MCP args...}, "history": {...hints...}, "summary": "..."}
-    # recommendation_agent reads ONLY this -- it never reaches back into
-    # intent_profile/history_profile, so there is exactly one place where a
-    # request is turned into menu filters.
+    # Frozen hand-off from decision_agent -> recommendation_agent:
+    # {"filters": {...MCP args...}, "history": {...hints...}, "summary": "..."}.
+    # recommendation_agent reads only this, never intent/history_profile directly.
     recommendation_brief: dict
-    # How many clarification round-trips decision_agent_node has asked for in
-    # the current gap-filling streak; reset to 0 by intent_discovery_node at
-    # the start of every *fresh* user turn (not on a clarify-and-retry loop).
+    # Clarification round-trips in the current gap-filling streak; reset by
+    # intent_discovery_node at the start of each fresh turn.
     clarification_rounds: int
-    # The profile field decision_agent_node just asked about, e.g.
-    # "craving_or_cuisine". intent_discovery_node consumes this to apply the
-    # user's answer deterministically instead of relying on the (small,
-    # unreliable) extraction model to infer which question a bare reply like
-    # "Indian" or "1000" was answering. Cleared once consumed.
+    # Field decision_agent_node just asked about (e.g. "craving_or_cuisine");
+    # intent_discovery_node uses this to apply the answer deterministically
+    # instead of trusting extraction to guess which question was answered.
     pending_clarification_field: str
-    # A free-text question decision_agent_node wants asked with tappable
-    # options, because it doesn't map to one of intent_discovery_node's own
-    # fixed fields (e.g. "I see both vegetarian and non-vegetarian saved --
-    # which did you mean?"). decision_agent_node never calls `interrupt()`
-    # itself -- only intent_discovery_node does, so there's exactly one
-    # interrupt site and one round budget in the whole graph (see
-    # `DecisionAgentNeverAsksTests`) -- so it hands the question off through
-    # this field instead. intent_discovery_node asks it (via
-    # `cravr.options.suggest_options` for the choices, same as its own
-    # fields) before running its usual extraction pass, folds the answer into
-    # `messages` so the normal pipeline picks it up, and clears this field.
+    # Free-text question decision_agent_node wants asked with tappable options
+    # when it doesn't map to one of intent_discovery_node's fixed fields.
+    # decision_agent_node never calls interrupt() itself -- only
+    # intent_discovery_node does (one interrupt site, one round budget) -- so
+    # it hands the question off here instead.
     pending_decision_question: str
-    # Fields already asked about in this streak. A field is never asked twice:
-    # if the answer couldn't be captured, we move on rather than badgering the
-    # user with the same question until MAX_CLARIFICATION_ROUNDS runs out.
-    asked_clarification_fields: list
-    # decision_agent_node's verdict, read by graph.py's conditional edge to
-    # route to recommendation_agent / back to intent_discovery / END. These
-    # must be declared here -- LangGraph only reliably threads state through
-    # its schema-declared channels, and routing on an undeclared key is silent
-    # until it isn't.
+    asked_clarification_fields: list  # fields already asked this streak; never re-asked
+    # decision_agent_node's verdict; graph.py's conditional edge routes on
+    # these. Must stay declared here -- LangGraph only threads state through
+    # schema-declared channels, and routing on an undeclared key fails silently.
     ready_to_recommend: bool
     decision: str

@@ -39,26 +39,26 @@ def _call_mcp_tool(tool_name: str, user_id: str | None, *, mcp_url: str | None =
     return {"status": "error", "message": f"Unexpected {tool_name} response format"}
 
 
-def fetch_order_history(user_id: str | None, address_id: str | None = None) -> dict[str, Any]:
+def fetch_order_history(address_id: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
     """Fetch a user's recent orders from MCP.
 
-    `address_id` is optional -- history_discovery_node/user_preference_node
-    run before context_agent resolves the address, so it's usually None
-    here; food_mcp.get_order_history() falls back to its own fresh lookup
-    when that happens. Passed through when a caller does have it on hand
-    (e.g. context_agent has already run) to avoid the extra call.
+    `user_id` is keyword-only, used only by the mock `order_history` tool --
+    Swiggy's real get_food_orders takes no user identifier at all (confirmed
+    against its docs: session credentials are supplied automatically by the
+    authenticated MCP session). `addressId` only says which saved address.
+
+    `address_id` is usually None on the first call of a turn (this node runs
+    before context_agent resolves it), so food_mcp.get_order_history() falls
+    back to its own lookup; passed through when a caller already has it.
     """
     if using_real_food_mcp():
         return food_mcp.get_order_history(address_id=address_id)
     return _call_mcp_tool("order_history", user_id)
 
 def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
-    """Fetch a user's saved preference profile from MCP.
-
-    No Swiggy Food MCP tool exposes this (checked all 20) -- always targets
-    MOCK_MCP_URL explicitly, since CRAVR_MCP_URL may point at Swiggy for
-    everything else. A future version could derive rough preferences from
-    get_food_orders instead of a dedicated tool call."""
+    """Fetch a user's saved preference profile from MCP. No Swiggy Food MCP
+    tool exposes this (checked all 20), so this always targets MOCK_MCP_URL
+    explicitly regardless of what CRAVR_MCP_URL points at."""
     return _call_mcp_tool("user_preferences", user_id, mcp_url=MOCK_MCP_URL)
 
 
@@ -66,7 +66,7 @@ def history_discovery_node(state: CravrState) -> dict:
     """Fetch order history for the current user and store it in state."""
     user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
     address_id = (state.get("context_profile") or {}).get("address_id")
-    history_profile = fetch_order_history(user_id, address_id=address_id)
+    history_profile = fetch_order_history(address_id, user_id=user_id)
     debug(
         "history_agent",
         f"user_id={user_id!r} status={history_profile.get('status')!r} "
@@ -80,12 +80,9 @@ def user_preference_node(state: CravrState) -> dict:
     context_profile = dict(state.get("context_profile") or {})
     address_id = context_profile.get("address_id")
 
-    # This node runs before context_discovery_node, so address_id is
-    # normally still unresolved here -- but get_food_orders needs one.
-    # Resolve it once (real Food MCP only; the mock order_history tool
-    # doesn't need an address) and forward the *same* result via
-    # context_profile so context_discovery_node reuses it instead of
-    # calling get_addresses a second time for the same Swiggy account.
+    # Runs before context_discovery_node, so address_id is usually unresolved but get_food_orders
+    # needs one. Resolve it once (real Food MCP only) and forward via context_profile so
+    # context_discovery_node reuses it instead of calling get_addresses again.
     context_update: dict[str, Any] = {}
     if using_real_food_mcp() and not address_id:
         location_result = food_mcp.get_saved_address()
@@ -98,7 +95,7 @@ def user_preference_node(state: CravrState) -> dict:
             }
 
     preference_profile = fetch_user_preferences(user_id)
-    history_profile = fetch_order_history(user_id, address_id=address_id)
+    history_profile = fetch_order_history(address_id, user_id=user_id)
     debug(
         "preference_agent",
         f"user_id={user_id!r} status={preference_profile.get('status')!r} "

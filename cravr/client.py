@@ -1,12 +1,9 @@
 """Shared MCP tool-calling helper. All agents call tools through
 `call_tool`/`call_tool_sync` instead of building their own `fastmcp.Client`.
-
-CRAVR_MCP_URL defaults to the local mock server; in production it should
-point at Swiggy's Food MCP server (https://mcp.swiggy.com/food -- the only
-one of Swiggy's three MCP servers Cravr targets). When a Swiggy OAuth
-token exists (see mcp_server/oauth.py), it's attached as a Bearer token
-automatically; otherwise calls stay unauthenticated, as they do today
-against the mock server.
+CRAVR_MCP_URL defaults to the local mock server; in production it points at
+Swiggy's Food MCP server (https://mcp.swiggy.com/food). A Swiggy OAuth token
+(see mcp_server/oauth.py), when present, is attached as a Bearer token
+automatically; otherwise calls stay unauthenticated, as against the mock server.
 """
 
 from __future__ import annotations
@@ -19,11 +16,9 @@ from fastmcp import Client
 
 DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
 
-# Separate from CRAVR_MCP_URL on purpose: user_preferences has no real Food
-# MCP equivalent, so it must keep reaching the mock server even once
-# CRAVR_MCP_URL is switched to Swiggy for everything else. Defaults to the
-# same local mock URL; set explicitly on Render once cravr-mock-mcp is
-# deployed (e.g. https://cravr-mock-mcp.onrender.com/mcp).
+# Separate from CRAVR_MCP_URL on purpose: user_preferences has no real Food MCP equivalent,
+# so it must keep reaching the mock server even once CRAVR_MCP_URL points at Swiggy. Set
+# explicitly on Render once cravr-mock-mcp is deployed.
 MOCK_MCP_URL = os.getenv("CRAVR_MOCK_MCP_URL", "http://127.0.0.1:8000/mcp")
 
 

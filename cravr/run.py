@@ -21,9 +21,7 @@ def _print_assistant_reply(result: dict) -> None:
     messages = result.get("messages", [])
     if messages:
         last = messages[-1]
-        # Intent collection ends with the user's last clarification. It is
-        # not an assistant response, so never echo it back with an assistant
-        # label.
+        # Intent collection can end on the user's last clarification -- never echo that back as an assistant reply.
         if getattr(last, "type", None) in {"human", "user"} or getattr(last, "role", None) in {"human", "user"}:
             return
         assistant_text = getattr(last, "content", str(last))
@@ -47,9 +45,7 @@ def _resume_until_complete(result: dict, config: dict, app) -> dict | None:
             source = "assistant"
             options = []
         print(f"Assistant [{source}]:", question)
-        # Options are numbered so a one-keystroke reply works; the agents
-        # accept the number, the value or the label, so typing something else
-        # entirely is still fine.
+        # Numbered so a one-keystroke reply works; agents also accept the value/label, or free text.
         for position, option in enumerate(options, start=1):
             print(f"    {position}. {option.get('label') or option.get('value')}")
 
@@ -65,21 +61,15 @@ def _resume_until_complete(result: dict, config: dict, app) -> dict | None:
 def main() -> None:
     print("Cravr CLI — type a message, or Ctrl-C/Ctrl-D to exit")
     app = _load_app()
-    # A checkpointer (configured on the compiled graph) persists state per
-    # thread_id, so the conversation no longer needs to be replayed by hand —
-    # each turn only sends the new message and the graph remembers the rest.
+    # A checkpointer persists state per thread_id, so each turn only sends the new message.
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
     try:
-        # Start the graph before collecting free text. With an empty history,
-        # intent_discovery asks its opening, time-aware meal question and lets
-        # the user choose a direction immediately.
+        # Start the graph before collecting free text, so intent_discovery's opening question shows immediately.
         try:
             result = app.invoke(
                 {
-                    # No hardcoded user_id -- same reasoning as
-                    # UI/graph_bridge.py: it's vestigial now that Swiggy's
-                    # OAuth token is the real, single identity.
+                    # No hardcoded user_id -- Swiggy's OAuth token is the real, single identity.
                     "messages": [],
                     "intent_profile": {},
                     "context_profile": {},
@@ -92,13 +82,8 @@ def main() -> None:
             result = None
 
         if result is not None:
-            # Cover the opening exchange too: intent_discovery can resolve
-            # every required field (and hand off to decision_agent) purely
-            # from the option-driven clarification rounds above, before the
-            # user ever reaches the free-typed loop below. Without printing
-            # here, whatever decision_agent (or recommendation_agent) says
-            # at the end of that first exchange was silently dropped and the
-            # user just saw a bare "You:" prompt.
+            # The opening exchange can resolve all the way to a recommendation via clarification
+            # rounds alone, before the free-typed loop below runs -- print it or it's silently dropped.
             result = _resume_until_complete(result, config, app)
             if result is not None:
                 _print_assistant_reply(result)

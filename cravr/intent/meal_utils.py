@@ -73,15 +73,9 @@ class MealWindow:
         return self.start > self.end
 
 
-# Ordered windows covering all 24 hours. The late-night window wraps midnight,
-# which is why containment is checked with an explicit `spans_midnight` branch
-# rather than a naive `start <= t <= end`.
-#
-# The option sets encode a real asymmetry: at lunch and dinner the user might
-# want a full meal OR something small, but at 3pm "lunch" is no longer on the
-# table. Offering an impossible option is worse than offering fewer.
-
-
+# Ordered windows covering all 24 hours. The late-night window wraps midnight, hence the
+# explicit `spans_midnight` branch instead of a naive `start <= t <= end`. Option sets encode
+# a real asymmetry -- at 3pm "lunch" is no longer on offer, so fewer options beat an impossible one.
 MEAL_WINDOWS: tuple[MealWindow, ...] = (
     MealWindow(
         name="breakfast",

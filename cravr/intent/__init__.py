@@ -1,11 +1,7 @@
 """Intent discovery: turns the user's message into a structured intent profile.
-
-Re-exported here so callers import from the *package* (`from .intent import
-intent_discovery_node`) rather than reaching into the module. The vocabulary
-constants are part of the public surface too: `recommend` reuses them to tell a
-reply that changes the request ("make it non-veg") from one that merely reacts
-to it ("3"), and duplicating those word lists there would let the two drift.
-"""
+Vocabulary constants are re-exported too -- `recommend` reuses them to tell a
+request change ("make it non-veg") apart from a mere reaction ("3"), and
+duplicating the word lists there would let the two drift."""
 
 from .intentAgent import (
     KNOWN_CUISINE_WORDS,

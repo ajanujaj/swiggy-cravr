@@ -1,3 +1,11 @@
+"""Real Swiggy Food MCP adapter -- maps Cravr's agent contracts onto
+Swiggy's Food MCP tools (get_addresses, search_restaurants,
+get_restaurant_menu, get_food_orders, all account-scoped via OAuth, no
+user_id). Their responses are text, not clean JSON: get_addresses is a
+natural-language block; the rest are JSON with trailing human-readable
+text appended after it.
+"""
+
 from __future__ import annotations
 
 import json
@@ -31,18 +39,12 @@ _JSON_DECODER = json.JSONDecoder()
 
 
 def _parse_leading_json(text: str) -> Any:
-    """Swiggy's tools return a JSON object/array followed by trailing
-    human-readable text -- e.g. search_restaurants' response ends with
-    "\n\n\u26a0\ufe0f A rich UI widget may be shown...". Plain
-    `json.loads` chokes on that with "Extra data" and silently falls back
-    to the raw string, which downstream code then iterates character by
-    character (0 results, no error). `raw_decode` parses just the JSON
-    prefix and ignores whatever follows. If the text isn't JSON at all
-    (get_addresses' plain-language response), this falls back to the raw
-    text unchanged, same as before."""
-    stripped = text.lstrip()
+    """Parse a JSON prefix, ignoring trailing text Swiggy appends after it
+    (e.g. a UI-widget disclaimer) -- plain json.loads chokes on that with
+    "Extra data". Falls back to the raw text if it isn't JSON at all
+    (get_addresses' plain-language response)."""
     try:
-        value, _end = _JSON_DECODER.raw_decode(stripped)
+        value, _end = _JSON_DECODER.raw_decode(text.lstrip())
         return value
     except json.JSONDecodeError:
         return text
@@ -54,20 +56,16 @@ _ADDRESS_LINE_RE = re.compile(
 )
 _SUGGESTED_ID_RE = re.compile(r"Suggested/preselected address ID:\s*([^\s.,]+)")
 
-# get_restaurant_menu's text-based response inlines "[image: <url>]" after
-# almost every line (the restaurant header and every dish) -- long, noisy,
-# and nothing downstream (parsing or display) needs it.
+# get_restaurant_menu inlines "[image: <url>]" after almost every line; noise, drop it.
 _IMAGE_REF_RE = re.compile(r"\s*\[image:[^\]]*\]")
 
-# get_restaurant_menu's real shape (confirmed against a live response):
-# markdown-ish text with "##"/"###" category headers and dish lines like
-# "  - Aloo Paratha ... -- \u20b9105 | Veg, Bestseller, has addons (ID: 200268099)".
-# "###" subcategory headers are indented (e.g. "  ### Veg Main Course") --
-# the leading "[ \t]*" is required, a bare "^(#{2,3})" misses every one of
-# them and silently drops every subcategory attribution.
+# get_restaurant_menu's shape: "##"/"###" category headers + dish lines like
+# "  - Aloo Paratha ... -- ₹105 | Veg, Bestseller, has addons (ID: 200268099)".
+# "###" lines are indented -- the leading "[ \t]*" is required or subcategory
+# attribution silently drops.
 _MENU_HEADER_RE = re.compile(r"^[ \t]*(#{2,3})\s*(.+?)\s*$", re.MULTILINE)
 _MENU_ITEM_RE = re.compile(
-    r"^[ \t]*-[ \t]*(?P<name>.+?)(?:[ \t]*\u2014[ \t]*\u20b9(?P<price>[\d,]+(?:\.\d+)?))?"
+    r"^[ \t]*-[ \t]*(?P<name>.+?)(?:[ \t]*—[ \t]*₹(?P<price>[\d,]+(?:\.\d+)?))?"
     r"[ \t]*\|[ \t]*(?P<tags>[^()\n]*?)[ \t]*\(ID:[ \t]*(?P<id>[^)]+)\)[ \t]*$",
     re.MULTILINE,
 )
@@ -75,13 +73,9 @@ _DIETARY_TAGS = {"veg", "non-veg", "nonveg", "non veg", "egg"}
 
 
 def _parse_menu_items(text: str, restaurant_name: str, restaurant_cuisine: Any) -> list[dict[str, Any]]:
-    """Parse get_restaurant_menu's text response into dish records shaped
-    like _normalize_item's output. Category attribution: walk the header
-    positions once and, for each item, take whichever header (## resets
-    the subcategory, ### sets it) most recently preceded that item's
-    position -- category/tag text never contains ")" so matching by
-    absolute offset is reliable without a line-by-line state machine.
-    """
+    """Parse get_restaurant_menu's text into dish records. Category
+    attribution: for each item, take whichever header most recently
+    preceded it (## resets subcategory, ### sets it)."""
     headers = [(m.start(), len(m.group(1)), m.group(2)) for m in _MENU_HEADER_RE.finditer(text)]
 
     def _category_path(pos: int) -> tuple[str, str]:
@@ -100,8 +94,7 @@ def _parse_menu_items(text: str, restaurant_name: str, restaurant_cuisine: Any) 
         raw_tags = [t.strip() for t in m.group("tags").split(",") if t.strip()]
         dietary_tag = next((t for t in raw_tags if t.lower() in _DIETARY_TAGS), "")
         category, subcategory = _category_path(m.start())
-        # Semicolon-joined: _rank_candidates (RecommendAgent.py) splits an
-        # item's "tags" field on ";", not ",".
+        # ";"-joined: _rank_candidates (RecommendAgent.py) splits tags on ";", not ",".
         tags = "; ".join(t for t in (category, subcategory, *raw_tags) if t)
 
         price_text = m.group("price")
@@ -128,18 +121,15 @@ def get_saved_address() -> dict[str, Any]:
     """-> {"location", "delivery_area", "address_id", "status"}, matching
     ContextAgent.fetch_user_location's contract.
 
-    get_addresses returns a natural-language block for display, e.g.:
+    get_addresses returns a natural-language block, e.g.:
         1. [Baba] Anuj Jain: 307, third floor, ... (ID: abc123)
-        ...
         Suggested/preselected address ID: abc123. Ask the user to confirm...
-    Parsed with regex rather than JSON; uses the suggested ID Swiggy itself
-    provides so this stays ambient (no clarification question), matching
-    ContextAgent's existing "don't ask the user for it" contract.
+    Parsed with regex; uses Swiggy's own suggested ID so this stays ambient
+    (no clarification question needed).
     """
     try:
         raw = _unwrap(call_tool_sync("get_addresses", {}))
     except Exception as exc:
-        
         debug("food_mcp", f"get_addresses FAILED ({type(exc).__name__}: {exc})")
         return {"status": "error", "message": f"Unable to retrieve saved address: {exc}"}
 
@@ -165,15 +155,14 @@ def get_saved_address() -> dict[str, Any]:
     }
 
 
-# Tags (from RecommendAgent.KNOWN_TAGS) that mean "diet food" in Swiggy's
-# own EATRIGHT collection sense -- vegan/vegetarian excluded, those map to
-# dietary_type/cuisine concerns rather than "healthy eating" as such.
+# EATRIGHT-flavored tags from RecommendAgent.KNOWN_TAGS (vegan/vegetarian
+# excluded -- those are dietary/cuisine, not "healthy eating").
 _EATRIGHT_TAGS = {"low-calorie", "high-protein", "low-carb", "gluten-free", "sugar-free-option", "organic"}
 
 
 def _infer_collection(filters: dict[str, Any]) -> str | None:
-    """Optional `collection` scope for search_restaurants -- no BOLT signal
-    exists yet (nothing in Cravr captures "make it fast")."""
+    """Optional `collection` scope for search_restaurants. No BOLT mapping --
+    nothing in Cravr signals "fast delivery" yet."""
     tags = {t.strip() for t in str(filters.get("tags") or "").split(",") if t.strip()}
     if tags & _EATRIGHT_TAGS:
         return "EATRIGHT"
@@ -185,12 +174,11 @@ def _infer_collection(filters: dict[str, Any]) -> str | None:
 
 def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaurants: int = 5) -> list[dict[str, Any]]:
     """search_restaurants -> get_restaurant_menu -> flatten -> filter
-    locally, since Swiggy's tools don't filter by dish attributes.
+    locally (Swiggy's tools don't filter by dish attributes).
 
-    `query` is required by the real tool and rejected if empty --
-    `_filter_variants` (RecommendAgent.py) progressively drops cuisine/tags
-    to relax the search, so by the last attempt(s) neither survives. Falls
-    back to dietary_type, then a generic term, rather than failing outright.
+    `query` is required and rejected if empty; falls back through
+    cuisine/tags/dietary_type to a generic term since _filter_variants
+    (RecommendAgent.py) can drop both cuisine and tags while relaxing.
     """
     query = filters.get("cuisine") or filters.get("tags") or filters.get("dietary_type") or "restaurants"
     arguments: dict[str, Any] = {"addressId": address_id, "query": query}
@@ -221,28 +209,17 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
         if not restaurant_id:
             continue
         try:
-            # get_restaurant_menu requires addressId too, same as
-            # search_restaurants (Swiggy's docs table confirms this) --
-            # omitting it was the direct cause of every menu fetch failing
-            # with "addressId is required".
+            # addressId is required here too, same as search_restaurants.
             menu_raw = _unwrap(
                 call_tool_sync("get_restaurant_menu", {"restaurantId": restaurant_id, "addressId": address_id})
             )
         except Exception as exc:
             debug("food_mcp", f"get_restaurant_menu FAILED for {restaurant_id}: {exc}")
             continue
-        # Confirmed real shape: markdown-ish text (headers + "- Name --
-        # ₹price | tags [image: url] (ID: ...)" lines), not JSON with an
-        # "items" list -- same text-first convention as get_addresses.
-        # Strip the "[image: ...]" segments immediately, before anything
-        # else (including the debug log below) touches this text -- they're
-        # long, noisy, and nothing downstream needs them.
         if isinstance(menu_raw, str):
             menu_raw = _IMAGE_REF_RE.sub("", menu_raw)
         debug("food_mcp", f"raw get_restaurant_menu response for {restaurant_id}: {menu_raw!r}")
-        # Swiggy's search_restaurants shape uses "cuisines" (a list), not
-        # "cuisine" -- join it into a readable string for _apply_filters'
-        # substring match against the user's requested cuisine.
+        # "cuisines" is a list, not singular "cuisine" -- join for the filter's substring match.
         restaurant_cuisine = _first(restaurant, "cuisine", "cuisines")
         if isinstance(restaurant_cuisine, list):
             restaurant_cuisine = ", ".join(str(c) for c in restaurant_cuisine)
@@ -250,9 +227,7 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
         if isinstance(menu_raw, str):
             dishes.extend(_parse_menu_items(menu_raw, restaurant_name, restaurant_cuisine))
         else:
-            # Defensive fallback only -- the real response is text, not JSON
-            # (see _parse_menu_items' docstring), but keep this path working
-            # in case that ever changes.
+            # Defensive fallback if the response is ever real JSON instead of text.
             raw_items = menu_raw.get("items") if isinstance(menu_raw, dict) else (menu_raw if isinstance(menu_raw, list) else [])
             for item in raw_items or []:
                 dishes.append(_normalize_item(item, restaurant_name, restaurant_cuisine))
@@ -294,14 +269,9 @@ def get_order_history(address_id: str | None = None) -> dict[str, Any]:
     """-> {"status", "count", "orders"}, matching preference.py's
     fetch_order_history contract.
 
-    get_food_orders requires addressId too (Swiggy's docs confirm it, same
-    as search_restaurants/get_restaurant_menu) -- the original version
-    called it with no arguments at all, which is why it always failed.
-    preference.py's history node runs before context_agent resolves the
-    address, so address_id usually isn't available yet at the call site;
-    when the caller doesn't have one on hand, resolve it here directly
-    (deliberately uncached -- see _resolve_address_id in RecommendAgent.py
-    for why a process-wide cache burned us before).
+    addressId is required. If the caller doesn't have one yet (usually
+    true -- this runs before context_agent resolves it), resolve it here,
+    deliberately uncached (see _resolve_address_id in RecommendAgent.py).
     """
     if not address_id:
         address_id = get_saved_address().get("address_id")

@@ -1,16 +1,9 @@
 """Generic LLM-backed multiple-choice suggestions for clarification questions.
-
-Cravr exists for someone who "doesn't know what to eat" -- every place the
-graph pauses to ask something should default to letting the user tap a
-number instead of typing a sentence. `suggest_options()` is the one place
-that turns a free-text clarification question into a short, context-aware
-menu of answers; `resolve_option_choice()` is its counterpart, turning the
-reply (a digit, an option's own text, or something the menu never
-anticipated) back into a value any agent can use exactly like it would a
-plain free-text answer.
-
-Any agent that currently does `interrupt({"question": q, "options": []})`
-can switch to `suggest_options(q, ...)` to get the same treatment.
+`suggest_options()` turns a free-text clarification question into a short,
+tappable menu; `resolve_option_choice()` maps the reply (a digit, an
+option's own text, or unanticipated free text) back into a plain value.
+Any `interrupt({"question": q, "options": []})` call can switch to
+`suggest_options(q, ...)` to get the same treatment.
 """
 
 from __future__ import annotations
@@ -23,10 +16,8 @@ from .debug_utils import debug
 from .llm import get_llm
 from .schemas import SuggestedOptions
 
-# Sentinel returned by `resolve_option_choice` when the user picked the
-# "type your own" option rather than one of the suggested answers. Never
-# stored as a real field value -- callers must catch it and ask a follow-up
-# free-text question instead.
+# Sentinel for the "type your own" option. Never a real field value -- callers must catch it
+# and ask a follow-up free-text question instead.
 OTHER_VALUE = "__other__"
 OTHER_LABEL = "Something else (type your own)"
 
@@ -56,13 +47,9 @@ def suggest_options(
     max_options: int = 5,
 ) -> list[dict[str, str]]:
     """LLM-suggested tappable answers for `question`, with a static fallback.
-
-    Returns interrupt-payload option dicts (`{"value", "label"}`). Ends with
-    an "other" escape hatch by default so a request the model/fallback list
-    didn't anticipate can still be typed out in full. Never raises: a model
-    failure (unavailable, malformed output, wrong schema) falls back to
-    `fallback` so a clarification question is never blocked on the LLM being
-    up.
+    Returns interrupt-payload option dicts (`{"value", "label"}`), ending with
+    an "other" escape hatch by default. Never raises -- any model failure falls
+    back to `fallback` so a clarification question is never blocked on the LLM.
     """
     labels: list[str] = []
     try:
@@ -84,7 +71,7 @@ def suggest_options(
     if not labels:
         labels = list(fallback or [])
 
-    # De-dupe while preserving order -- the model occasionally repeats itself.
+    # De-dupe, preserving order -- the model occasionally repeats itself.
     seen: set[str] = set()
     deduped: list[str] = []
     for label in labels:
@@ -100,11 +87,9 @@ def suggest_options(
 
 
 def resolve_option_choice(answer: str, options: list[dict]) -> str:
-    """Map a numbered or typed-out reply onto the option it picked.
-
-    Falls through to the raw answer unchanged when no options were offered,
-    or when the reply doesn't match any of them -- free text the menu didn't
-    anticipate must keep working exactly as it did before options existed.
+    """Map a numbered or typed-out reply onto the option it picked. Falls through to the
+    raw answer unchanged when no options were offered or none match -- free text the menu
+    didn't anticipate must keep working as before options existed.
     """
     if not options:
         return answer

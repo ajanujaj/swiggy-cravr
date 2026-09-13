@@ -1,15 +1,10 @@
-"""Decision agent: uses the LLM to decide whether the request is ready for recommendations.
-
-This node never calls `interrupt()` itself (see `DecisionAgentNeverAsksTests`
-in tests/test_decision_agent.py) -- only intent_discovery_node does, so the
-whole graph has exactly one interrupt site and one clarification round
-budget, never two competing ones. When decision_agent_node wants to ask
-something intent didn't already cover (e.g. a saved-preference conflict like
-"vegetarian or non-vegetarian?"), it hands the question off through
-`pending_decision_question` and routes back to intent_discovery_node via
-`CLARIFY_AND_RETRY`; intent_discovery_node asks it with tappable options the
-same way it asks its own fields, then folds the answer back in through the
-normal extraction pipeline before decision_agent_node is asked again.
+"""Decision agent: uses the LLM to decide whether the request is ready for
+recommendations. Never calls `interrupt()` itself (see
+`DecisionAgentNeverAsksTests`) -- only intent_discovery_node does, so there's
+exactly one interrupt site and round budget. A question intent didn't cover
+(e.g. a saved-preference conflict) is handed off via
+`pending_decision_question` + `CLARIFY_AND_RETRY`; intent_discovery_node asks
+it and folds the answer back through the normal extraction pipeline.
 """
 
 from __future__ import annotations
@@ -176,14 +171,11 @@ def _build_summary(intent_profile: dict, context_profile: dict, history_profile:
 
 
 def _collect_clarification_targets(intent_profile: dict, context_profile: dict) -> list[tuple[str, str]]:
-    """Pair each still-missing field with the follow-up question for it.
-
-    `intentAgent`/`ContextAgent` publish `important_missing_information` (field
-    names) alongside a positionally-matching `clarification_questions` list.
-    Keeping them paired is what lets the node ask about a *different* field
-    each round instead of pinning `questions[0]` forever -- previously, if the
-    first field's answer failed to extract, the second and third questions
-    were simply unreachable.
+    """Pair each still-missing field with its follow-up question.
+    intentAgent/ContextAgent publish `important_missing_information` fields
+    alongside a positionally-matching `clarification_questions` list; keeping
+    them paired lets the node ask a *different* field each round instead of
+    pinning `questions[0]` forever.
     """
     targets: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -200,8 +192,7 @@ def _collect_clarification_targets(intent_profile: dict, context_profile: dict) 
             seen.add(field)
             targets.append((field, questions[index] if index < len(questions) else GENERIC_CLARIFICATION_FALLBACK))
 
-        # Questions with no matching field name (older/partial profiles) still
-        # get asked, keyed by the question text itself.
+        # A question with no matching field (older/partial profiles) is still asked, keyed by its own text.
         for question in questions[len(fields):]:
             key = f"question:{question}"
             if key in seen:
@@ -210,9 +201,7 @@ def _collect_clarification_targets(intent_profile: dict, context_profile: dict) 
             targets.append((key, question))
 
     if not targets:
-        # The request is vague but neither profile named a specific gap (e.g.
-        # only the non-important `missing_information` was populated). Ask the
-        # catch-all once rather than saying nothing.
+        # Vague request but no profile named a specific gap -- ask the catch-all once.
         targets.append((GENERIC_CLARIFICATION_FIELD, GENERIC_CLARIFICATION_FALLBACK))
 
     return targets
@@ -232,12 +221,9 @@ def _needs_clarification(user_input: str, intent_profile: dict, context_profile:
 
 
 def _has_usable_signal(intent_profile: dict) -> bool:
-    """True when the profile carries at least one thing we can filter a menu on.
-
-    Tracks `IntentExtraction`: craving/cuisine/craving_tag are the filterable
-    fields. `meal_intent` alone does not count -- "dinner" narrows nothing on
-    its own, since 48 of the 80 menu rows are All Day.
-    """
+    """True when the profile carries at least one filterable thing
+    (craving/cuisine/craving_tag). `meal_intent` alone doesn't count --
+    "dinner" narrows nothing, most menu rows are All Day."""
     return bool(
         intent_profile.get("craving")
         or intent_profile.get("cuisine")
@@ -261,25 +247,16 @@ def _next_clarification_question(intent_profile: dict, context_profile: dict) ->
 
 
 def decision_agent_node(state: CravrState) -> dict:
-    """Judge whether the bot can recommend now. This node never calls `interrupt()`.
-
-    `intent_discovery_node` owns every actual `interrupt()` call: by the time
-    control reaches here the user has already been asked about every gap
-    intent could name, up to its own round budget. Calling `interrupt()` here
-    too would mean two interrupt sites competing over one conversation -- the
-    user answering the same gap twice, and two independent round budgets
-    neither of which knows about the other.
-
-    A gap that survives intent is therefore not automatically a reason to
-    stop -- it's usually a reason to recommend loosely and let the user
-    steer. The one case worth a fresh question is a *new* ambiguity intent
-    had no way to name (e.g. a saved dietary preference now conflicting with
-    what the user just asked for): that gets asked too, but via
-    `pending_decision_question` + `CLARIFY_AND_RETRY`, so intent_discovery_node
-    is still the only place `interrupt()` is ever called from, and its own
-    round budget (`clarification_rounds`, capped at `MAX_CLARIFICATION_ROUNDS`)
-    still applies. The only genuine dead end is a profile with nothing
-    filterable in it at all once that budget is spent.
+    """Judge whether the bot can recommend now. Never calls `interrupt()`
+    itself -- intent_discovery_node already asked about every gap it could
+    name, up to its own round budget, so a second interrupt site here would
+    double-ask and run a competing budget. A gap that survives intent is
+    usually a reason to recommend loosely, not stop. The one exception -- a
+    *new* ambiguity intent couldn't name (e.g. a saved-preference conflict)
+    -- still goes through `pending_decision_question` + `CLARIFY_AND_RETRY`,
+    so intent_discovery_node stays the only interrupt site and its own
+    budget (`clarification_rounds`, capped at `MAX_CLARIFICATION_ROUNDS`)
+    still applies.
     """
     intent_profile = _coerce_profile(state.get("intent_profile"))
     context_profile = _coerce_profile(state.get("context_profile"))
@@ -295,8 +272,7 @@ def decision_agent_node(state: CravrState) -> dict:
     debug("decision_agent", f"intent_profile={intent_profile}")
     debug("decision_agent", f"context_profile={context_profile}")
     debug("decision_agent", f"preference_profile={preference_profile}")
-    # Whatever intent could not fill, it has already asked about and given up
-    # on. Treat that as spent rather than as a fresh reason to interrogate.
+    # Intent already asked about and gave up on these gaps -- treat as spent, not a fresh reason to interrogate.
     exhausted = bool(intent_profile.get("important_missing_information"))
     debug("decision_agent", f"gaps left by intent={intent_profile.get('important_missing_information')}")
 
@@ -320,29 +296,19 @@ def decision_agent_node(state: CravrState) -> dict:
     ready_to_recommend = bool(result.get("ready_to_recommend"))
     decision = result.get("decision") if result.get("decision") in {"recommend", "clarify"} else "clarify"
 
-    # Decision-level round budget, separate from intent's own (tracked in
-    # `intent_profile["important_missing_information"]`/`exhausted` above).
-    # This is what caps *this* node's own ad hoc questions -- the ones intent
-    # never asked about, like a saved-preference conflict -- at
-    # MAX_CLARIFICATION_ROUNDS instead of letting the decision LLM invent a
-    # new question forever.
+    # This node's own round budget (separate from intent's, tracked via `exhausted` above) caps its ad hoc
+    # questions -- e.g. a saved-preference conflict intent never asked about -- at MAX_CLARIFICATION_ROUNDS.
     clarification_rounds = int(state.get("clarification_rounds") or 0)
     give_up = exhausted or clarification_rounds >= MAX_CLARIFICATION_ROUNDS
 
     if give_up and not ready_to_recommend and _has_usable_signal(intent_profile):
-        # We've spent the clarification budget and the user did tell us
-        # *something* usable. Ending the turn with another question is the
-        # worst outcome; attempt a (deliberately loosely-filtered)
-        # recommendation instead and let the user steer from there.
+        # Budget spent but the user gave us something usable -- recommend loosely rather than ask again.
         debug("decision_agent", "clarification exhausted but profile has signal — recommending anyway")
         ready_to_recommend = True
         decision = "recommend"
 
     if not ready_to_recommend and not give_up:
-        # Ask with tappable options instead of ending the turn on a
-        # type-it-yourself question -- see the module docstring for why this
-        # hands the question to intent_discovery_node rather than asking it
-        # directly.
+        # Hand off to intent_discovery_node so it's asked with tappable options (see module docstring).
         pending_question = result.get("clarification_message") or _next_clarification_question(
             intent_profile, context_profile
         )
@@ -361,8 +327,7 @@ def decision_agent_node(state: CravrState) -> dict:
         }
 
     if give_up:
-        # Out of clarification budget: never echo a question we just gave up
-        # on, or the user's reply restarts the streak from scratch.
+        # Never echo the question we just gave up on -- that would restart the streak.
         fallback_message = GIVE_UP_MESSAGE
     else:
         fallback_message = _next_clarification_question(intent_profile, context_profile)
@@ -385,8 +350,7 @@ def decision_agent_node(state: CravrState) -> dict:
     }
 
     if ready_to_recommend:
-        # Freeze the request exactly once, at the moment we commit to
-        # recommending. Everything downstream reads this and only this.
+        # Freeze the request once, here -- everything downstream reads only this brief.
         brief = build_recommendation_brief(
             intent_profile, history_profile, preference_profile
         )

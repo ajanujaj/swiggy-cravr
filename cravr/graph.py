@@ -12,10 +12,8 @@ from .recommend import is_pure_feedback, recommendation_agent_node
 from .state import CravrState
 
 
-# Router return values. These double as the conditional-edge labels in the
-# generated Mermaid diagram, so they're named for *why* the branch was taken
-# rather than for the node it lands on -- `draw_mermaid()` shows an unlabelled
-# dashed line when a path-map key is just the destination node's name.
+# These double as conditional-edge labels in the generated Mermaid diagram, so they're named
+# for *why* the branch was taken, not the node it lands on (an unnamed key draws an unlabelled edge).
 FEEDBACK = "feedback"
 NEW_REQUEST = "new_request"
 RECOMMEND = "recommend"
@@ -23,15 +21,10 @@ NEEDS_MORE_INFO = "needs_more_info"
 
 
 def _route_entry(state: CravrState) -> str:
-    """Send replies about the current suggestions straight to the recommender.
-
-    Once dishes are on the table, "3" or "yes" is a reaction, not a new
-    request. Running it through intent/history/decision costs an extraction
-    call, an MCP round-trip and a decision call for nothing -- and worse,
-    hands the extraction model a bare "3" to interpret.
-
-    Anything that changes the request ("make it non-veg", "under 200") still
-    takes the full path so the profile is actually updated.
+    """Send replies about the current suggestions straight to the recommender --
+    once dishes are on the table, "3" or "yes" is a reaction, not a new request,
+    and running it through intent/history/decision wastes 3 calls on a bare "3".
+    Anything that changes the request ("make it non-veg") still takes the full path.
     """
     if is_pure_feedback(latest_user_text(state.get("messages") or []), state.get("recommendation_state")):
         return FEEDBACK
@@ -60,9 +53,7 @@ def build_graph():
         _route_entry,
         {FEEDBACK: "recommendation_agent", NEW_REQUEST: "user_preference"},
     )
-    # New requests first load the durable user profile and recent order
-    # history, then enrich delivery context, and only then interpret the
-    # request itself.
+    # New requests load the durable profile/order history, then delivery context, then intent.
     workflow.add_edge("user_preference", "context_discovery")
     workflow.add_edge("context_discovery", "intent_discovery")
     workflow.add_edge("intent_discovery", "decision_agent")
@@ -77,9 +68,8 @@ def build_graph():
     )
     workflow.add_edge("recommendation_agent", END)
 
-    # A checkpointer is required so decision_agent_node can pause mid-graph
-    # (via `interrupt()`) to ask the user a clarifying question, then resume
-    # with just their answer instead of restarting the whole pipeline.
+    # A checkpointer is required so intent_discovery_node can pause mid-graph (via `interrupt()`)
+    # to ask a clarifying question, then resume with just the answer instead of restarting.
     return workflow.compile(checkpointer=MemorySaver())
 
 

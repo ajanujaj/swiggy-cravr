@@ -1,8 +1,5 @@
-"""Context discovery: delivery-side facts (location, weather).
-
-Currently wired out of `graph.py` — the node is kept importable so reinstating
-it is a one-line change rather than a resurrection.
-"""
+"""Context discovery: delivery-side facts (location, delivery area) enriched
+after user_preference, before intent discovery. See graph.py."""
 
 from .ContextAgent import context_discovery_node
 

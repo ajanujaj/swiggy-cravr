@@ -47,10 +47,8 @@ def context_discovery_node(state: CravrState) -> dict:
     existing_profile = state.get("context_profile") or {}
 
     if existing_profile.get("address_id"):
-        # user_preference_node (runs first, needs an address for
-        # get_food_orders) already resolved this earlier in the same turn
-        # -- reuse it instead of calling get_addresses a second time for
-        # the same Swiggy account.
+        # user_preference_node already resolved this earlier this turn -- reuse it
+        # instead of calling get_addresses again for the same account.
         location_result = {"status": "success", **existing_profile}
     else:
         location_result = fetch_user_location(user_id)
