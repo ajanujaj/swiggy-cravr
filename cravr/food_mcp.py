@@ -307,7 +307,13 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
             for item in raw_items or []:
                 dishes.append(_normalize_item(item, restaurant_name, restaurant_cuisine))
 
-    return _apply_filters(dishes, filters)
+    dishes = _apply_filters(dishes, filters)
+    if craving:
+        # This is the untargeted fallback (search_menu found nothing usable) --
+        # without a craving-name filter it would hand back a restaurant's whole
+        # menu regardless of what the user actually asked for.
+        dishes = [d for d in dishes if _matches_craving(str(d.get("item_name") or ""), str(craving))]
+    return dishes
 
 
 def _normalize_item(item: dict[str, Any], restaurant_name: str, restaurant_cuisine: Any) -> dict[str, Any]:
@@ -338,6 +344,29 @@ def _apply_filters(dishes: list[dict[str, Any]], filters: dict[str, Any]) -> lis
         return True
 
     return [d for d in dishes if keep(d)]
+
+
+_CRAVING_STOPWORDS = {"a", "an", "and", "the", "or", "with", "some", "of", "some", "please"}
+
+
+def _matches_craving(item_name: str, craving: str) -> bool:
+    """Loose substring/token match between a dish name and what the user actually
+    asked for. Only used on the search_restaurants -> get_restaurant_menu fallback:
+    that path searches for RESTAURANTS by cuisine/tag text and, once it has one,
+    returns that restaurant's *entire* menu -- with no dish-level filtering at all.
+    Without this, e.g. a "Mac and cheese" craving that falls back to a "comfort
+    food" restaurant search would return literally every dish on that restaurant's
+    menu (kebabs, biryani, dal makhani, ...), none of them mac and cheese."""
+    name = (item_name or "").lower()
+    craving_l = (craving or "").lower().strip()
+    if not craving_l:
+        return True
+    if craving_l in name or name in craving_l:
+        return True
+    words = [w for w in re.findall(r"[a-z0-9]+", craving_l) if w not in _CRAVING_STOPWORDS and len(w) > 2]
+    if not words:
+        return True
+    return any(w in name for w in words)
 
 
 def get_order_history(address_id: str | None = None) -> dict[str, Any]:
