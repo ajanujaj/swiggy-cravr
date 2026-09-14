@@ -236,7 +236,7 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
     filters: dict[str, Any] = {}
 
     tag_terms: list[str] = []
-    for term in [intent_profile.get("craving"), *(intent_profile.get("taste_preference") or [])]:
+    for term in [intent_profile.get("craving"), intent_profile.get("craving_tag"), *(intent_profile.get("taste_preference") or [])]:
         if not term:
             continue
         normalized = str(term).strip().lower()
@@ -246,6 +246,12 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
     if tag_terms:
         # Comma-separated tags are AND-matched by the MCP recommendation tool.
         filters["tags"] = ",".join(tag_terms)
+
+    # The exact dish/type name the user picked or typed -- kept verbatim (not filtered
+    # through KNOWN_TAGS) so a real-MCP search can query Swiggy's search_menu tool
+    # directly by name (e.g. "sushi"), which isn't a menu.csv tag at all.
+    if intent_profile.get("craving"):
+        filters["craving"] = str(intent_profile["craving"])
 
     cuisine = intent_profile.get("cuisine")
     if cuisine:
@@ -447,8 +453,13 @@ def _call_recommendation_tool(filters: dict[str, Any], address_id: str | None = 
     if using_real_food_mcp():
         return food_mcp.search_dishes(filters, address_id=_resolve_address_id(address_id))
 
+    # The mock `recommendation` tool's signature has no `craving` parameter --
+    # FastMCP rejects an unexpected argument, so this would otherwise fail every
+    # call once a specific dish/type is known. Real MCP uses it (food_mcp.search_dishes
+    # queries Swiggy's search_menu directly by name); mock mode just drops it.
+    mock_filters = {k: v for k, v in filters.items() if k != "craving"}
     try:
-        result = call_tool_sync("recommendation", filters)
+        result = call_tool_sync("recommendation", mock_filters)
     except Exception as exc:
         # Distinguishes "MCP server down" from "no dish matched" -- both used to
         # surface as the same shrug.
@@ -713,8 +724,8 @@ def recommendation_agent_node(state: CravrState) -> dict:
             awaiting_feedback=False, satisfied=False, last_recommendations=[],
         )
 
-    batch, rest = ranked[:DISPLAY_COUNT], ranked[DISPLAY_COUNT:]
-    debug("recommendation_agent", f"offering {len(batch)} of {len(ranked)} match(es)")
+    batch, rest = ranked, []
+    debug("recommendation_agent", f"offering all {len(batch)} match(es) as a scrollable list")
     return _reply(
         _build_recommendation_text(batch),
         awaiting_feedback=True, satisfied=False,

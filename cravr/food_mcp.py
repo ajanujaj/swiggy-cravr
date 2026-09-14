@@ -172,14 +172,89 @@ def _infer_collection(filters: dict[str, Any]) -> str | None:
     return None
 
 
-def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaurants: int = 5) -> list[dict[str, Any]]:
-    """search_restaurants -> get_restaurant_menu -> flatten -> filter
-    locally (Swiggy's tools don't filter by dish attributes).
+def search_menu_items(
+    query: str, address_id: str | None, veg_only: bool = False, offset: int = 0
+) -> dict[str, Any]:
+    """Search dishes directly by name across restaurants via Swiggy's
+    search_menu tool -- more direct than search_restaurants +
+    get_restaurant_menu for a specific craving ("sushi", "salad"), and
+    supports real pagination (hasMore/nextOffset) instead of fetching
+    everything up front.
 
-    `query` is required and rejected if empty; falls back through
-    cuisine/tags/dietary_type to a generic term since _filter_variants
-    (RecommendAgent.py) can drop both cuisine and tags while relaxing.
+    Field names below are a best-effort mapping from Swiggy's docs alone (no
+    live account to verify against) -- `_first()` tries a few plausible
+    aliases per field, and every raw response is logged via `debug()` so a
+    wrong guess (a missing dish name, a price off by 100x if it's actually
+    in paise) shows up immediately in CRAVR_DEBUG=1 output rather than
+    silently returning empty/garbled results.
+
+    Returns {"items": [...normalized dish records...], "has_more": bool,
+    "next_offset": int | None}.
     """
+    arguments: dict[str, Any] = {"addressId": address_id, "query": query, "offset": offset}
+    if veg_only:
+        arguments["vegFilter"] = 1
+
+    try:
+        raw = _unwrap(call_tool_sync("search_menu", arguments))
+    except Exception as exc:
+        debug("food_mcp", f"search_menu FAILED: {exc}")
+        return {"items": [], "has_more": False, "next_offset": None}
+
+    debug("food_mcp", f"raw search_menu response: {raw!r}")
+    if not isinstance(raw, dict):
+        return {"items": [], "has_more": False, "next_offset": None}
+
+    items: list[dict[str, Any]] = []
+    for entry in raw.get("items") or []:
+        if not isinstance(entry, dict):
+            continue
+        restaurant = entry.get("restaurant") if isinstance(entry.get("restaurant"), dict) else {}
+        restaurant_name = _first(entry, "restaurantName") or _first(restaurant, "name", "restaurantName", default="")
+        cuisine = _first(entry, "cuisine") or _first(restaurant, "cuisine", "cuisines")
+        if isinstance(cuisine, list):
+            cuisine = ", ".join(str(c) for c in cuisine)
+        name = _first(entry, "name", "itemName", "dishName", default="")
+        if not name:
+            continue
+        items.append({
+            "item_name": name,
+            "restaurant_name": restaurant_name or "",
+            "cuisine": cuisine or "",
+            "price_inr": _first(entry, "price", "priceInr", "price_inr", default=0),
+            "rating": _first(entry, "rating", "restaurantRating"),
+            "tags": _first(entry, "tags", default="") or "",
+            "dietary_type": "Veg" if _first(entry, "isVeg", "veg") else "",
+        })
+
+    return {
+        "items": items,
+        "has_more": bool(raw.get("hasMore")),
+        "next_offset": raw.get("nextOffset"),
+    }
+
+
+def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaurants: int = 5) -> list[dict[str, Any]]:
+    """search_menu (direct dish-name search) when a specific craving is known --
+    e.g. "sushi" from the category/type funnel in intentAgent.py -- else
+    search_restaurants -> get_restaurant_menu -> flatten -> filter locally
+    (Swiggy's tools don't filter by dish attributes beyond a name/cuisine query).
+    """
+    craving = filters.get("craving")
+    if craving:
+        veg_only = filters.get("dietary_type") == "Veg"
+        result = search_menu_items(str(craving), address_id, veg_only=veg_only)
+        if result["items"]:
+            # dietary_type isn't re-checked locally here -- vegFilter above already asked
+            # Swiggy to enforce it server-side, and search_menu_items' own veg/isVeg field
+            # name is an unverified guess (see its docstring); re-applying a strict local
+            # check on a field that might simply be absent could zero out every result.
+            local_filters = {k: v for k, v in filters.items() if k != "dietary_type"}
+            filtered = _apply_filters(result["items"], local_filters)
+            if filtered:
+                return filtered
+        debug("food_mcp", f"search_menu found nothing usable for {craving!r} -- falling back to search_restaurants")
+
     query = filters.get("cuisine") or filters.get("tags") or filters.get("dietary_type") or "restaurants"
     arguments: dict[str, Any] = {"addressId": address_id, "query": query}
     collection = _infer_collection(filters)

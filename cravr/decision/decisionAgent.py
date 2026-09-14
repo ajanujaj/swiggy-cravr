@@ -247,16 +247,12 @@ def _next_clarification_question(intent_profile: dict, context_profile: dict) ->
 
 
 def decision_agent_node(state: CravrState) -> dict:
-    """Judge whether the bot can recommend now. Never calls `interrupt()`
-    itself -- intent_discovery_node already asked about every gap it could
-    name, up to its own round budget, so a second interrupt site here would
-    double-ask and run a competing budget. A gap that survives intent is
-    usually a reason to recommend loosely, not stop. The one exception -- a
-    *new* ambiguity intent couldn't name (e.g. a saved-preference conflict)
-    -- still goes through `pending_decision_question` + `CLARIFY_AND_RETRY`,
-    so intent_discovery_node stays the only interrupt site and its own
-    budget (`clarification_rounds`, capped at `MAX_CLARIFICATION_ROUNDS`)
-    still applies.
+    """Always recommends now -- no clarifying question of its own anymore.
+    Previously this could hand an ad hoc question back to intent_discovery_node
+    via `pending_decision_question` + `CLARIFY_AND_RETRY` (e.g. a saved-preference
+    conflict); removed by design so tapping a food type always goes straight to
+    results, never a second round of questions. Still the only place that
+    freezes `recommendation_brief`, so recommendation_agent has something to read.
     """
     intent_profile = _coerce_profile(state.get("intent_profile"))
     context_profile = _coerce_profile(state.get("context_profile"))
@@ -272,91 +268,19 @@ def decision_agent_node(state: CravrState) -> dict:
     debug("decision_agent", f"intent_profile={intent_profile}")
     debug("decision_agent", f"context_profile={context_profile}")
     debug("decision_agent", f"preference_profile={preference_profile}")
-    # Intent already asked about and gave up on these gaps -- treat as spent, not a fresh reason to interrogate.
-    exhausted = bool(intent_profile.get("important_missing_information"))
-    debug("decision_agent", f"gaps left by intent={intent_profile.get('important_missing_information')}")
 
-    debug("decision_agent", f"asking the decision LLM (exhausted={exhausted})")
-    payload = {
-        "summary": summary,
-    }
-    debug("decision_agent", f"payload={payload}")
-    try:
-        structured_llm = get_llm().with_structured_output(DecisionOutput)
-        decision_output = structured_llm.invoke([
-            SystemMessage(content=DECISION_PROMPT),
-            HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-        ])
-        result = decision_output.model_dump()
-        debug("decision_agent", f"structured decision={result}")
-    except Exception as exc:
-        debug("decision_agent", f"structured decision call failed ({exc}) — falling back to clarify")
-        result = {"ready_to_recommend": False, "decision": "clarify", "clarification_message": ""}
+    brief = build_recommendation_brief(intent_profile, history_profile, preference_profile)
+    debug("decision_agent", f"brief filters={brief['filters']} history={brief['history']}")
+    debug("decision_agent", f"brief summary={brief['summary']!r}")
 
-    ready_to_recommend = bool(result.get("ready_to_recommend"))
-    decision = result.get("decision") if result.get("decision") in {"recommend", "clarify"} else "clarify"
-
-    # This node's own round budget (separate from intent's, tracked via `exhausted` above) caps its ad hoc
-    # questions -- e.g. a saved-preference conflict intent never asked about -- at MAX_CLARIFICATION_ROUNDS.
-    clarification_rounds = int(state.get("clarification_rounds") or 0)
-    give_up = exhausted or clarification_rounds >= MAX_CLARIFICATION_ROUNDS
-
-    if give_up and not ready_to_recommend and _has_usable_signal(intent_profile):
-        # Budget spent but the user gave us something usable -- recommend loosely rather than ask again.
-        debug("decision_agent", "clarification exhausted but profile has signal — recommending anyway")
-        ready_to_recommend = True
-        decision = "recommend"
-
-    if not ready_to_recommend and not give_up:
-        # Hand off to intent_discovery_node so it's asked with tappable options (see module docstring).
-        pending_question = result.get("clarification_message") or _next_clarification_question(
-            intent_profile, context_profile
-        )
-        debug(
-            "decision_agent",
-            f"handing question to intent_discovery (round {clarification_rounds + 1}/"
-            f"{MAX_CLARIFICATION_ROUNDS}): {pending_question!r}",
-        )
-        return {
-            "ready_to_recommend": False,
-            "decision": CLARIFY_AND_RETRY,
-            "pending_decision_question": pending_question,
-            "pending_clarification_field": GENERIC_CLARIFICATION_FIELD,
-            "clarification_rounds": clarification_rounds + 1,
-            "summary": summary,
-        }
-
-    if give_up:
-        # Never echo the question we just gave up on -- that would restart the streak.
-        fallback_message = GIVE_UP_MESSAGE
-    else:
-        fallback_message = _next_clarification_question(intent_profile, context_profile)
-    clarification_message = result.get("clarification_message") or fallback_message
-
-    updates: dict = {
-        "ready_to_recommend": ready_to_recommend,
-        "decision": decision,
-        "messages": [
-            AIMessage(
-                content=clarification_message if not ready_to_recommend else "Ready to recommend.",
-                name="decision_agent",
-            )
-        ],
-        "summary": summary,
+    return {
+        "ready_to_recommend": True,
+        "decision": "recommend",
+        "messages": [AIMessage(content="Ready to recommend.", name="decision_agent")],
+        "summary": brief["summary"],
         "clarification_rounds": 0,
         "asked_clarification_fields": [],
         "pending_clarification_field": None,
         "pending_decision_question": None,
+        "recommendation_brief": brief,
     }
-
-    if ready_to_recommend:
-        # Freeze the request once, here -- everything downstream reads only this brief.
-        brief = build_recommendation_brief(
-            intent_profile, history_profile, preference_profile
-        )
-        debug("decision_agent", f"brief filters={brief['filters']} history={brief['history']}")
-        debug("decision_agent", f"brief summary={brief['summary']!r}")
-        updates["recommendation_brief"] = brief
-        updates["summary"] = brief["summary"]
-
-    return updates

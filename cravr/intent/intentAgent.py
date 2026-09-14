@@ -135,6 +135,8 @@ def _derive(profile: dict, now: datetime | None = None) -> dict:
 
     # The clock always knows this one; it is never worth asking.
     derived["meal_time"] = current_meal_window(now).name
+    if not derived.get("meal_intent"):
+        derived["meal_intent"] = current_meal_window(now).default_intent
 
     flavor = _derive_flavor(derived)
     if flavor:
@@ -153,14 +155,33 @@ def _derive(profile: dict, now: datetime | None = None) -> dict:
 
 
 def _missing_fields(profile: dict) -> list[str]:
-    """Which required fields are still unfilled, in the order they're asked."""
+    """Which required fields are still unfilled, in the order they're asked.
+    Category comes first, but only when there's no flavour signal at all yet --
+    someone who already named a dish/cuisine skips the funnel entirely."""
     missing: list[str] = []
-    if not profile.get("meal_intent"):
-        missing.append("meal_intent")
+    no_pref = profile.get("no_preference") or []
+    if not _has_flavour_signal(profile) and not profile.get("craving_tag") and "category" not in no_pref:
+        missing.append("category")
     if not _has_flavour_signal(profile):
         missing.append("craving_or_cuisine")
     return missing
 
+
+# Category funnel: asked first when nothing at all is known yet. Loosely mirrors
+# Swiggy's own EATRIGHT/STORE_99 storefront collections (see food_mcp._infer_collection)
+# so a pick here can also narrow the real search, not just phrase the next question.
+_CATEGORY_OPTION_FALLBACK = [
+    "Healthy", "Comfort food", "Something sweet", "High protein", "Budget-friendly",
+]
+
+# Safety net when the LLM can't be reached -- tappable choices instead of a bare prompt.
+_TYPE_OPTION_FALLBACKS_BY_CATEGORY = {
+    "comfort-food": ["Butter chicken", "Mac and cheese", "Biryani", "Pizza", "Noodles"],
+    "lightweight": ["Salad", "Soup", "Grilled chicken", "Poke bowl", "Sushi"],
+    "high-protein": ["Grilled chicken", "Paneer bowl", "Egg curry", "Sushi", "Protein bowl"],
+    "low-calorie": ["Salad", "Soup", "Grilled fish", "Sushi", "Steamed veggies"],
+    "dessert": ["Cake", "Ice cream", "Brownie", "Pastry", "Gulab jamun"],
+}
 
 # Safety net when the LLM can't be reached -- tappable choices instead of a bare prompt.
 _CRAVING_OPTION_FALLBACKS = {
@@ -205,45 +226,35 @@ def _question_for(
     """The question to ask for a field, plus any options to offer."""
     if field == "meal_intent":
         return meal_intent_question(now), meal_intent_options(now)
+    if field == "category":
+        question = "What are you in the mood for?"
+        options = suggest_options(
+            question,
+            context={
+                "meal_time": (profile or {}).get("meal_time"),
+                "hunger_level": (profile or {}).get("hunger_level"),
+            },
+            fallback=_CATEGORY_OPTION_FALLBACK,
+        )
+        return question, options
     if field == "craving_or_cuisine":
-        meal_intent = (profile or {}).get("meal_intent")
-        follow_ups = {
-            "breakfast": (
-                "Breakfast it is! What are you in the mood for — something light, healthy, "
-                "or filling?"
-            ),
-            "quick_bite": (
-                "Got it — something quick. Are you craving sweet, spicy, healthy, or indulgent?"
-            ),
-            "lunch": (
-                "Great — lunch it is! What are you in the mood for today?"
-            ),
-            "quick_lunch": (
-                "Got it — a quick lunch. Do you want something light, filling, or easy to grab?"
-            ),
-            "snack": (
-                "Snack it is! Are you craving something spicy, sweet, crunchy, or healthy?"
-            ),
-            "dinner": (
-                "Dinner it is! What kind of meal are you in the mood for?"
-            ),
-            "late_night_craving": (
-                "Late-night craving detected 😄 What are you craving — sweet, savoury, spicy, or comforting?"
-            ),
-        }
-        question = follow_ups.get(
-            meal_intent,
+        category = (profile or {}).get("craving_tag")
+        category_label = category.replace("-", " ") if category else None
+        question = (
+            f"Great — {category_label}! What sounds good — a specific dish, a cuisine, "
+            "or something else?"
+            if category_label else
             "What are you in the mood for — a dish, a cuisine, or just a flavour "
-            "like spicy or sweet?",
+            "like spicy or sweet?"
         )
         options = suggest_options(
             question,
             context={
-                "meal_intent": meal_intent,
+                "category": category,
                 "meal_time": (profile or {}).get("meal_time"),
                 "hunger_level": (profile or {}).get("hunger_level"),
             },
-            fallback=_CRAVING_OPTION_FALLBACKS.get(meal_intent, _DEFAULT_CRAVING_OPTION_FALLBACK),
+            fallback=_TYPE_OPTION_FALLBACKS_BY_CATEGORY.get(category, _DEFAULT_CRAVING_OPTION_FALLBACK),
         )
         return question, options
     question = f"Could you tell me a bit more about {field.replace('_', ' ')}?"
@@ -273,6 +284,20 @@ def _apply_answer(profile: dict, field: str, answer: str, now: datetime | None =
         updated["meal_intent"] = (
             resolve_meal_intent(answer, now) or current_meal_window(now).default_intent
         )
+        return updated
+
+    if field == "category":
+        normalized = answer.lower()
+        if normalized.isdigit() or len(normalized) < 2:
+            return updated
+        # Best-effort onto a known tag (e.g. "Healthy" -> "low-calorie" via its cue
+        # words); an unrecognised label is still kept raw -- it still scopes the next
+        # question, just doesn't also narrow the search filters.
+        tag = next(
+            (t for t, cues in CRAVING_TAG_CUES.items() if any(cue in normalized for cue in cues)),
+            None,
+        )
+        updated["craving_tag"] = tag or answer
         return updated
 
     if field == "craving_or_cuisine":
