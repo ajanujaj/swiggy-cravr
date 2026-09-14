@@ -44,8 +44,8 @@ class DecisionOutput(BaseModel):
     clarification_message: Optional[str] = None
 
 class SuggestedOptions(BaseModel):
-    """Short, tappable answer choices for a clarification question, used by
-    `cravr.options.suggest_options` to turn free text into a numbered menu."""
+    """Short, tappable answer choices for a clarification question, turning
+    free text into a numbered menu the user can pick from."""
 
     options: list[str] = Field(
         default_factory=list,
