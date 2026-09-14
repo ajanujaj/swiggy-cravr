@@ -172,21 +172,68 @@ def _infer_collection(filters: dict[str, Any]) -> str | None:
     return None
 
 
+# search_menu's real response is plain text, not JSON (confirmed from a live
+# CRAVR_DEBUG log) -- a numbered list like:
+#   Found 10 menu items for "Bolognese":
+#   1. Spaghetti Bolognese Pasta — ₹625 | 4.5★ | Fat Lulu's Cafe & Bar (restaurantId: 30446) (ID: 35627636) [has addons]
+#   6. Sicilian Four Cheese — ₹545 | Veg | Fat Lulu's Cafe & Bar (restaurantId: 30446) (ID: 55029917) [has addons]
+# The "|"-separated middle segment holds 0-2 optional attributes (a "Veg"/
+# "Non-veg" tag, a "N.N★" rating) before the restaurant name, which is
+# always last.
+_SEARCH_MENU_ITEM_RE = re.compile(
+    r"^\d+\.\s*(?P<name>.+?)\s*—\s*₹(?P<price>[\d,]+(?:\.\d+)?)\s*\|\s*(?P<rest>.+?)\s*"
+    r"\(restaurantId:\s*(?P<restaurant_id>[^)]+)\)\s*\(ID:\s*(?P<id>[^)]+)\)"
+    r"(?:\s*\[(?P<tags>[^\]]+)\])?\s*$",
+    re.MULTILINE,
+)
+_RATING_RE = re.compile(r"^\d+(?:\.\d+)?★$")
+
+
+def _parse_search_menu_items(text: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for m in _SEARCH_MENU_ITEM_RE.finditer(text):
+        rest_parts = [p.strip() for p in m.group("rest").split("|") if p.strip()]
+        restaurant_name = rest_parts[-1] if rest_parts else ""
+        rating: str | None = None
+        dietary_type = ""
+        for part in rest_parts[:-1]:
+            if _RATING_RE.match(part):
+                rating = part.rstrip("★")
+            elif part.lower() in ("veg", "non-veg", "nonveg", "non veg"):
+                dietary_type = "Veg" if part.lower() == "veg" else "Non-Veg"
+
+        try:
+            price_inr: float | int = float(m.group("price").replace(",", ""))
+        except ValueError:
+            price_inr = 0
+
+        items.append({
+            "item_name": m.group("name").strip(),
+            "restaurant_name": restaurant_name,
+            "restaurant_id": m.group("restaurant_id"),
+            "cuisine": "",
+            "price_inr": price_inr,
+            "rating": rating,
+            "tags": m.group("tags") or "",
+            "dietary_type": dietary_type,
+        })
+    return items
+
+
 def search_menu_items(
     query: str, address_id: str | None, veg_only: bool = False, offset: int = 0
 ) -> dict[str, Any]:
     """Search dishes directly by name across restaurants via Swiggy's
     search_menu tool -- more direct than search_restaurants +
-    get_restaurant_menu for a specific craving ("sushi", "salad"), and
-    supports real pagination (hasMore/nextOffset) instead of fetching
-    everything up front.
+    get_restaurant_menu for a specific craving ("sushi", "salad", "bolognese").
 
-    Field names below are a best-effort mapping from Swiggy's docs alone (no
-    live account to verify against) -- `_first()` tries a few plausible
-    aliases per field, and every raw response is logged via `debug()` so a
-    wrong guess (a missing dish name, a price off by 100x if it's actually
-    in paise) shows up immediately in CRAVR_DEBUG=1 output rather than
-    silently returning empty/garbled results.
+    The response is a numbered plain-text list (see `_parse_search_menu_items`),
+    same style as get_restaurant_menu/get_addresses -- not the JSON shape the
+    docs alone suggested (an earlier version of this function assumed JSON and
+    silently discarded every real result as a result). No pagination info is
+    exposed in the text form, so has_more/next_offset are always False/None
+    here; every raw response is still logged via `debug()` so a future format
+    change shows up immediately in CRAVR_DEBUG=1 output.
 
     Returns {"items": [...normalized dish records...], "has_more": bool,
     "next_offset": int | None}.
@@ -202,9 +249,15 @@ def search_menu_items(
         return {"items": [], "has_more": False, "next_offset": None}
 
     debug("food_mcp", f"raw search_menu response: {raw!r}")
+
+    if isinstance(raw, str):
+        return {"items": _parse_search_menu_items(raw), "has_more": False, "next_offset": None}
+
     if not isinstance(raw, dict):
         return {"items": [], "has_more": False, "next_offset": None}
 
+    # Defensive fallback in case Swiggy ever actually returns the JSON shape
+    # the docs describe.
     items: list[dict[str, Any]] = []
     for entry in raw.get("items") or []:
         if not isinstance(entry, dict):
