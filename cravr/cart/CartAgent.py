@@ -117,6 +117,30 @@ def _current_restaurant_id(state: CravrState) -> str | None:
     return None
 
 
+def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, lead_in: str = "") -> dict:
+    """Add one dish via update_cart, then show the result via get_cart.
+    Single call site for "how a dish gets added" -- used by both this
+    node's own "add" action and RecommendAgent's pick-to-cart handoff, so
+    the two can't drift apart. `lead_in` prefixes whatever message comes
+    back (success or failure)."""
+    menu_item_id = dish.get("menu_item_id")
+    restaurant_id = dish.get("restaurant_id")
+    if not menu_item_id or not restaurant_id:
+        content = "I don't have enough details on that dish to add it to your cart -- try searching again."
+        return _cart_reply(f"{lead_in} {content}".strip())
+
+    result = food_mcp.update_cart(
+        restaurant_id, address_id,
+        [{"id": menu_item_id, "quantity": quantity}],
+        restaurant_name=dish.get("restaurant_name"),
+    )
+    if result.get("status") != "success":
+        content = f"Couldn't add that to your cart: {result.get('message', 'unknown error')}"
+        return _cart_reply(f"{lead_in} {content}".strip())
+
+    return _show_cart(address_id, lead_in=f"{lead_in} Added {dish.get('item_name')} to your cart.".strip())
+
+
 def cart_agent_node(state: CravrState) -> dict:
     user_input = latest_user_text(state.get("messages") or [])
     context_profile = state.get("context_profile") or {}
@@ -159,21 +183,6 @@ def cart_agent_node(state: CravrState) -> dict:
         chosen = (state.get("recommendation_state") or {}).get("last_recommendations") or []
         if len(chosen) != 1:
             return _cart_reply("Which dish should I add? Pick one from the options first.")
-        dish = chosen[0]
-        menu_item_id = dish.get("menu_item_id")
-        restaurant_id = dish.get("restaurant_id")
-        if not menu_item_id or not restaurant_id:
-            return _cart_reply(
-                "I don't have enough details on that dish to add it to your cart -- try searching again."
-            )
-        quantity = arg or 1
-        result = food_mcp.update_cart(
-            restaurant_id, address_id,
-            [{"id": menu_item_id, "quantity": quantity}],
-            restaurant_name=dish.get("restaurant_name"),
-        )
-        if result.get("status") != "success":
-            return _cart_reply(f"Couldn't add that to your cart: {result.get('message', 'unknown error')}")
-        return _show_cart(address_id, lead_in=f"Added {dish.get('item_name')} to your cart.")
+        return add_dish_to_cart(chosen[0], address_id, quantity=arg or 1)
 
     return _show_cart(address_id)

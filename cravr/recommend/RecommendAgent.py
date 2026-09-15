@@ -10,6 +10,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from .. import food_mcp
+from ..cart.CartAgent import add_dish_to_cart
 from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
@@ -184,8 +185,14 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
         ):
             return options[position - 1]
 
-    match = re.search(r"(?<!\d)([1-9])(?!\d)", normalized)
-    if match and int(match.group(1)) <= len(options):
+    # A fresh search offers every match at once (recommendation_agent_node's
+    # "offering all N match(es) as a scrollable list"), so a pick can be a
+    # two/three-digit position ("10", "36") -- not just 1-9. Bounded to
+    # len(options) so a genuinely out-of-range number ("under 200") still
+    # falls through to _carries_new_constraints' price heuristic instead of
+    # being misread as a pick.
+    match = re.search(r"(?<!\d)(\d{1,3})(?!\d)", normalized)
+    if match and 1 <= int(match.group(1)) <= len(options):
         return options[int(match.group(1)) - 1]
 
     # Require a distinctive word so a stray "rice"/"veg" doesn't misfire.
@@ -597,6 +604,24 @@ def _reply(content: str, **rec_state: Any) -> dict:
     }
 
 
+def _reply_with_pick(chosen: dict[str, Any], address_id: str | None, **rec_state: Any) -> dict:
+    """Terminal "user picked a dish" reply. Auto-adds it to the real cart --
+    picking isn't spending money (place_food_order's hard confirmation gate
+    is where that risk actually lives), so no extra ask here, just add and
+    show the cart. Goes through cart.CartAgent.add_dish_to_cart so this and
+    "add it to cart" share one code path.
+    """
+    lead_in = f"Great — {_describe(chosen)} it is."
+    if not address_id:
+        return _reply(
+            f"{lead_in} I don't have a delivery address yet, so I couldn't add it to your cart.",
+            **rec_state,
+        )
+    result = add_dish_to_cart(chosen, address_id, lead_in=lead_in)
+    result["recommendation_state"] = rec_state
+    return result
+
+
 def _serve_next_batch(
     lead_in: str,
     offered: list[dict[str, Any]],
@@ -654,8 +679,8 @@ def recommendation_agent_node(state: CravrState) -> dict:
         chosen = _resolve_choice(user_input, offered)
         if chosen:
             debug("recommendation_agent", f"user chose {chosen.get('item_name')!r}")
-            return _reply(
-                f"Great — {_describe(chosen)} it is.",
+            return _reply_with_pick(
+                chosen, address_id,
                 awaiting_feedback=False, satisfied=True, last_recommendations=[chosen],
             )
 
@@ -685,8 +710,8 @@ def recommendation_agent_node(state: CravrState) -> dict:
 
         if _looks_like_acceptance(user_input):
             if len(offered) == 1:
-                return _reply(
-                    f"Great — {_describe(offered[0])} it is.",
+                return _reply_with_pick(
+                    offered[0], address_id,
                     awaiting_feedback=False, satisfied=True, last_recommendations=offered,
                 )
             # Ambiguous against a list of three -- don't guess which one.

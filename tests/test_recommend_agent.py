@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from cravr.graph import FEEDBACK, NEW_REQUEST, _route_entry, app
 from cravr.recommend.RecommendAgent import (
@@ -453,6 +453,68 @@ class ThreeSuggestionTests(unittest.TestCase):
         with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=fresh):
             result = recommendation_agent_node(state)
         self.assertIn("Butter Chicken", result["messages"][0].content)
+
+
+class PickToCartHandoffTests(unittest.TestCase):
+    """Picking a dish auto-adds it to the cart (via
+    cart.CartAgent.add_dish_to_cart) when an address is known -- no
+    confirmation gate here, since a cart isn't a placed order."""
+
+    DISH = {"item_name": "Schezwan Paneer", "restaurant_name": "Dragon Bowl",
+            "menu_item_id": "ITEM1", "restaurant_id": "REST1", "cuisine": "Chinese"}
+    MENU = [
+        {"item_name": "Hyderabadi Veg Biryani", "restaurant_name": "Coastal Kitchen",
+         "cuisine": "South Indian", "price_inr": 290, "rating": 4.5, "course": "main"},
+        DISH,
+        {"item_name": "Green Curry with Rice", "restaurant_name": "Thai Basil",
+         "cuisine": "Thai", "price_inr": 360, "rating": 4.5, "course": "main"},
+    ]
+
+    def _follow_up(self, reply, address_id="addr1"):
+        state = {
+            "messages": [{"role": "user", "content": reply}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "context_profile": {"address_id": address_id} if address_id else {},
+            "recommendation_state": {"awaiting_feedback": True, "satisfied": False,
+                                     "last_recommendations": self.MENU, "alternates": []},
+        }
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=[]):
+            return recommendation_agent_node(state)
+
+    def test_pick_with_an_address_calls_add_dish_to_cart(self):
+        cart_reply = {"cart_state": {"items": [{"item_name": "Schezwan Paneer"}]},
+                      "messages": [AIMessage(content="Great — Schezwan Paneer from Dragon Bowl it is. "
+                                              "Added Schezwan Paneer to your cart.\nHere's your cart:\n"
+                                              "  - Schezwan Paneer x1 — ₹280", name="cart_agent")]}
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart", return_value=cart_reply) as mock_add:
+            result = self._follow_up("2")
+        mock_add.assert_called_once()
+        called_dish, called_address = mock_add.call_args.args[0], mock_add.call_args.args[1]
+        self.assertEqual(called_dish["item_name"], "Schezwan Paneer")
+        self.assertEqual(called_address, "addr1")
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertEqual(result["recommendation_state"]["last_recommendations"], [self.DISH])
+        self.assertIn("Added Schezwan Paneer to your cart", result["messages"][0].content)
+        self.assertEqual(result["cart_state"], cart_reply["cart_state"])
+
+    def test_pick_without_an_address_skips_the_cart_call_gracefully(self):
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart") as mock_add:
+            result = self._follow_up("2", address_id=None)
+        mock_add.assert_not_called()
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertIn("Great — Schezwan Paneer", result["messages"][0].content)
+        self.assertIn("couldn't add it to your cart", result["messages"][0].content)
+
+    def test_a_cart_failure_still_confirms_the_pick(self):
+        """add_dish_to_cart's own failure message (missing IDs, MCP error,
+        etc.) is what gets shown -- the pick itself must still register as
+        satisfied, not get stuck re-offering the same list."""
+        failure_reply = {"cart_state": {}, "messages": [AIMessage(
+            content="Couldn't add that to your cart: timeout", name="cart_agent")]}
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart", return_value=failure_reply):
+            result = self._follow_up("2")
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertIn("Couldn't add that to your cart", result["messages"][0].content)
 
 
 class RecommendationOptionsTests(unittest.TestCase):
