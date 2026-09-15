@@ -14,6 +14,30 @@ recommendations_data = pd.read_csv(DATA_DIR / "menu.csv")
 order_history_data = pd.read_csv(DATA_DIR / "order_history.csv")
 user_data = pd.read_csv(DATA_DIR / "user.csv")
 
+# menu.csv has no restaurant/item ID columns -- synthesize stable ones so mock
+# recommendations carry the same "menu_item_id"/"restaurant_id" fields real
+# Swiggy dish records do (needed by the cart tools below). Row-index-based,
+# so they're stable across calls within one server run but NOT across a CSV
+# edit/reorder -- fine for local mock testing, never used against real money.
+recommendations_data["menu_item_id"] = "ITEM" + (recommendations_data.index + 1).astype(str).str.zfill(4)
+_restaurant_codes, _ = pd.factorize(recommendations_data["restaurant_name"])
+recommendations_data["restaurant_id"] = "REST" + pd.Series(_restaurant_codes + 1, index=recommendations_data.index).astype(str).str.zfill(3)
+
+# In-memory mock cart -- single global cart (this test server has no
+# per-user auth), mirroring real Swiggy's "one active cart, single
+# restaurant" behavior. Reset by flush_food_cart or a server restart.
+_cart_state: dict = {
+    "restaurant_id": None,
+    "restaurant_name": None,
+    "items": [],  # [{"menu_item_id","name","quantity","final_price","total","in_stock","is_veg"}]
+    "coupon_code": None,
+    "coupon_discount": 0,
+}
+_MOCK_COUPONS = {
+    "SAVE20": {"kind": "percent", "value": 0.2, "cap": 100},
+    "FREESHIP": {"kind": "delivery", "value": 30},
+}
+
 @app.tool()
 def recommendation(
     cuisine: str = None,
@@ -180,6 +204,160 @@ def user_location(user_id: str) -> dict:
         "location": location["default_city"],
         "delivery_area": location["default_delivery_area"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Mock Cart tools -- mirror Swiggy's real get_food_cart/update_food_cart/
+# apply_food_coupon/fetch_food_coupons/flush_food_cart tool names and
+# {"success", "data", "message"} response envelope (see cravr/food_mcp.py's
+# cart functions) so the same code path can be exercised safely here before
+# ever touching a real Swiggy account.
+# ---------------------------------------------------------------------------
+
+def _cart_pricing() -> dict:
+    item_total = sum(i["final_price"] * i["quantity"] for i in _cart_state["items"])
+    delivery_charge = 0 if not _cart_state["items"] else 30
+    taxes = round(item_total * 0.05, 2) if _cart_state["items"] else 0
+    discount = _cart_state.get("coupon_discount", 0)
+    to_pay = max(round(item_total + delivery_charge + taxes - discount, 2), 0)
+    return {
+        "item_total": round(item_total, 2),
+        "delivery_charge": delivery_charge,
+        "taxes_and_charges": taxes,
+        "to_pay": to_pay,
+    }
+
+
+@app.tool()
+def get_food_cart(addressId: str, restaurantName: str = None) -> dict:
+    """Mock get_food_cart -- returns the current in-memory cart."""
+    restaurant = (
+        {"id": _cart_state["restaurant_id"], "name": _cart_state["restaurant_name"]}
+        if _cart_state["restaurant_id"] else None
+    )
+    return {
+        "success": True,
+        "data": {
+            "cart_id": "MOCK-CART-1",
+            "restaurant": restaurant,
+            "items": _cart_state["items"],
+            "item_count": len(_cart_state["items"]),
+            "pricing": _cart_pricing(),
+            "offers": {
+                "coupon_applied": _cart_state.get("coupon_code"),
+                "coupon_discount": _cart_state.get("coupon_discount", 0),
+                "free_delivery_applied": False,
+            },
+        },
+        "addressId": addressId,
+    }
+
+
+@app.tool()
+def update_food_cart(restaurantId: str, addressId: str, cartItems: list, restaurantName: str = None) -> dict:
+    """Mock update_food_cart. cartItems entries: {"id": <menu_item_id>,
+    "quantity": <int>}; quantity<=0 removes the item. Switching restaurants
+    replaces the cart -- real Swiggy carts are single-restaurant too."""
+    if _cart_state["restaurant_id"] and _cart_state["restaurant_id"] != restaurantId:
+        _cart_state["items"] = []
+        _cart_state["coupon_code"] = None
+        _cart_state["coupon_discount"] = 0
+    _cart_state["restaurant_id"] = restaurantId
+    _cart_state["restaurant_name"] = restaurantName or _cart_state["restaurant_name"]
+
+    for entry in cartItems or []:
+        item_id = (entry or {}).get("id")
+        if not item_id:
+            continue
+        quantity = (entry or {}).get("quantity", 1)
+        existing = next((i for i in _cart_state["items"] if i["menu_item_id"] == item_id), None)
+
+        if quantity <= 0:
+            if existing:
+                _cart_state["items"].remove(existing)
+            continue
+
+        if existing:
+            existing["quantity"] = quantity
+            existing["total"] = round(existing["final_price"] * quantity, 2)
+            continue
+
+        row = recommendations_data[recommendations_data["menu_item_id"] == item_id]
+        if row.empty:
+            return {"success": False, "error": {"message": f"Unknown menu_item_id {item_id!r}"}}
+        row0 = row.iloc[0]
+        price = float(row0["price_inr"])
+        _cart_state["items"].append({
+            "menu_item_id": item_id,
+            "name": row0["item_name"],
+            "quantity": quantity,
+            "final_price": price,
+            "total": round(price * quantity, 2),
+            "in_stock": True,
+            "is_veg": str(row0.get("dietary_type", "")).lower() == "veg",
+        })
+
+    return {"success": True, "data": {}, "message": "Cart updated"}
+
+
+@app.tool()
+def apply_food_coupon(couponCode: str, addressId: str, cartId: str = None) -> dict:
+    """Mock apply_food_coupon -- static SAVE20 (20% off, capped ₹100) /
+    FREESHIP (waives delivery) catalog; anything else is rejected."""
+    item_total = sum(i["final_price"] * i["quantity"] for i in _cart_state["items"])
+    if item_total <= 0:
+        return {"success": False, "error": {"message": "Cart is empty -- nothing to apply a coupon to"}}
+
+    code = (couponCode or "").strip().upper()
+    coupon = _MOCK_COUPONS.get(code)
+    if not coupon:
+        return {"success": False, "error": {"message": f"Coupon {couponCode!r} is not valid"}}
+
+    discount = min(round(item_total * coupon["value"], 2), coupon.get("cap", item_total))         if coupon["kind"] == "percent" else coupon["value"]
+    _cart_state["coupon_code"] = code
+    _cart_state["coupon_discount"] = discount
+    return {"success": True, "data": {"coupon_discount": discount}, "message": f"{code} applied: ₹{discount} off"}
+
+
+@app.tool()
+def fetch_food_coupons(restaurantId: str, addressId: str, couponCode: str = None) -> dict:
+    """Mock fetch_food_coupons -- static SAVE20/FREESHIP catalog, COD-only
+    per the real tool's stated scope."""
+    catalog = [
+        {
+            "id": "SAVE20", "title": "SAVE20", "subtitle": "20% off, up to ₹100",
+            "description": "Get 20% off your order", "applicable": True,
+            "applicabilityStatus": "APPLICABLE", "terms": "Max discount ₹100. Valid for Cash on Delivery.",
+        },
+        {
+            "id": "FREESHIP", "title": "FREESHIP", "subtitle": "Free delivery",
+            "description": "Waives the delivery charge", "applicable": True,
+            "applicabilityStatus": "APPLICABLE", "terms": "Valid for Cash on Delivery.",
+        },
+    ]
+    if couponCode:
+        catalog = [c for c in catalog if c["id"] == couponCode.strip().upper()]
+
+    return {
+        "success": True,
+        "data": {
+            "status_message": None if catalog else "No matching coupon",
+            "coupon_sections": [{"title": "Available offers", "type": "COD", "coupons": catalog}] if catalog else [],
+            "summary": {"total": len(catalog), "applicable": len(catalog), "sections": 1 if catalog else 0},
+        },
+    }
+
+
+@app.tool()
+def flush_food_cart() -> dict:
+    """Mock flush_food_cart -- clears the in-memory cart. No parameters."""
+    _cart_state["restaurant_id"] = None
+    _cart_state["restaurant_name"] = None
+    _cart_state["items"] = []
+    _cart_state["coupon_code"] = None
+    _cart_state["coupon_discount"] = 0
+    return {"success": True, "data": {}, "message": "Cart cleared"}
+
 
 
 if __name__ == "__main__":

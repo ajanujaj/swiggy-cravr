@@ -72,7 +72,9 @@ _MENU_ITEM_RE = re.compile(
 _DIETARY_TAGS = {"veg", "non-veg", "nonveg", "non veg", "egg"}
 
 
-def _parse_menu_items(text: str, restaurant_name: str, restaurant_cuisine: Any) -> list[dict[str, Any]]:
+def _parse_menu_items(
+    text: str, restaurant_name: str, restaurant_cuisine: Any, restaurant_id: str | None = None
+) -> list[dict[str, Any]]:
     """Parse get_restaurant_menu's text into dish records. Category
     attribution: for each item, take whichever header most recently
     preceded it (## resets subcategory, ### sets it)."""
@@ -106,7 +108,9 @@ def _parse_menu_items(text: str, restaurant_name: str, restaurant_cuisine: Any) 
         items.append(
             {
                 "item_name": m.group("name").strip(),
+                "menu_item_id": m.group("id").strip(),
                 "restaurant_name": restaurant_name,
+                "restaurant_id": restaurant_id,
                 "cuisine": restaurant_cuisine or "",
                 "price_inr": price_inr,
                 "rating": None,
@@ -209,6 +213,7 @@ def _parse_search_menu_items(text: str) -> list[dict[str, Any]]:
 
         items.append({
             "item_name": m.group("name").strip(),
+            "menu_item_id": m.group("id").strip(),
             "restaurant_name": restaurant_name,
             "restaurant_id": m.group("restaurant_id"),
             "cuisine": "",
@@ -272,7 +277,9 @@ def search_menu_items(
             continue
         items.append({
             "item_name": name,
+            "menu_item_id": _first(entry, "id", "itemId", "menuItemId"),
             "restaurant_name": restaurant_name or "",
+            "restaurant_id": _first(entry, "restaurantId") or _first(restaurant, "id", "restaurantId"),
             "cuisine": cuisine or "",
             "price_inr": _first(entry, "price", "priceInr", "price_inr", default=0),
             "rating": _first(entry, "rating", "restaurantRating"),
@@ -353,12 +360,12 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
             restaurant_cuisine = ", ".join(str(c) for c in restaurant_cuisine)
 
         if isinstance(menu_raw, str):
-            dishes.extend(_parse_menu_items(menu_raw, restaurant_name, restaurant_cuisine))
+            dishes.extend(_parse_menu_items(menu_raw, restaurant_name, restaurant_cuisine, restaurant_id))
         else:
             # Defensive fallback if the response is ever real JSON instead of text.
             raw_items = menu_raw.get("items") if isinstance(menu_raw, dict) else (menu_raw if isinstance(menu_raw, list) else [])
             for item in raw_items or []:
-                dishes.append(_normalize_item(item, restaurant_name, restaurant_cuisine))
+                dishes.append(_normalize_item(item, restaurant_name, restaurant_cuisine, restaurant_id))
 
     dishes = _apply_filters(dishes, filters)
     if craving:
@@ -369,11 +376,15 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
     return dishes
 
 
-def _normalize_item(item: dict[str, Any], restaurant_name: str, restaurant_cuisine: Any) -> dict[str, Any]:
+def _normalize_item(
+    item: dict[str, Any], restaurant_name: str, restaurant_cuisine: Any, restaurant_id: str | None = None
+) -> dict[str, Any]:
     is_veg = _first(item, "isVeg", "veg")
     return {
         "item_name": _first(item, "name", "itemName", default="Item"),
+        "menu_item_id": _first(item, "id", "itemId", "menuItemId"),
         "restaurant_name": restaurant_name,
+        "restaurant_id": restaurant_id or _first(item, "restaurantId"),
         "cuisine": _first(item, "cuisine", default=restaurant_cuisine) or "",
         "price_inr": _first(item, "price", "finalPrice", "priceInr", default=0),
         "rating": _first(item, "rating"),
@@ -459,3 +470,187 @@ def get_order_history(address_id: str | None = None) -> dict[str, Any]:
         for o in orders
     ]
     return {"status": "success", "count": len(normalized), "orders": normalized}
+
+
+# ---------------------------------------------------------------------------
+# Cart: get_food_cart / update_food_cart / apply_food_coupon /
+# fetch_food_coupons / flush_food_cart. Docs describe a consistent
+# {"success", "data", "message"} JSON envelope for all five, unlike
+# get_addresses/search_menu (plain text) -- still routed through _unwrap so a
+# stray text reply degrades to `_check_success` returning None / an "error"
+# status instead of crashing, per the search_menu lesson (docs != reality).
+# ---------------------------------------------------------------------------
+
+def _check_success(raw: Any) -> str | None:
+    """None when `raw` isn't the documented {"success": false, "error": {...}}
+    shape; else the error message to surface."""
+    if isinstance(raw, dict) and raw.get("success") is False:
+        return _first(raw.get("error") or {}, "message", default="Request failed")
+    return None
+
+
+def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, Any]:
+    """get_food_cart -> {"status", "cart_id", "restaurant", "items",
+    "item_count", "pricing", "coupon_applied", "coupon_discount", "address_id"}.
+    items[]: {"menu_item_id","item_name","quantity","total","final_price","in_stock"}.
+    """
+    arguments: dict[str, Any] = {"addressId": address_id}
+    if restaurant_name:
+        arguments["restaurantName"] = restaurant_name
+
+    try:
+        raw = _unwrap(call_tool_sync("get_food_cart", arguments))
+    except Exception as exc:
+        debug("food_mcp", f"get_food_cart FAILED: {exc}")
+        return {"status": "error", "message": f"Unable to retrieve cart: {exc}"}
+
+    debug("food_mcp", f"raw get_food_cart response: {raw!r}")
+    error = _check_success(raw)
+    if error:
+        return {"status": "error", "message": error}
+    if not isinstance(raw, dict):
+        return {"status": "error", "message": "Unexpected get_food_cart response"}
+
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    items = [
+        {
+            "menu_item_id": _first(it, "menu_item_id", "id", default=""),
+            "item_name": _first(it, "name", "item_name", default=""),
+            "quantity": _first(it, "quantity", default=1),
+            "total": _first(it, "total", default=0),
+            "final_price": _first(it, "final_price", "total", default=0),
+            "in_stock": it.get("in_stock", True),
+        }
+        for it in (data.get("items") or []) if isinstance(it, dict)
+    ]
+    pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
+    offers = data.get("offers") if isinstance(data.get("offers"), dict) else {}
+    restaurant = data.get("restaurant") if isinstance(data.get("restaurant"), dict) else None
+
+    return {
+        "status": "success" if items else "empty",
+        "cart_id": data.get("cart_id"),
+        "restaurant": restaurant,
+        "items": items,
+        "item_count": data.get("item_count", len(items)),
+        "pricing": pricing,
+        # coupon_discount==0 means "auto-suggested", not actually applied (per docs).
+        "coupon_applied": offers.get("coupon_applied") if (offers.get("coupon_discount") or 0) > 0 else None,
+        "coupon_discount": offers.get("coupon_discount", 0),
+        "address_id": raw.get("addressId", address_id),
+    }
+
+
+def update_cart(
+    restaurant_id: str, address_id: str, cart_items: list[dict[str, Any]], restaurant_name: str | None = None
+) -> dict[str, Any]:
+    """update_food_cart -- add/change items. Docs: renders no cart view
+    itself ("does NOT render any widget or cart UI"), so the documented flow
+    is update_food_cart -> get_food_cart; callers here should follow with
+    `get_cart` to show the result. `cart_items` entries need at minimum
+    {"id": <menu_item_id>, "quantity": <int>} -- the exact input key names
+    aren't fully documented beyond "variants or variantsV2, never both", so
+    this is the untested part of the cart flow; the raw response is always
+    logged so a field-name mismatch shows up immediately in CRAVR_DEBUG=1
+    output instead of silently mis-adding items.
+    """
+    arguments: dict[str, Any] = {
+        "restaurantId": restaurant_id,
+        "addressId": address_id,
+        "cartItems": cart_items,
+    }
+    if restaurant_name:
+        arguments["restaurantName"] = restaurant_name
+
+    try:
+        raw = _unwrap(call_tool_sync("update_food_cart", arguments))
+    except Exception as exc:
+        debug("food_mcp", f"update_food_cart FAILED: {exc}")
+        return {"status": "error", "message": f"Unable to update cart: {exc}"}
+
+    debug("food_mcp", f"raw update_food_cart response: {raw!r}")
+    error = _check_success(raw)
+    if error:
+        return {"status": "error", "message": error}
+    return {"status": "success", "message": raw.get("message") if isinstance(raw, dict) else None}
+
+
+def apply_coupon(coupon_code: str, address_id: str, cart_id: str | None = None) -> dict[str, Any]:
+    """apply_food_coupon -> {"status", "message"}. Caller should re-fetch
+    via `get_cart` afterwards to see the updated pricing/coupon_discount."""
+    arguments: dict[str, Any] = {"couponCode": coupon_code, "addressId": address_id}
+    if cart_id:
+        arguments["cartId"] = cart_id
+
+    try:
+        raw = _unwrap(call_tool_sync("apply_food_coupon", arguments))
+    except Exception as exc:
+        debug("food_mcp", f"apply_food_coupon FAILED: {exc}")
+        return {"status": "error", "message": f"Unable to apply coupon: {exc}"}
+
+    debug("food_mcp", f"raw apply_food_coupon response: {raw!r}")
+    error = _check_success(raw)
+    if error:
+        return {"status": "error", "message": error}
+    return {"status": "success", "message": raw.get("message") if isinstance(raw, dict) else None}
+
+
+def fetch_coupons(restaurant_id: str, address_id: str, coupon_code: str | None = None) -> dict[str, Any]:
+    """fetch_food_coupons -> {"status", "coupons", "count"}. Docs: only
+    COD-applicable coupons are returned. Each coupon: {"id", "title",
+    "subtitle", "description", "applicable", "applicability_status", "terms"}.
+    """
+    arguments: dict[str, Any] = {"restaurantId": restaurant_id, "addressId": address_id}
+    if coupon_code:
+        arguments["couponCode"] = coupon_code
+
+    try:
+        raw = _unwrap(call_tool_sync("fetch_food_coupons", arguments))
+    except Exception as exc:
+        debug("food_mcp", f"fetch_food_coupons FAILED: {exc}")
+        return {"status": "error", "message": f"Unable to fetch coupons: {exc}", "coupons": []}
+
+    debug("food_mcp", f"raw fetch_food_coupons response: {raw!r}")
+    error = _check_success(raw)
+    if error:
+        return {"status": "error", "message": error, "coupons": []}
+    if not isinstance(raw, dict):
+        return {"status": "error", "message": "Unexpected fetch_food_coupons response", "coupons": []}
+
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    coupons: list[dict[str, Any]] = []
+    for section in data.get("coupon_sections") or []:
+        if not isinstance(section, dict):
+            continue
+        for c in section.get("coupons") or []:
+            if not isinstance(c, dict):
+                continue
+            coupons.append({
+                "id": c.get("id"),
+                "title": c.get("title"),
+                "subtitle": c.get("subtitle"),
+                "description": c.get("description"),
+                "applicable": c.get("applicable", c.get("applicabilityStatus") == "APPLICABLE"),
+                "applicability_status": c.get("applicabilityStatus"),
+                "terms": c.get("terms"),
+            })
+
+    if not coupons:
+        return {"status": "no_results", "message": data.get("status_message") or "No coupons available", "coupons": []}
+    return {"status": "success", "coupons": coupons, "count": len(coupons)}
+
+
+def flush_cart() -> dict[str, Any]:
+    """flush_food_cart -- clears the entire cart. No parameters (auth is
+    session-scoped, per docs)."""
+    try:
+        raw = _unwrap(call_tool_sync("flush_food_cart", {}))
+    except Exception as exc:
+        debug("food_mcp", f"flush_food_cart FAILED: {exc}")
+        return {"status": "error", "message": f"Unable to clear cart: {exc}"}
+
+    debug("food_mcp", f"raw flush_food_cart response: {raw!r}")
+    error = _check_success(raw)
+    if error:
+        return {"status": "error", "message": error}
+    return {"status": "success"}
