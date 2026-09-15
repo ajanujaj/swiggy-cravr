@@ -5,7 +5,7 @@ from unittest.mock import patch
 from langgraph.types import Command
 
 from cravr.graph import app
-from cravr.schemas import IntentExtraction, ContextExtraction, DecisionOutput
+from cravr.schemas import IntentExtraction
 
 
 class ClarificationContextTests(unittest.TestCase):
@@ -18,8 +18,8 @@ class ClarificationContextTests(unittest.TestCase):
     "what's your budget?". This checks the question is now present in
     `messages` right before the answer, in the right role, after a resume.
 
-    Clarification has since moved into intent_discovery_node, so this now
-    exercises that node's interrupt loop end-to-end through the real graph.
+    Exercises intent_discovery_node's interrupt loop end-to-end through the
+    real graph -- it is the only node that ever calls interrupt().
     """
 
     def test_question_is_recorded_in_messages_alongside_the_answer(self):
@@ -29,22 +29,18 @@ class ClarificationContextTests(unittest.TestCase):
             def with_structured_output(self, schema):
                 class Stub:
                     def invoke(self, messages):
-                        if schema is IntentExtraction:
-                            # A craving but no meal_intent, so intent asks.
-                            return IntentExtraction(craving="something spicy")
-                        if schema is ContextExtraction:
-                            return ContextExtraction()
-                        return DecisionOutput(ready_to_recommend=False, decision="clarify")
+                        # Category already known (as if inferred from an earlier turn) --
+                        # only the type question is left, so a single resume completes it.
+                        return IntentExtraction(craving_tag="comfort-food")
 
                 return Stub()
 
         stub = StubLLM()
         with patch("cravr.intent.intentAgent.get_llm", return_value=stub), \
-             patch("cravr.context.ContextAgent.get_llm", return_value=stub), \
-             patch("cravr.decision.decisionAgent.get_llm", return_value=stub):
+             patch("cravr.options.get_llm", side_effect=RuntimeError("no llm in tests")):
             result = app.invoke(
                 {
-                    "messages": [{"role": "user", "content": "I want something spicy"}],
+                    "messages": [{"role": "user", "content": "I'm hungry"}],
                     "intent_profile": {},
                     "context_profile": {},
                     "history_profile": {},
@@ -89,6 +85,14 @@ class GraphWiringTests(unittest.TestCase):
         edge_pairs = {(edge.source, edge.target) for edge in graph.edges}
         self.assertIn(("user_preference", "context_discovery"), edge_pairs)
         self.assertIn(("context_discovery", "intent_discovery"), edge_pairs)
+
+    def test_decision_agent_always_reaches_the_recommender(self):
+        """decision_agent_node never asks its own question anymore (see
+        tests/test_decision_agent.py) -- decision_agent -> recommendation_agent
+        must be a plain edge, not a branch that could dead-end at END."""
+        graph = app.get_graph()
+        edge_pairs = {(edge.source, edge.target) for edge in graph.edges}
+        self.assertIn(("decision_agent", "recommendation_agent"), edge_pairs)
 
 
 if __name__ == "__main__":

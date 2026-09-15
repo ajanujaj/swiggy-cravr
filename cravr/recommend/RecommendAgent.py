@@ -7,13 +7,12 @@ import re
 from collections import Counter
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage
 
 from .. import food_mcp
 from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
-from ..llm import get_llm
 from ..profile_utils import latest_user_text
 from ..state import CravrState
 

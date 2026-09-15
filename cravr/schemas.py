@@ -5,14 +5,13 @@ schema-valid object or raises loudly, never silent malformed JSON.
 
 Computed fields (missing_information, important_missing_*,
 clarification_questions) are deliberately not part of these schemas -- the
-model only describes what's in the message; decisionAgent/intentAgent/
-ContextAgent derive what's missing deterministically (see
-profile_utils.merge_profile).
+model only describes what's in the message; intentAgent derives what's
+missing deterministically (see profile_utils.merge_profile).
 """
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -27,21 +26,6 @@ class IntentExtraction(BaseModel):
     craving_tag: Optional[str] = Field(None, description="A normalized tag for the craving, e.g. comfort-food, lightweight, high-protein, low-calorie, dessert. Leave null if none of them fit.")
     flavor: Optional[str] = Field(None, description="A normalized tag for the craving, e.g. spicy, sweet, savory, etc.")
     cuisine: Optional[str] = None
-
-class ContextExtraction(BaseModel):
-    """Structured delivery-context facts extracted from the conversation."""
-
-    location: Optional[str] = None
-    weather: Optional[str] = None
-    delivery_area: Optional[str] = None
-    max_delivery_minutes: Optional[int] = "under 30 minutes"
-
-class DecisionOutput(BaseModel):
-    """The decision agent's verdict on whether to recommend now."""
-
-    ready_to_recommend: bool
-    decision: Literal["recommend", "clarify"]
-    clarification_message: Optional[str] = None
 
 class SuggestedOptions(BaseModel):
     """Short, tappable answer choices for a clarification question, turning
@@ -58,12 +42,3 @@ class SuggestedOptions(BaseModel):
             "separately."
         ),
     )
-
-class UserProfile(BaseModel):
-    """Structured facts about the user, extracted from the conversation and/or
-    fetched from the MCP.
-    """
-    
-    dietary_preference: Optional[str] = None
-    allergies: Optional[str] = None
-    default_budget_inr: Optional[str] = None

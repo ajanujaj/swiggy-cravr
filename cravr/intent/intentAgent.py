@@ -1,9 +1,6 @@
 """Intent Discovery agent: turns a food-ordering request into structured
-intent. Owns every `interrupt()` call in the graph -- its own required
-fields, plus any ad hoc question decision_agent_node hands off via
-`state["pending_decision_question"]`. Extracts, derives, asks the hand-off
-question first if any, then pauses once per still-missing field.
-decision_agent never interrupts itself; it only judges and hands off.
+intent. Owns the graph's only `interrupt()` call -- extracts, derives, then
+pauses once per still-missing field (category, then a specific dish/cuisine).
 """
 
 from __future__ import annotations
@@ -19,12 +16,7 @@ from ..llm import get_llm
 from ..profile_utils import latest_user_text, merge_profile
 from ..schemas import IntentExtraction
 from ..state import CravrState
-from .meal_clock import (
-    current_meal_window,
-    meal_intent_options,
-    meal_intent_question,
-    resolve_meal_intent,
-)
+from .meal_clock import current_meal_window
 from .meal_utils import (
     CRAVING_TAG_CUES,
     HUNGER_BY_INTENT,
@@ -32,7 +24,6 @@ from .meal_utils import (
     MILD_PATTERN,
     MILD_WORDS,
     NO_PREFERENCE_ANSWERS,
-    REQUIRED_FIELDS,
     TASTE_CUES,
     VEG_ANSWERS,
     NON_VEG_ANSWERS,
@@ -182,38 +173,6 @@ _TYPE_OPTION_FALLBACKS_BY_CATEGORY = {
     "low-calorie": ["Salad", "Soup", "Grilled fish", "Sushi", "Steamed veggies"],
     "dessert": ["Cake", "Ice cream", "Brownie", "Pastry", "Gulab jamun"],
 }
-
-# Safety net when the LLM can't be reached -- tappable choices instead of a bare prompt.
-_CRAVING_OPTION_FALLBACKS = {
-    "breakfast": [
-        "Something light", "Healthy meal", "Filling breakfast",
-        "South Indian", "Continental",
-    ],
-    "quick_bite": [
-        "Something sweet", "Something spicy", "Something healthy",
-        "Something filling", "Something crunchy",
-    ],
-    "lunch": [
-        "Full meal", "Healthy meal", "Indian cuisine",
-        "Something light", "Comfort food",
-    ],
-    "quick_lunch": [
-        "Something light", "Something filling", "Easy to grab",
-        "Something healthy", "Something spicy",
-    ],
-    "snack": [
-        "Something spicy", "Something sweet", "Something healthy",
-        "Something crunchy", "Comfort food",
-    ],
-    "dinner": [
-        "Full meal", "Healthy meal", "Indian cuisine",
-        "Something light", "Comfort food",
-    ],
-    "late_night_craving": [
-        "Something sweet", "Something savoury", "Something spicy",
-        "Comfort food", "Something light",
-    ],
-}
 _DEFAULT_CRAVING_OPTION_FALLBACK = [
     "A dish in mind", "A cuisine", "Spicy or sweet",
     "Healthy option", "Comfort food",
@@ -224,8 +183,6 @@ def _question_for(
     field: str, now: datetime | None = None, profile: dict | None = None
 ) -> tuple[str, list[dict]]:
     """The question to ask for a field, plus any options to offer."""
-    if field == "meal_intent":
-        return meal_intent_question(now), meal_intent_options(now)
     if field == "category":
         question = "What are you in the mood for?"
         options = suggest_options(
@@ -276,14 +233,6 @@ def _apply_answer(profile: dict, field: str, answer: str, now: datetime | None =
         if field not in resolved:
             resolved.append(field)
         updated["no_preference"] = resolved
-        if field == "meal_intent":
-            updated["meal_intent"] = current_meal_window(now).default_intent
-        return updated
-
-    if field == "meal_intent":
-        updated["meal_intent"] = (
-            resolve_meal_intent(answer, now) or current_meal_window(now).default_intent
-        )
         return updated
 
     if field == "category":
@@ -327,45 +276,10 @@ def intent_discovery_node(state: CravrState) -> dict:
     The extraction call re-runs on each resume too, harmlessly, since
     `merge_profile` only adds non-empty values.
 
-    Also the *only* place that calls `interrupt()`, including
-    decision_agent's hand-off question (`state["pending_decision_question"]`)
-    -- decision_agent never interrupts itself (see
-    `DecisionAgentNeverAsksTests`). If set, it's asked first and folded into
-    `messages` before extraction runs, so its signal (cuisine, diet, budget)
-    is picked up like any fresh user message.
+    Also the *only* place that calls `interrupt()` in the whole graph --
+    decision_agent_node never does (see `DecisionAgentNeverAsksTests`).
     """
     now = datetime.now()
-
-    pending_qa: list = []
-    pending_question = state.get("pending_decision_question")
-    if pending_question:
-        pending_options = suggest_options(
-            pending_question, context=state.get("intent_profile") or {}, fallback=[]
-        )
-        debug("intent_agent", f"asking decision_agent's handed-off question: {pending_question!r}")
-        raw_pending_answer = interrupt({
-            "question": pending_question,
-            "options": pending_options,
-            "agent": "decision_agent",
-            "field": "decision_clarification",
-        })
-        debug("intent_agent", f"got answer for decision_agent's question: {raw_pending_answer!r}")
-        pending_answer = resolve_option_choice(str(raw_pending_answer), pending_options)
-        if pending_answer == OTHER_VALUE:
-            follow_up = "Sure — go ahead and tell me in your own words."
-            other_pending_answer = interrupt({
-                "question": follow_up,
-                "options": [],
-                "agent": "decision_agent",
-                "field": "decision_clarification",
-            })
-            pending_answer = str(other_pending_answer)
-        pending_qa = [
-            AIMessage(content=pending_question, name="decision_agent"),
-            HumanMessage(content=str(pending_answer)),
-        ]
-        # Rebind so every read below sees the answer without touching each call site.
-        state = {**state, "messages": list(state.get("messages") or []) + pending_qa}
 
     # The CLI starts with no user message on purpose (offers a meal choice
     # first) -- never extract from an empty conversation, some models invent a craving.
@@ -399,7 +313,7 @@ def intent_discovery_node(state: CravrState) -> dict:
     profile = _derive(merged, now)
     debug("intent_agent", f"merged+derived profile={profile}")
 
-    transcript: list = list(pending_qa)  # seeded with any decision_agent hand-off Q&A
+    transcript: list = []
     asked: list[str] = []
 
     for round_number in range(1, MAX_INTENT_CLARIFICATION_ROUNDS + 1):
@@ -444,7 +358,7 @@ def intent_discovery_node(state: CravrState) -> dict:
             answer = str(other_answer)
 
         profile = _derive(_apply_answer(profile, field, str(answer), now), now)
-        
+
         debug("intent_agent", f"profile after {field!r}={profile}")
 
     still_missing = _missing_fields(profile)
@@ -455,11 +369,7 @@ def intent_discovery_node(state: CravrState) -> dict:
         _question_for(field, now, profile)[0] for field in still_missing
     ]
 
-    updates: dict = {
-        "intent_profile": profile,
-        "pending_decision_question": None,  # clear the hand-off -- else it's re-asked stale next turn
-        "pending_clarification_field": None,
-    }
+    updates: dict = {"intent_profile": profile}
     if transcript:
         updates["messages"] = transcript
     return updates

@@ -52,8 +52,6 @@ HUNGER_BY_INTENT = {
 }
 DEFAULT_HUNGER = "medium"
 
-REQUIRED_FIELDS = ("meal_intent", "craving_or_cuisine")
-
 @dataclass(frozen=True)
 class MealWindow:
     """One slice of the day and the meal intents plausible inside it."""

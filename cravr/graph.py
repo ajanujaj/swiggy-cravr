@@ -4,7 +4,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from .context import context_discovery_node
-from .decision import CLARIFY_AND_RETRY, decision_agent_node
+from .decision import decision_agent_node
 from .userPreference import user_preference_node
 from .intent import intent_discovery_node
 from .profile_utils import latest_user_text
@@ -12,12 +12,10 @@ from .recommend import is_pure_feedback, recommendation_agent_node
 from .state import CravrState
 
 
-# These double as conditional-edge labels in the generated Mermaid diagram, so they're named
-# for *why* the branch was taken, not the node it lands on (an unnamed key draws an unlabelled edge).
+# Doubles as the conditional-edge label in the generated Mermaid diagram, so it's
+# named for *why* the branch was taken, not the node it lands on.
 FEEDBACK = "feedback"
 NEW_REQUEST = "new_request"
-RECOMMEND = "recommend"
-NEEDS_MORE_INFO = "needs_more_info"
 
 
 def _route_entry(state: CravrState) -> str:
@@ -29,14 +27,6 @@ def _route_entry(state: CravrState) -> str:
     if is_pure_feedback(latest_user_text(state.get("messages") or []), state.get("recommendation_state")):
         return FEEDBACK
     return NEW_REQUEST
-
-
-def _route_after_decision(state: CravrState) -> str:
-    if state.get("ready_to_recommend"):
-        return RECOMMEND
-    if state.get("decision") == CLARIFY_AND_RETRY:
-        return CLARIFY_AND_RETRY
-    return NEEDS_MORE_INFO
 
 
 def build_graph():
@@ -57,15 +47,8 @@ def build_graph():
     workflow.add_edge("user_preference", "context_discovery")
     workflow.add_edge("context_discovery", "intent_discovery")
     workflow.add_edge("intent_discovery", "decision_agent")
-    workflow.add_conditional_edges(
-        "decision_agent",
-        _route_after_decision,
-        {
-            RECOMMEND: "recommendation_agent",
-            CLARIFY_AND_RETRY: "intent_discovery",
-            NEEDS_MORE_INFO: END,
-        },
-    )
+    # decision_agent always recommends now (see decisionAgent.py) -- one edge, not a branch.
+    workflow.add_edge("decision_agent", "recommendation_agent")
     workflow.add_edge("recommendation_agent", END)
 
     # A checkpointer is required so intent_discovery_node can pause mid-graph (via `interrupt()`)
