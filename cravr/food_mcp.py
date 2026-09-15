@@ -582,14 +582,19 @@ def update_cart(
     """update_food_cart -- add/change items. Docs: renders no cart view
     itself ("does NOT render any widget or cart UI"), so the documented flow
     is update_food_cart -> get_food_cart; callers here should follow with
-    `get_cart` to show the result and confirm the add actually took (a
-    real observed response was 'Cart updated.\nCart is empty.' -- the call
-    succeeded but the item plainly wasn't added, most likely because
-    `cart_items` entries need more than {"id": <menu_item_id>, "quantity":
-    <int>} for dishes with mandatory variants/add-ons, which the docs say
-    are common ("Items use either variants or variantsV2 format") -- the
-    exact input shape still isn't confirmed, so both the request and
-    response are always logged to pin this down from a real run).
+    `get_cart` to show the result and confirm the add actually took.
+
+    `cart_items` entries need {"menu_item_id": <id>, "quantity": <int>} --
+    NOT bare "id" (an earlier version of this used "id"; a real call with
+    it returned 'Cart updated.\nCart is empty.', i.e. accepted but silently
+    a no-op, because Swiggy didn't recognise the field. Confirmed via
+    Swiggy's own docs.md source, which explicitly ties menu_item_id to this
+    tool: '"menu_item_id": Food menu item identifier used by
+    update_food_cart.'). Items with mandatory variants/add-ons ("Items use
+    either variants or variantsV2 format") may still need one of those two
+    fields too -- not yet confirmed, since Cravr doesn't capture per-item
+    variant/addon options today -- so both the request and response are
+    always logged to catch that from a real run.
     """
     arguments: dict[str, Any] = {
         "restaurantId": restaurant_id,

@@ -145,7 +145,7 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
 
     result = food_mcp.update_cart(
         restaurant_id, address_id,
-        [{"id": menu_item_id, "quantity": quantity}],
+        [{"menu_item_id": menu_item_id, "quantity": quantity}],
         restaurant_name=dish.get("restaurant_name"),
     )
     debug("cart_agent", f"update_cart -> {result!r}")

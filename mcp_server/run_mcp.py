@@ -255,9 +255,16 @@ def get_food_cart(addressId: str, restaurantName: str = None) -> dict:
 
 @app.tool()
 def update_food_cart(restaurantId: str, addressId: str, cartItems: list, restaurantName: str = None) -> dict:
-    """Mock update_food_cart. cartItems entries: {"id": <menu_item_id>,
-    "quantity": <int>}; quantity<=0 removes the item. Switching restaurants
-    replaces the cart -- real Swiggy carts are single-restaurant too."""
+    """Mock update_food_cart. cartItems entries: {"menu_item_id": <id>,
+    "quantity": <int>} -- matches real Swiggy's field name (confirmed via
+    its docs.md: '"menu_item_id": Food menu item identifier used by
+    update_food_cart.'); an earlier version of this mock and of
+    cart.CartAgent both used "id" instead, which the real tool silently
+    ignores (accepts the call, adds nothing). Silently ignoring an
+    unrecognised key here too, rather than falling back to it, so a
+    regression back to "id" fails the same way against the mock as it does
+    for real. quantity<=0 removes the item. Switching restaurants replaces
+    the cart -- real Swiggy carts are single-restaurant too."""
     if _cart_state["restaurant_id"] and _cart_state["restaurant_id"] != restaurantId:
         _cart_state["items"] = []
         _cart_state["coupon_code"] = None
@@ -266,7 +273,7 @@ def update_food_cart(restaurantId: str, addressId: str, cartItems: list, restaur
     _cart_state["restaurant_name"] = restaurantName or _cart_state["restaurant_name"]
 
     for entry in cartItems or []:
-        item_id = (entry or {}).get("id")
+        item_id = (entry or {}).get("menu_item_id")
         if not item_id:
             continue
         quantity = (entry or {}).get("quantity", 1)

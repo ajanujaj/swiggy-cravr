@@ -117,7 +117,7 @@ class CartAgentNodeTests(unittest.TestCase):
              patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=cart_after):
             result = cart_agent_node(_state("add it to my cart", chosen=[self.DISH]))
         mock_update.assert_called_once_with(
-            "REST003", "addr1", [{"id": "ITEM0011", "quantity": 1}], restaurant_name="Dakshin Delights",
+            "REST003", "addr1", [{"menu_item_id": "ITEM0011", "quantity": 1}], restaurant_name="Dakshin Delights",
         )
         self.assertIn("Masala Dosa", result["messages"][0].content)
         self.assertIn("Total to pay: ₹210", result["messages"][0].content)
@@ -137,7 +137,7 @@ class CartAgentNodeTests(unittest.TestCase):
              patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value={"status": "success", "items": []}):
             cart_agent_node(_state("add 2 to my cart", chosen=[self.DISH]))
         mock_update.assert_called_once_with(
-            "REST003", "addr1", [{"id": "ITEM0011", "quantity": 2}], restaurant_name="Dakshin Delights",
+            "REST003", "addr1", [{"menu_item_id": "ITEM0011", "quantity": 2}], restaurant_name="Dakshin Delights",
         )
 
     def test_clear_reports_success_without_a_get_cart_round_trip(self):
@@ -216,10 +216,10 @@ class FoodMcpCartFunctionTests(unittest.TestCase):
 
     def test_update_cart_sends_the_documented_argument_names(self):
         with patch("cravr.food_mcp.call_tool_sync", return_value={"success": True, "data": {}}) as mock_call:
-            food_mcp.update_cart("R1", "addr1", [{"id": "I1", "quantity": 2}], restaurant_name="X")
+            food_mcp.update_cart("R1", "addr1", [{"menu_item_id": "I1", "quantity": 2}], restaurant_name="X")
         mock_call.assert_called_once_with(
             "update_food_cart",
-            {"restaurantId": "R1", "addressId": "addr1", "cartItems": [{"id": "I1", "quantity": 2}], "restaurantName": "X"},
+            {"restaurantId": "R1", "addressId": "addr1", "cartItems": [{"menu_item_id": "I1", "quantity": 2}], "restaurantName": "X"},
         )
 
     def test_apply_coupon_sends_the_documented_argument_names(self):
