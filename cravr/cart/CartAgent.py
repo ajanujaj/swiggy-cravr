@@ -12,6 +12,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from .. import food_mcp
+from ..debug_utils import debug
 from ..profile_utils import latest_user_text
 from ..state import CravrState
 
@@ -69,6 +70,10 @@ def _classify_cart_action(text: str) -> tuple[str, Any]:
     return "view", None
 
 
+def _log_action(action: str, arg: Any) -> None:
+    debug("cart_agent", f"classified action={action!r} arg={arg!r}")
+
+
 def _cart_reply(content: str, **cart_state: Any) -> dict:
     return {
         "cart_state": cart_state,
@@ -78,25 +83,29 @@ def _cart_reply(content: str, **cart_state: Any) -> dict:
 
 def _format_cart(cart: dict[str, Any]) -> str:
     items = cart.get("items") or []
-    if not items:
-        return "Your cart is empty."
-    lines = [
-        f"  - {i.get('item_name')} x{i.get('quantity', 1)} — ₹{i.get('total', i.get('final_price', 0))}"
-        for i in items
-    ]
-    body = "Here's your cart:\n" + "\n".join(lines)
-    pricing = cart.get("pricing") or {}
-    to_pay = pricing.get("to_pay")
-    if to_pay is not None:
-        body += f"\nTotal to pay: ₹{to_pay}"
-    coupon = cart.get("coupon_applied")
-    if coupon:
-        body += f"\nCoupon applied: {coupon} (-₹{cart.get('coupon_discount', 0)})"
-    return body
+    if items:
+        lines = [
+            f"  - {i.get('item_name')} x{i.get('quantity', 1)} — ₹{i.get('total', i.get('final_price', 0))}"
+            for i in items
+        ]
+        body = "Here's your cart:\n" + "\n".join(lines)
+        pricing = cart.get("pricing") or {}
+        to_pay = pricing.get("to_pay")
+        if to_pay is not None:
+            body += f"\nTotal to pay: ₹{to_pay}"
+        coupon = cart.get("coupon_applied")
+        if coupon:
+            body += f"\nCoupon applied: {coupon} (-₹{cart.get('coupon_discount', 0)})"
+        return body
+    # No structured items -- the real get_food_cart returns plain text with
+    # no itemized breakdown (Swiggy expects a widget to show that), so its
+    # own status message ("Cart is empty.", etc.) is all there is to show.
+    return cart.get("message") or "Your cart is empty."
 
 
 def _show_cart(address_id: str, lead_in: str = "") -> dict:
     cart = food_mcp.get_cart(address_id)
+    debug("cart_agent", f"get_cart -> status={cart.get('status')!r} item_count={len(cart.get('items') or [])}")
     if cart.get("status") == "error":
         return _cart_reply(f"Couldn't load your cart: {cart.get('message', 'unknown error')}")
     body = _format_cart(cart)
@@ -125,6 +134,11 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
     back (success or failure)."""
     menu_item_id = dish.get("menu_item_id")
     restaurant_id = dish.get("restaurant_id")
+    debug(
+        "cart_agent",
+        f"add_dish_to_cart dish={dish.get('item_name')!r} menu_item_id={menu_item_id!r} "
+        f"restaurant_id={restaurant_id!r} quantity={quantity} address_id={address_id!r}",
+    )
     if not menu_item_id or not restaurant_id:
         content = "I don't have enough details on that dish to add it to your cart -- try searching again."
         return _cart_reply(f"{lead_in} {content}".strip())
@@ -134,53 +148,72 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
         [{"id": menu_item_id, "quantity": quantity}],
         restaurant_name=dish.get("restaurant_name"),
     )
+    debug("cart_agent", f"update_cart -> {result!r}")
     if result.get("status") != "success":
         content = f"Couldn't add that to your cart: {result.get('message', 'unknown error')}"
         return _cart_reply(f"{lead_in} {content}".strip())
 
-    return _show_cart(address_id, lead_in=f"{lead_in} Added {dish.get('item_name')} to your cart.".strip())
+    # update_cart succeeding doesn't guarantee the item actually landed --
+    # a real response was 'Cart updated.\nCart is empty.' -- so its own
+    # message is relayed rather than an independent "Added X" claim, unless
+    # it's just going to repeat get_cart's own "Cart is empty." next (avoid
+    # the duplicate line); get_cart right after is the real source of truth.
+    update_message = result.get("message")
+    if update_message and "cart is empty" not in update_message.lower():
+        prefix = f"{lead_in} {update_message}".strip()
+    else:
+        prefix = lead_in
+    return _show_cart(address_id, lead_in=prefix)
 
 
 def cart_agent_node(state: CravrState) -> dict:
     user_input = latest_user_text(state.get("messages") or [])
     context_profile = state.get("context_profile") or {}
     address_id = context_profile.get("address_id") if isinstance(context_profile, dict) else None
+    debug("cart_agent", f"user_input={user_input!r} address_id={address_id!r}")
 
     if not address_id:
+        debug("cart_agent", "no address_id in context_profile -- asking the user to order first")
         return _cart_reply(
             "I don't have a delivery address saved yet -- tell me what you'd like to eat first "
             "so I can look one up, then come back to your cart."
         )
 
     action, arg = _classify_cart_action(user_input)
+    _log_action(action, arg)
 
     if action == "clear":
         result = food_mcp.flush_cart()
+        debug("cart_agent", f"flush_cart -> {result!r}")
         if result.get("status") != "success":
             return _cart_reply(f"Couldn't clear the cart: {result.get('message', 'unknown error')}")
-        return _cart_reply("Your cart is now empty.", items=[], pricing={})
+        return _cart_reply(result.get("message") or "Your cart is now empty.", items=[], pricing={})
 
     if action == "apply_coupon":
         result = food_mcp.apply_coupon(str(arg), address_id)
+        debug("cart_agent", f"apply_coupon({arg!r}) -> {result!r}")
         if result.get("status") != "success":
             return _cart_reply(f"Couldn't apply that coupon: {result.get('message', 'unknown error')}")
         return _show_cart(address_id, lead_in=result.get("message") or "Coupon applied.")
 
     if action == "coupons":
         restaurant_id = _current_restaurant_id(state)
+        debug("cart_agent", f"coupons requested, restaurant_id={restaurant_id!r}")
         if not restaurant_id:
             return _cart_reply("Add something to your cart first, then I can check available coupons.")
         result = food_mcp.fetch_coupons(restaurant_id, address_id)
+        debug("cart_agent", f"fetch_coupons -> status={result.get('status')!r} count={len(result.get('coupons') or [])}")
         if result.get("status") == "error":
             return _cart_reply(f"Couldn't fetch coupons: {result.get('message', 'unknown error')}")
         coupons = result.get("coupons") or []
         if not coupons:
-            return _cart_reply("No coupons available for this restaurant right now.")
+            return _cart_reply(result.get("message") or "No coupons available for this restaurant right now.")
         lines = [f"  - {c.get('title')}: {c.get('subtitle') or c.get('description') or ''}" for c in coupons]
         return _cart_reply("Available coupons:\n" + "\n".join(lines))
 
     if action == "add":
         chosen = (state.get("recommendation_state") or {}).get("last_recommendations") or []
+        debug("cart_agent", f"add requested, {len(chosen)} dish(es) in last_recommendations")
         if len(chosen) != 1:
             return _cart_reply("Which dish should I add? Pick one from the options first.")
         return add_dish_to_cart(chosen[0], address_id, quantity=arg or 1)

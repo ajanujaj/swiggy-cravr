@@ -489,14 +489,33 @@ def _check_success(raw: Any) -> str | None:
     return None
 
 
+def _strip_widget_disclaimer(text: str) -> str:
+    """Real cart-tool responses are plain text (confirmed via CRAVR_DEBUG=1
+    logs, same lesson as search_menu -- docs describe JSON, reality doesn't):
+    a short user-facing status line/paragraph, then a blank line, then
+    agent-only meta-instructions about a "cart widget" our chat UI doesn't
+    render ("Cart widget is displayed...", "NOTE: ...", the same "A rich UI
+    widget may be shown..." boilerplate search_menu/get_restaurant_menu
+    append after their JSON). Keep only the first paragraph -- that's the
+    part meant for the user; the rest is Swiggy telling the calling agent
+    not to restate what a widget would have shown.
+    """
+    return text.split("\n\n", 1)[0].strip()
+
+
 def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, Any]:
     """get_food_cart -> {"status", "cart_id", "restaurant", "items",
-    "item_count", "pricing", "coupon_applied", "coupon_discount", "address_id"}.
-    items[]: {"menu_item_id","item_name","quantity","total","final_price","in_stock"}.
+    "item_count", "pricing", "coupon_applied", "coupon_discount", "address_id",
+    "message"}. items[]: {"menu_item_id","item_name","quantity","total",
+    "final_price","in_stock"} -- populated only on the documented-JSON path
+    (e.g. the mock server); the real tool returns plain text with no
+    itemized breakdown (see `_strip_widget_disclaimer`), so `message` is
+    what actually has the human-readable status there.
     """
     arguments: dict[str, Any] = {"addressId": address_id}
     if restaurant_name:
         arguments["restaurantName"] = restaurant_name
+    debug("food_mcp", f"get_food_cart request: {arguments!r}")
 
     try:
         raw = _unwrap(call_tool_sync("get_food_cart", arguments))
@@ -505,8 +524,21 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
         return {"status": "error", "message": f"Unable to retrieve cart: {exc}"}
 
     debug("food_mcp", f"raw get_food_cart response: {raw!r}")
+
+    if isinstance(raw, str):
+        message = _strip_widget_disclaimer(raw)
+        result = {
+            "status": "empty" if "cart is empty" in message.lower() else "text",
+            "cart_id": None, "restaurant": None, "items": [], "item_count": 0,
+            "pricing": {}, "coupon_applied": None, "coupon_discount": 0,
+            "address_id": address_id, "message": message,
+        }
+        debug("food_mcp", f"get_food_cart parsed (text mode): status={result['status']!r} message={message!r}")
+        return result
+
     error = _check_success(raw)
     if error:
+        debug("food_mcp", f"get_food_cart parsed: status='error' message={error!r}")
         return {"status": "error", "message": error}
     if not isinstance(raw, dict):
         return {"status": "error", "message": "Unexpected get_food_cart response"}
@@ -527,7 +559,7 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
     offers = data.get("offers") if isinstance(data.get("offers"), dict) else {}
     restaurant = data.get("restaurant") if isinstance(data.get("restaurant"), dict) else None
 
-    return {
+    result = {
         "status": "success" if items else "empty",
         "cart_id": data.get("cart_id"),
         "restaurant": restaurant,
@@ -538,7 +570,10 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
         "coupon_applied": offers.get("coupon_applied") if (offers.get("coupon_discount") or 0) > 0 else None,
         "coupon_discount": offers.get("coupon_discount", 0),
         "address_id": raw.get("addressId", address_id),
+        "message": None,
     }
+    debug("food_mcp", f"get_food_cart parsed (json mode): status={result['status']!r} item_count={len(items)}")
+    return result
 
 
 def update_cart(
@@ -547,12 +582,14 @@ def update_cart(
     """update_food_cart -- add/change items. Docs: renders no cart view
     itself ("does NOT render any widget or cart UI"), so the documented flow
     is update_food_cart -> get_food_cart; callers here should follow with
-    `get_cart` to show the result. `cart_items` entries need at minimum
-    {"id": <menu_item_id>, "quantity": <int>} -- the exact input key names
-    aren't fully documented beyond "variants or variantsV2, never both", so
-    this is the untested part of the cart flow; the raw response is always
-    logged so a field-name mismatch shows up immediately in CRAVR_DEBUG=1
-    output instead of silently mis-adding items.
+    `get_cart` to show the result and confirm the add actually took (a
+    real observed response was 'Cart updated.\nCart is empty.' -- the call
+    succeeded but the item plainly wasn't added, most likely because
+    `cart_items` entries need more than {"id": <menu_item_id>, "quantity":
+    <int>} for dishes with mandatory variants/add-ons, which the docs say
+    are common ("Items use either variants or variantsV2 format") -- the
+    exact input shape still isn't confirmed, so both the request and
+    response are always logged to pin this down from a real run).
     """
     arguments: dict[str, Any] = {
         "restaurantId": restaurant_id,
@@ -561,6 +598,7 @@ def update_cart(
     }
     if restaurant_name:
         arguments["restaurantName"] = restaurant_name
+    debug("food_mcp", f"update_food_cart request: {arguments!r}")
 
     try:
         raw = _unwrap(call_tool_sync("update_food_cart", arguments))
@@ -569,10 +607,19 @@ def update_cart(
         return {"status": "error", "message": f"Unable to update cart: {exc}"}
 
     debug("food_mcp", f"raw update_food_cart response: {raw!r}")
+
+    if isinstance(raw, str):
+        message = _strip_widget_disclaimer(raw)
+        debug("food_mcp", f"update_food_cart parsed (text mode): message={message!r}")
+        return {"status": "success", "message": message}
+
     error = _check_success(raw)
     if error:
+        debug("food_mcp", f"update_food_cart parsed: status='error' message={error!r}")
         return {"status": "error", "message": error}
-    return {"status": "success", "message": raw.get("message") if isinstance(raw, dict) else None}
+    result = {"status": "success", "message": raw.get("message") if isinstance(raw, dict) else None}
+    debug("food_mcp", f"update_food_cart parsed (json mode): {result!r}")
+    return result
 
 
 def apply_coupon(coupon_code: str, address_id: str, cart_id: str | None = None) -> dict[str, Any]:
@@ -581,6 +628,7 @@ def apply_coupon(coupon_code: str, address_id: str, cart_id: str | None = None) 
     arguments: dict[str, Any] = {"couponCode": coupon_code, "addressId": address_id}
     if cart_id:
         arguments["cartId"] = cart_id
+    debug("food_mcp", f"apply_food_coupon request: {arguments!r}")
 
     try:
         raw = _unwrap(call_tool_sync("apply_food_coupon", arguments))
@@ -589,20 +637,34 @@ def apply_coupon(coupon_code: str, address_id: str, cart_id: str | None = None) 
         return {"status": "error", "message": f"Unable to apply coupon: {exc}"}
 
     debug("food_mcp", f"raw apply_food_coupon response: {raw!r}")
+
+    if isinstance(raw, str):
+        message = _strip_widget_disclaimer(raw)
+        debug("food_mcp", f"apply_food_coupon parsed (text mode): message={message!r}")
+        return {"status": "success", "message": message}
+
     error = _check_success(raw)
     if error:
+        debug("food_mcp", f"apply_food_coupon parsed: status='error' message={error!r}")
         return {"status": "error", "message": error}
-    return {"status": "success", "message": raw.get("message") if isinstance(raw, dict) else None}
+    result = {"status": "success", "message": raw.get("message") if isinstance(raw, dict) else None}
+    debug("food_mcp", f"apply_food_coupon parsed (json mode): {result!r}")
+    return result
 
 
 def fetch_coupons(restaurant_id: str, address_id: str, coupon_code: str | None = None) -> dict[str, Any]:
-    """fetch_food_coupons -> {"status", "coupons", "count"}. Docs: only
-    COD-applicable coupons are returned. Each coupon: {"id", "title",
-    "subtitle", "description", "applicable", "applicability_status", "terms"}.
+    """fetch_food_coupons -> {"status", "coupons", "count", "message"}. Docs:
+    only COD-applicable coupons are returned. Each coupon: {"id", "title",
+    "subtitle", "description", "applicable", "applicability_status", "terms"}
+    -- populated only on the documented-JSON path; if the real tool turns
+    out to be plain text too (unconfirmed as of this writing, unlike the
+    other four cart tools which are all now known to be text), `message`
+    carries the raw status and `coupons` stays empty rather than crashing.
     """
     arguments: dict[str, Any] = {"restaurantId": restaurant_id, "addressId": address_id}
     if coupon_code:
         arguments["couponCode"] = coupon_code
+    debug("food_mcp", f"fetch_food_coupons request: {arguments!r}")
 
     try:
         raw = _unwrap(call_tool_sync("fetch_food_coupons", arguments))
@@ -611,8 +673,16 @@ def fetch_coupons(restaurant_id: str, address_id: str, coupon_code: str | None =
         return {"status": "error", "message": f"Unable to fetch coupons: {exc}", "coupons": []}
 
     debug("food_mcp", f"raw fetch_food_coupons response: {raw!r}")
+
+    if isinstance(raw, str):
+        message = _strip_widget_disclaimer(raw)
+        result = {"status": "text", "message": message, "coupons": []}
+        debug("food_mcp", f"fetch_food_coupons parsed (text mode): {result!r}")
+        return result
+
     error = _check_success(raw)
     if error:
+        debug("food_mcp", f"fetch_food_coupons parsed: status='error' message={error!r}")
         return {"status": "error", "message": error, "coupons": []}
     if not isinstance(raw, dict):
         return {"status": "error", "message": "Unexpected fetch_food_coupons response", "coupons": []}
@@ -636,13 +706,18 @@ def fetch_coupons(restaurant_id: str, address_id: str, coupon_code: str | None =
             })
 
     if not coupons:
-        return {"status": "no_results", "message": data.get("status_message") or "No coupons available", "coupons": []}
-    return {"status": "success", "coupons": coupons, "count": len(coupons)}
+        result = {"status": "no_results", "message": data.get("status_message") or "No coupons available", "coupons": []}
+        debug("food_mcp", f"fetch_food_coupons parsed (json mode): {result!r}")
+        return result
+    result = {"status": "success", "coupons": coupons, "count": len(coupons)}
+    debug("food_mcp", f"fetch_food_coupons parsed (json mode): {len(coupons)} coupon(s)")
+    return result
 
 
 def flush_cart() -> dict[str, Any]:
     """flush_food_cart -- clears the entire cart. No parameters (auth is
     session-scoped, per docs)."""
+    debug("food_mcp", "flush_food_cart request: {}")
     try:
         raw = _unwrap(call_tool_sync("flush_food_cart", {}))
     except Exception as exc:
@@ -650,7 +725,15 @@ def flush_cart() -> dict[str, Any]:
         return {"status": "error", "message": f"Unable to clear cart: {exc}"}
 
     debug("food_mcp", f"raw flush_food_cart response: {raw!r}")
+
+    if isinstance(raw, str):
+        message = _strip_widget_disclaimer(raw)
+        debug("food_mcp", f"flush_food_cart parsed (text mode): message={message!r}")
+        return {"status": "success", "message": message}
+
     error = _check_success(raw)
     if error:
+        debug("food_mcp", f"flush_food_cart parsed: status='error' message={error!r}")
         return {"status": "error", "message": error}
+    debug("food_mcp", "flush_food_cart parsed (json mode): success")
     return {"status": "success"}

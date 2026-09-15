@@ -119,8 +119,18 @@ class CartAgentNodeTests(unittest.TestCase):
         mock_update.assert_called_once_with(
             "REST003", "addr1", [{"id": "ITEM0011", "quantity": 1}], restaurant_name="Dakshin Delights",
         )
-        self.assertIn("Added Masala Dosa", result["messages"][0].content)
+        self.assertIn("Masala Dosa", result["messages"][0].content)
         self.assertIn("Total to pay: ₹210", result["messages"][0].content)
+
+    def test_add_relays_update_carts_own_message_when_it_has_signal(self):
+        """A real update_cart message that isn't just "cart is empty" noise
+        (e.g. a genuine confirmation) is shown as a lead-in to the cart."""
+        cart_after = {"status": "empty", "items": [], "pricing": {}, "message": "Cart is empty."}
+        with patch("cravr.cart.CartAgent.food_mcp.update_cart",
+                   return_value={"status": "success", "message": "Item added, size required."}), \
+             patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=cart_after):
+            result = cart_agent_node(_state("add it to my cart", chosen=[self.DISH]))
+        self.assertIn("Item added, size required.", result["messages"][0].content)
 
     def test_add_honours_an_explicit_quantity(self):
         with patch("cravr.cart.CartAgent.food_mcp.update_cart", return_value={"status": "success"}) as mock_update, \
