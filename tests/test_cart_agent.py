@@ -4,6 +4,7 @@ from unittest.mock import patch
 from langchain_core.messages import HumanMessage
 
 from cravr import food_mcp
+from cravr.cart import CartAgent
 from cravr.cart.CartAgent import _classify_cart_action, cart_agent_node, is_cart_request
 from cravr.graph import CART, FEEDBACK, NEW_REQUEST, _route_entry
 
@@ -250,6 +251,147 @@ class FoodMcpCartFunctionTests(unittest.TestCase):
         with patch("cravr.food_mcp.call_tool_sync", return_value={"success": True, "data": {}}):
             result = food_mcp.flush_cart()
         self.assertEqual(result["status"], "success")
+
+
+class RealTextResponseRegressionTests(unittest.TestCase):
+    """Regression coverage for the exact plain-text payloads Swiggy returned
+    in a live run (CRAVR_DEBUG=1 log, Sep 2026): a non-empty cart's raw text
+    has THREE blank-line-separated paragraphs (items, pricing, disclaimer),
+    not two -- a naive "split on first blank line" silently threw away the
+    whole pricing breakdown (Bug B), and add_dish_to_cart relayed
+    update_cart's own full item+pricing dump as a lead-in right before
+    get_cart printed the identical dump again (Bug A, the user's reported
+    "duplicate .. i guess.")."""
+
+    REAL_UPDATE_CART_RAW = (
+        "Cart updated.\n"
+        "Restaurant: Timpano - The Pasta Shop\n"
+        "Items (1):\n"
+        "  - Italian Meat Lover Pizza — ₹260 (ID: 179082816)\n\n"
+        "Item total: ₹400\n"
+        "Delivery: ₹80\n"
+        "Taxes & charges: ₹57.98\n"
+        "Coupon (FLAT140): -₹140\n"
+        "TO PAY: ₹398\n\n"
+        "Cart widget is displayed. Wait for the user to review and confirm."
+    )
+
+    REAL_GET_CART_RAW = (
+        "Items (1):\n"
+        "  - Italian Meat Lover Pizza — ₹260 (ID: 179082816)\n\n"
+        "Item total: ₹400\n"
+        "Delivery: ₹80\n"
+        "Taxes & charges: ₹57.98\n"
+        "Coupon (FLAT140): -₹140\n"
+        "TO PAY: ₹398\n\n"
+        "Cart widget is displayed — do not repeat the cart items, prices, or totals in text.\n"
+        "NOTE: The cart widget has quantity stepper controls. The user can adjust quantities "
+        "and click \"Confirm and Review Cart\" — the widget will send you the changes to "
+        "process via update_food_cart.\n"
+        "Some items have add-on options available (check valid_addons). Briefly mention this "
+        "to the user, e.g. \"Your Veg Burger has add-on options (Fries, Cheese) — want to add any?\"\n\n"
+        "⚠️ A rich UI widget may be shown to the user with this data. Avoid restating everything "
+        "the widget already displays — instead, provide a brief recommendation or ask what "
+        "they'd like to do next."
+    )
+
+    def test_update_cart_text_mode_keeps_the_full_pricing_breakdown(self):
+        with patch("cravr.food_mcp.call_tool_sync", return_value=self.REAL_UPDATE_CART_RAW):
+            result = food_mcp.update_cart("351682", "addr1", [{"menu_item_id": "179082816", "quantity": 1}])
+        self.assertEqual(result["status"], "success")
+        for expected in ("Item total: ₹400", "Delivery: ₹80", "Taxes & charges: ₹57.98",
+                          "Coupon (FLAT140): -₹140", "TO PAY: ₹398"):
+            self.assertIn(expected, result["message"])
+        self.assertNotIn("Cart widget is displayed", result["message"])
+
+    def test_get_cart_text_mode_keeps_the_full_pricing_breakdown(self):
+        with patch("cravr.food_mcp.call_tool_sync", return_value=self.REAL_GET_CART_RAW):
+            result = food_mcp.get_cart("addr1")
+        self.assertEqual(result["status"], "text")
+        for expected in ("Item total: ₹400", "Delivery: ₹80", "Taxes & charges: ₹57.98",
+                          "Coupon (FLAT140): -₹140", "TO PAY: ₹398"):
+            self.assertIn(expected, result["message"])
+        self.assertNotIn("Cart widget is displayed", result["message"])
+        self.assertNotIn("NOTE:", result["message"])
+        self.assertNotIn("⚠️", result["message"])
+
+    def test_add_dish_to_cart_does_not_duplicate_the_real_pizza_response(self):
+        """End-to-end replay of the exact log that triggered the user's
+        "duplicate .. i guess." report: the item line must appear once, and
+        the pricing must survive intact."""
+        dish = {"item_name": "Italian Meat Lover Pizza", "menu_item_id": "179082816",
+                "restaurant_id": "351682", "restaurant_name": "Timpano - The Pasta Shop"}
+
+        def fake_call_tool_sync(tool_name, arguments):
+            if tool_name == "update_food_cart":
+                return self.REAL_UPDATE_CART_RAW
+            if tool_name == "get_food_cart":
+                return self.REAL_GET_CART_RAW
+            raise AssertionError(f"unexpected tool {tool_name}")
+
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync):
+            result = CartAgent.add_dish_to_cart(
+                dish, "d3n3lphv42g4rgmuvu70__AbKqwgSYhkE5YttayIYiXs", quantity=1,
+                lead_in="Great — Italian Meat Lover Pizza from Timpano - The Pasta Shop (₹400.0) it is.",
+            )
+
+        content = result["messages"][0].content
+        # The lead_in naturally names the dish once ("... it is."), and the
+        # cart body names it again in its item line -- that's two DIFFERENT
+        # sentences, not a duplicate. The actual bug was the cart body
+        # itself (the "Items (1): ..." block) appearing twice.
+        self.assertEqual(content.count("Items (1):"), 1, content)
+        self.assertEqual(content.count("TO PAY: ₹398"), 1, content)
+        self.assertIn("Coupon (FLAT140): -₹140", content)
+
+    def test_add_dish_to_cart_accumulates_a_second_item_from_the_same_restaurant(self):
+        """The user's actual follow-up report: picking a second dish from
+        the SAME restaurant ("add more") wasn't landing in the cart. Root
+        cause found in a real log: update_food_cart is documented as
+        additive, but two consecutive real calls (one new item each) both
+        came back with "Items (1): ..." and an unchanged item total -- the
+        first item was silently dropped, not accumulated, and there's no
+        cartId param to target an existing cart. Fix: add_dish_to_cart now
+        fetches the current cart first and always sends the FULL merged
+        item list, so it no longer depends on the server merging for us.
+        This replays that exact real single-item response text as "what's
+        already in the cart" and checks the second call's cartItems
+        includes both the old and the new item."""
+        first_item_cart_text = (
+            "Items (1):\n  - Italian Meat Lover Pizza — ₹260 (ID: 179082816)\n\n"
+            "Item total: ₹400\nDelivery: ₹80\nTaxes & charges: ₹57.98\n"
+            "Coupon (FLAT140): -₹140\nTO PAY: ₹398\n\n"
+            "Cart widget is displayed — do not repeat the cart items, prices, or totals in text."
+        )
+        second_dish = {"item_name": "All Fungi Pizza", "menu_item_id": "179082813",
+                        "restaurant_id": "351682", "restaurant_name": "Timpano - The Pasta Shop"}
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "text", "message": first_item_cart_text}), \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart",
+                   return_value={"status": "success", "message": "Cart updated."}) as mock_update:
+            CartAgent.add_dish_to_cart(second_dish, "addr1", quantity=1, lead_in="")
+
+        sent_cart_items = mock_update.call_args.args[2]
+        sent_ids = {entry["menu_item_id"] for entry in sent_cart_items}
+        self.assertEqual(sent_ids, {"179082816", "179082813"}, sent_cart_items)
+
+    def test_add_dish_to_cart_bumps_quantity_when_the_same_item_is_added_again(self):
+        existing_cart_text = (
+            "Items (1):\n  - Italian Meat Lover Pizza — ₹260 (ID: 179082816)\n\n"
+            "TO PAY: ₹398"
+        )
+        dish = {"item_name": "Italian Meat Lover Pizza", "menu_item_id": "179082816",
+                "restaurant_id": "351682", "restaurant_name": "Timpano - The Pasta Shop"}
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "text", "message": existing_cart_text}), \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart",
+                   return_value={"status": "success", "message": "Cart updated."}) as mock_update:
+            CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="")
+
+        sent_cart_items = mock_update.call_args.args[2]
+        self.assertEqual(sent_cart_items, [{"menu_item_id": "179082816", "quantity": 2}])
 
 
 if __name__ == "__main__":

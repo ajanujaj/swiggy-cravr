@@ -489,17 +489,40 @@ def _check_success(raw: Any) -> str | None:
     return None
 
 
+_DISCLAIMER_MARKERS = (
+    "cart widget is displayed",
+    "\nnote:",
+    "\u26a0",  # warning-sign emoji prefix on "A rich UI widget may be shown..."
+)
+
+
 def _strip_widget_disclaimer(text: str) -> str:
     """Real cart-tool responses are plain text (confirmed via CRAVR_DEBUG=1
     logs, same lesson as search_menu -- docs describe JSON, reality doesn't):
-    a short user-facing status line/paragraph, then a blank line, then
-    agent-only meta-instructions about a "cart widget" our chat UI doesn't
-    render ("Cart widget is displayed...", "NOTE: ...", the same "A rich UI
-    widget may be shown..." boilerplate search_menu/get_restaurant_menu
-    append after their JSON). Keep only the first paragraph -- that's the
-    part meant for the user; the rest is Swiggy telling the calling agent
-    not to restate what a widget would have shown.
+    a user-facing section (status/items, and for a non-empty cart also a
+    pricing breakdown -- Item total/Delivery/Taxes & charges/Coupon/TO PAY,
+    itself blank-line-separated from the item list), followed by a blank
+    line and agent-only meta-instructions about a "cart widget" our chat UI
+    doesn't render ("Cart widget is displayed...", "NOTE: ...", the same "A
+    rich UI widget may be shown..." boilerplate search_menu/get_restaurant_menu
+    append after their JSON).
+
+    A naive "split on the first blank line" truncates the pricing breakdown
+    for a non-empty cart, since that response has THREE blank-line-separated
+    paragraphs (items, pricing, disclaimer) not two -- confirmed directly in
+    a real get_food_cart/update_food_cart response. So instead we search for
+    the earliest occurrence of an actual disclaimer marker and keep
+    everything before it; only if no marker is found do we fall back to the
+    old first-blank-line split, as a defensive last resort.
     """
+    lower = text.lower()
+    earliest = None
+    for marker in _DISCLAIMER_MARKERS:
+        idx = lower.find(marker)
+        if idx != -1 and (earliest is None or idx < earliest):
+            earliest = idx
+    if earliest is not None:
+        return text[:earliest].strip()
     return text.split("\n\n", 1)[0].strip()
 
 

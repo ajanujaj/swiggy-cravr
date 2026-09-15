@@ -41,6 +41,20 @@ _VIEW_RE = re.compile(
 _COUPON_LIST_RE = re.compile(r"\bcoupons?\b|\boffers?\b|\bdiscounts?\b|\bdeals?\b", re.IGNORECASE)
 _QTY_RE = re.compile(r"\b(\d+)\b")
 
+# Best-effort extraction of {menu_item_id, quantity} pairs from a real
+# get_food_cart/update_food_cart plain-text item list, e.g.
+# "  - Italian Meat Lover Pizza — ₹260 (ID: 179082816)". Swiggy's cart
+# responses are plain text with no JSON items array for the real tool (see
+# food_mcp._strip_widget_disclaimer's docstring), so this is the only way
+# to know what's already in the cart before merging in a newly-added item.
+# Only the single-item, quantity-omitted format has been observed live; an
+# "x<N>" quantity suffix is supported defensively but unverified against a
+# real multi-quantity response.
+_CART_LINE_RE = re.compile(
+    r"^\s*-\s*.+?(?:\s+x(?P<qty>\d+))?\s*[—-]\s*₹[\d,.]+\s*\(ID:\s*(?P<id>[^)]+)\)\s*$",
+    re.MULTILINE,
+)
+
 
 def is_cart_request(text: str) -> bool:
     """Entry-router gate (graph.py) -- only messages with a strong cart/
@@ -72,6 +86,17 @@ def _classify_cart_action(text: str) -> tuple[str, Any]:
 
 def _log_action(action: str, arg: Any) -> None:
     debug("cart_agent", f"classified action={action!r} arg={arg!r}")
+
+
+def _parse_existing_cart_items(cart_message: str) -> list[dict[str, Any]]:
+    """See _CART_LINE_RE. Returns [{"menu_item_id": ..., "quantity": ...}]."""
+    items = []
+    for match in _CART_LINE_RE.finditer(cart_message or ""):
+        items.append({
+            "menu_item_id": match.group("id").strip(),
+            "quantity": int(match.group("qty")) if match.group("qty") else 1,
+        })
+    return items
 
 
 def _cart_reply(content: str, **cart_state: Any) -> dict:
@@ -143,9 +168,35 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
         content = "I don't have enough details on that dish to add it to your cart -- try searching again."
         return _cart_reply(f"{lead_in} {content}".strip())
 
+    # Swiggy's update_food_cart is documented as additive ("Add items to
+    # cart"), but a live run showed the opposite: two consecutive calls
+    # (same restaurant/address, one new item each) each came back reporting
+    # only the item just sent -- "Items (1): ... " both times, with item
+    # total unchanged (~₹400, a single item's price) -- meaning the first
+    # item was dropped rather than accumulated. There's no cartId param to
+    # target an existing cart (confirmed against the docs: cart identity is
+    # resolved server-side from restaurantId/addressId, not a client-held
+    # id), so the safest fix from our side is to never rely on server-side
+    # accumulation: always fetch what's already in the cart, merge the new
+    # item into it (bumping quantity if it's already there), and send the
+    # FULL desired cart contents every time.
+    existing_cart = food_mcp.get_cart(address_id)
+    existing_items = (
+        _parse_existing_cart_items(existing_cart.get("message") or "")
+        if existing_cart.get("status") in ("text", "success", "empty")
+        else []
+    )
+    debug("cart_agent", f"existing cart before add: status={existing_cart.get('status')!r} "
+          f"parsed_items={existing_items!r}")
+
+    merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
+    merged[str(menu_item_id)] = merged.get(str(menu_item_id), 0) + quantity
+    cart_items_payload = [{"menu_item_id": mid, "quantity": qty} for mid, qty in merged.items()]
+    debug("cart_agent", f"sending merged cartItems={cart_items_payload!r}")
+
     result = food_mcp.update_cart(
         restaurant_id, address_id,
-        [{"menu_item_id": menu_item_id, "quantity": quantity}],
+        cart_items_payload,
         restaurant_name=dish.get("restaurant_name"),
     )
     debug("cart_agent", f"update_cart -> {result!r}")
@@ -155,11 +206,23 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
 
     # update_cart succeeding doesn't guarantee the item actually landed --
     # a real response was 'Cart updated.\nCart is empty.' -- so its own
-    # message is relayed rather than an independent "Added X" claim, unless
-    # it's just going to repeat get_cart's own "Cart is empty." next (avoid
-    # the duplicate line); get_cart right after is the real source of truth.
+    # message is relayed rather than an independent "Added X" claim, UNLESS
+    # it's just going to repeat what get_cart is about to show next (avoid
+    # duplicate lines); get_cart right after is the real source of truth.
+    # Two shapes look like a redundant full dump: "Cart is empty." (empty
+    # cart) and an "Items (N): ... TO PAY: ..." itemized+pricing dump
+    # (non-empty cart) -- a real observed update_cart response was 'Cart
+    # updated.\nRestaurant: X\nItems (1):\n  - Dish — ₹260 (ID: 123)\n\n
+    # Item total: ₹400\n...\nTO PAY: ₹398', which get_cart repeats verbatim
+    # right after. Only relay update_cart's own message when it's neither --
+    # e.g. a genuinely different short status line.
     update_message = result.get("message")
-    if update_message and "cart is empty" not in update_message.lower():
+    looks_like_full_dump = bool(update_message) and (
+        "cart is empty" in update_message.lower()
+        or "items (" in update_message.lower()
+        or "to pay" in update_message.lower()
+    )
+    if update_message and not looks_like_full_dump:
         prefix = f"{lead_in} {update_message}".strip()
     else:
         prefix = lead_in
