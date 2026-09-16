@@ -683,6 +683,53 @@ class CartNextStepTests(unittest.TestCase):
         names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
         self.assertNotIn("Protein Bowl v2", names, "must exclude the restaurant just cleared")
         self.assertIn("Grain Bowl", names)
+        # Regression: the cart is genuinely empty after a successful flush,
+        # so the restaurant recorded for it must be cleared here -- or the
+        # NEXT add wrongly compares against the one just cleared. Live bug:
+        # "Your cart already has items from Social" right after "start
+        # over" had just flushed the cart clean.
+        self.assertIsNone(result["cart_state"]["restaurant"])
+
+    def test_start_over_then_picking_a_different_restaurant_is_not_refused(self):
+        """End-to-end replay of the live regression: cart had items from
+        "Social", user hit "start over", flush succeeded, then picking a
+        dish from an entirely different restaurant ("Blue Tokai Coffee
+        Roasters") must NOT trip the cross-restaurant guard -- the cart is
+        empty now, there's nothing to conflict with."""
+        from cravr.recommend.RecommendAgent import recommendation_agent_node
+
+        raw_results = [
+            {"item_name": "Chicken Mortadella And Cheese Sando", "menu_item_id": "183585989",
+             "restaurant_id": "32955", "restaurant_name": "Blue Tokai Coffee Roasters",
+             "price_inr": 545, "course": "main"},
+        ]
+
+        def fake_flush(tool_name, arguments):
+            if tool_name == "flush_food_cart":
+                return "Cart cleared.\n\nCart widget is displayed."
+            raise AssertionError(tool_name)
+
+        chosen = [{"item_name": "Mile High Club Veg", "menu_item_id": "63432924",
+                   "restaurant_id": "53859", "restaurant_name": "Social"}]
+        state = self._state_with_brief(
+            CartAgent.CART_START_OVER_VALUE, chosen=chosen,
+            cart_state={"status": "text", "restaurant": {"id": "53859", "name": "Social"}},
+        )
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_flush),              patch("cravr.recommend.RecommendAgent._call_recommendation_tool", return_value=raw_results):
+            start_over_result = cart_agent_node(state)
+
+        state["cart_state"] = start_over_result["cart_state"]
+        state["recommendation_state"] = start_over_result["recommendation_state"]
+        state["messages"] = state["messages"] + [HumanMessage(content="1")]
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "empty", "message": "Cart is empty."}),              patch("cravr.cart.CartAgent.food_mcp.update_cart",
+                   return_value={"status": "success", "message": "Cart updated."}):
+            pick_result = recommendation_agent_node(state)
+
+        content = pick_result["messages"][0].content
+        self.assertNotIn("Swiggy carts can only hold", content, content)
+        self.assertNotIn("needs a variant/add-on choice", content, content)
 
     def test_picking_a_suggested_item_lands_in_the_cart_via_the_normal_pick_machinery(self):
         """End-to-end: "add more" hands off to recommendation_agent's own

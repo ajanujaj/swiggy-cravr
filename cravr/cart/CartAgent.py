@@ -449,7 +449,10 @@ def add_dish_to_cart(
     return outcome
 
 
-def _offer_dishes(lead_in: str, batch: list[dict[str, Any]], filters: dict[str, Any]) -> dict:
+def _offer_dishes(
+    lead_in: str, batch: list[dict[str, Any]], filters: dict[str, Any],
+    cart_state: dict[str, Any] | None = None,
+) -> dict:
     """Hand a dish batch off through the SAME "offer -> pick -> add to
     cart" machinery RecommendAgent already uses, instead of building a
     parallel one here: `name="recommendation_agent"` on the reply message
@@ -462,13 +465,23 @@ def _offer_dishes(lead_in: str, batch: list[dict[str, Any]], filters: dict[str, 
     code. Deferred import: RecommendAgent imports `add_dish_to_cart` from
     this module at load time, so importing back at module scope would be
     circular -- safe here since both modules are fully loaded by the time
-    any node actually runs."""
+    any node actually runs. `cart_state`, when passed, is included in the
+    return so a caller can overwrite state the graph would otherwise
+    leave untouched -- LangGraph only updates keys a node's return dict
+    actually includes, so a caller with nothing to say about `cart_state`
+    (e.g. "add more") must simply omit it here, while one that changed
+    the cart (e.g. "start over") must say so explicitly or a STALE value
+    survives into the next turn. Live regression: after "start over"
+    flushed the cart, the next pick was refused with "Your cart already
+    has items from Social" -- the restaurant _current_restaurant_id
+    recorded before the flush, never cleared, because this function used
+    to omit `cart_state` unconditionally."""
     from ..recommend.RecommendAgent import ONLY_MATCH_OPTIONS, _build_recommendation_text, _dish_pick_options
 
     body = _build_recommendation_text(batch)
     content = f"{lead_in}\n{body}".strip() if lead_in else body
     options = ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch)
-    return {
+    outcome: dict[str, Any] = {
         "recommendation_state": {
             "last_recommendations": batch,
             "alternates": [],
@@ -479,6 +492,9 @@ def _offer_dishes(lead_in: str, batch: list[dict[str, Any]], filters: dict[str, 
         },
         "messages": [AIMessage(content=content, name="recommendation_agent")],
     }
+    if cart_state is not None:
+        outcome["cart_state"] = cart_state
+    return outcome
 
 
 def _suggest_more_from_restaurant(state: CravrState, address_id: str) -> dict:
@@ -522,9 +538,18 @@ def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
     if flush_result.get("status") != "success":
         return _cart_reply(f"Couldn't clear the cart: {flush_result.get('message', 'unknown error')}")
 
+    # The cart is genuinely empty now -- clear the restaurant we recorded
+    # for it, or the NEXT add wrongly compares against the one just
+    # flushed (live regression: "Your cart already has items from Social"
+    # right after "start over" successfully cleared it).
+    cleared_cart_state = {"restaurant": None}
+
     brief = state.get("recommendation_brief") or {}
     if not brief:
-        return _cart_reply("Cart's cleared. Tell me what you're craving and I'll find some other restaurants.")
+        return _cart_reply(
+            "Cart's cleared. Tell me what you're craving and I'll find some other restaurants.",
+            **cleared_cart_state,
+        )
 
     from ..recommend.RecommendAgent import fetch_recommendations  # deferred -- see _offer_dishes
 
@@ -534,9 +559,13 @@ def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
     if not ranked:
         return _cart_reply(
             "Cart's cleared, but I couldn't find another restaurant with the same kind of food "
-            "right now -- tell me what to change and I'll look again."
+            "right now -- tell me what to change and I'll look again.",
+            **cleared_cart_state,
         )
-    return _offer_dishes("Cart's cleared. Other restaurants with what you were after:", ranked, filters)
+    return _offer_dishes(
+        "Cart's cleared. Other restaurants with what you were after:", ranked, filters,
+        cart_state=cleared_cart_state,
+    )
 
 
 def cart_agent_node(state: CravrState) -> dict:
