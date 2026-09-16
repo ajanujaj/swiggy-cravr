@@ -410,7 +410,8 @@ class RealTextResponseRegressionTests(unittest.TestCase):
                 "tags": "has addons"}
 
         with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
-             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update:
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items") as mock_probe:
             # A non-empty lead_in mirrors RecommendAgent._reply_with_pick's
             # "Great -- X it is." -- it must be dropped, not prefixed, or
             # the reply contradicts itself (confirmed live: see CartAgent).
@@ -421,6 +422,12 @@ class RealTextResponseRegressionTests(unittest.TestCase):
 
         mock_get_cart.assert_not_called()
         mock_update.assert_not_called()
+        # Temporary verification probe -- see CartAgent's comment. Must
+        # target the SPECIFIC dish+restaurant the docs point at, not the
+        # broad unscoped query CartAgent otherwise never makes here.
+        mock_probe.assert_called_once_with(
+            "Mediterranean Veg Pizza [11 inches]", "addr1", restaurant_id="855114",
+        )
         content = result["messages"][0].content
         self.assertIn("Mediterranean Veg Pizza [11 inches]", content)
         self.assertIn("add-on", content)
@@ -431,7 +438,22 @@ class RealTextResponseRegressionTests(unittest.TestCase):
                 "restaurant_id": "996967", "restaurant_name": "Mister Edamame",
                 "tags": "Veg, has variants"}
 
-        with patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update:
+        with patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items"):
+            result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="")
+
+        mock_update.assert_not_called()
+        self.assertIn("Fiery Avocado Roll", result["messages"][0].content)
+
+    def test_add_dish_to_cart_refuses_even_when_the_verification_probe_itself_fails(self):
+        """The probe is diagnostic only -- a failure there (e.g. the real
+        MCP call errors out) must never block or alter the refusal."""
+        dish = {"item_name": "Fiery Avocado Roll", "menu_item_id": "157423529",
+                "restaurant_id": "996967", "restaurant_name": "Mister Edamame",
+                "tags": "Veg, has variants"}
+
+        with patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items", side_effect=RuntimeError("boom")):
             result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="")
 
         mock_update.assert_not_called()

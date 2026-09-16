@@ -363,6 +363,23 @@ def add_dish_to_cart(
         return _cart_reply(content)
 
     if _requires_customization(dish.get("tags") or ""):
+        # TEMPORARY verification instrumentation (remove once answered):
+        # docs.md says a targeted search_menu(item name, restaurantIdOfAdded
+        # Item=restaurant) call returns the item's full variants/variantsV2/
+        # addons breakdown -- untested, since every response Cravr has
+        # actually seen from search_menu/get_restaurant_menu so far (broad,
+        # unscoped queries) has been condensed text, not that structured
+        # data. This makes that exact targeted call and logs the raw
+        # response, purely to find out what comes back -- it does not
+        # change the refusal below either way, and never blocks it.
+        try:
+            probe = food_mcp.search_menu_items(
+                str(dish.get("item_name") or ""), address_id, restaurant_id=str(restaurant_id),
+            )
+            debug("cart_agent", f"customization probe for {dish.get('item_name')!r} -> {probe!r}")
+        except Exception as exc:  # noqa: BLE001 -- diagnostic only, must never break the refusal path
+            debug("cart_agent", f"customization probe FAILED: {exc}")
+
         # Deliberately drop `lead_in` here, not prefix it -- callers build
         # it assuming a successful add (RecommendAgent._reply_with_pick:
         # "Great -- X it is."), and prefixing that onto a refusal produced

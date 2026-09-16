@@ -226,7 +226,8 @@ def _parse_search_menu_items(text: str) -> list[dict[str, Any]]:
 
 
 def search_menu_items(
-    query: str, address_id: str | None, veg_only: bool = False, offset: int = 0
+    query: str, address_id: str | None, veg_only: bool = False, offset: int = 0,
+    restaurant_id: str | None = None,
 ) -> dict[str, Any]:
     """Search dishes directly by name across restaurants via Swiggy's
     search_menu tool -- more direct than search_restaurants +
@@ -242,10 +243,21 @@ def search_menu_items(
 
     Returns {"items": [...normalized dish records...], "has_more": bool,
     "next_offset": int | None}.
+
+    `restaurant_id` maps to the tool's own `restaurantIdOfAddedItem` param
+    (per docs.md -- confirmed there is no plain `restaurantId`), which
+    scopes the search to one restaurant; docs.md's own item-line text says
+    this item-name+restaurant combo is how to "get full customization
+    details" (variants/variantsV2/addons) for one specific dish -- unverified
+    against the real tool, since every response actually seen from it so
+    far (broad, unscoped queries) has been a condensed text summary, not
+    the structured JSON the docs describe for variants/addons.
     """
     arguments: dict[str, Any] = {"addressId": address_id, "query": query, "offset": offset}
     if veg_only:
         arguments["vegFilter"] = 1
+    if restaurant_id:
+        arguments["restaurantIdOfAddedItem"] = restaurant_id
 
     try:
         raw = _unwrap(call_tool_sync("search_menu", arguments))
