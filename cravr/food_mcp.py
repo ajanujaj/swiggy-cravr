@@ -225,6 +225,99 @@ def _parse_search_menu_items(text: str) -> list[dict[str, Any]]:
     return items
 
 
+# A *targeted* search_menu call (item name + restaurantIdOfAddedItem, per
+# docs.md's own "To order an item, use search_menu with the item name and
+# restaurantId to get full customization details" hint) returns a totally
+# different text shape than the broad/unscoped one _SEARCH_MENU_ITEM_RE
+# handles -- confirmed via a live CRAVR_DEBUG probe. No restaurantId in
+# the header (it's already scoped to one restaurant), rating shown as
+# "4.8\u2605 (53)" (review count in parens, no "|" before it), and each
+# item is followed by one or more indented "   Addons (<group name>): [...]"
+# lines instead of a trailing "[has addons]" tag -- each bracketed entry
+# is "<choice name> \u20b9<price> (group:<group_id>, choice:<choice_id>)".
+# No example of the "variants"/"variantsV2" shape has been seen this way
+# yet -- only addons.
+_DETAILED_ITEM_HEADER_RE = re.compile(
+    # Same overall "N. name — ₹price | ... (ID: X)" shape as the broad-search
+    # format below, which is why a plain match on this alone false-matched
+    # broad-format lines that happen to lack a trailing "[has addons]" tag
+    # (confirmed against the real "Hummus & pita" broad-search fixture in
+    # tests/test_food_mcp.py). The real, reliable difference: broad-format
+    # lines always carry "(restaurantId: X)" before "(ID: Y)" (the targeted
+    # shape omits it -- it's already scoped to one restaurant), so a
+    # negative lookahead on that is used to tell the two shapes apart
+    # rather than relying on the addon-tag text, which isn't always present.
+    r"^\d+\.[ \t]*(?P<name>.+?)[ \t]*—[ \t]*₹(?P<price>[\d,]+(?:\.\d+)?)[ \t]*\|[ \t]*"
+    r"(?P<rest>(?:(?!\(restaurantId:).)+?)[ \t]*"
+    r"\(ID:[ \t]*(?P<id>[^)]+)\)[ \t]*$",
+    re.MULTILINE,
+)
+_DETAILED_ADDON_GROUP_RE = re.compile(
+    r"^[ \t]*Addons \((?P<group_name>[^)]+)\):[ \t]*\[(?P<body>.*)\][ \t]*$",
+    re.MULTILINE,
+)
+_DETAILED_ADDON_CHOICE_RE = re.compile(
+    r"(?P<name>.+?)[ \t]*₹(?P<price>[\d,]+(?:\.\d+)?)[ \t]*"
+    r"\(group:(?P<group_id>\d+),[ \t]*choice:(?P<choice_id>\d+)\)"
+)
+
+
+def _parse_detailed_search_menu_items(text: str) -> dict[str, dict[str, Any]]:
+    """Parse the targeted-lookup shape above into
+    {menu_item_id: {"item_name", "price_inr", "addon_groups": [
+        {"group_id", "group_name", "choices": [{"id", "name", "price_inr"}, ...]}
+    ]}}. Returns {} if the text does not match this shape at all (e.g. it
+    was actually the broad-search shape instead) -- callers should treat
+    an empty dict as "nothing usable", not as "this item has no addons".
+    """
+    headers = list(_DETAILED_ITEM_HEADER_RE.finditer(text))
+    items: dict[str, dict[str, Any]] = {}
+    for idx, m in enumerate(headers):
+        item_id = m.group("id").strip()
+        block_end = headers[idx + 1].start() if idx + 1 < len(headers) else len(text)
+        block = text[m.end():block_end]
+
+        try:
+            price_inr: float | int = float(m.group("price").replace(",", ""))
+        except ValueError:
+            price_inr = 0
+
+        groups = []
+        for gm in _DETAILED_ADDON_GROUP_RE.finditer(block):
+            choices = []
+            for cm in _DETAILED_ADDON_CHOICE_RE.finditer(gm.group("body")):
+                try:
+                    choice_price: float | int = float(cm.group("price").replace(",", ""))
+                except ValueError:
+                    choice_price = 0
+                choices.append({
+                    "id": cm.group("choice_id"),
+                    # finditer matches choices back-to-back separated by ", " --
+                    # every match after the first starts with that leftover
+                    # ", " (the comma belongs to the previous choice's
+                    # separator, not this choice's name), so strip comma+space
+                    # specifically rather than plain .strip().
+                    "name": cm.group("name").strip().strip(", ").strip(),
+                    "price_inr": choice_price,
+                    "group_id": cm.group("group_id"),
+                })
+            # The group header line ("Addons (<name>): [...]") never carries a
+            # group_id itself -- only the choices inside it do, via
+            # "(group:X, choice:Y)". Every choice in one group shares the same
+            # group_id, so promote the first choice's id to the group level.
+            groups.append({
+                "group_id": choices[0]["group_id"] if choices else None,
+                "group_name": gm.group("group_name").strip(),
+                "choices": choices,
+            })
+        items[item_id] = {
+            "item_name": m.group("name").strip(),
+            "price_inr": price_inr,
+            "addon_groups": groups,
+        }
+    return items
+
+
 def search_menu_items(
     query: str, address_id: str | None, veg_only: bool = False, offset: int = 0,
     restaurant_id: str | None = None,
@@ -248,10 +341,17 @@ def search_menu_items(
     (per docs.md -- confirmed there is no plain `restaurantId`), which
     scopes the search to one restaurant; docs.md's own item-line text says
     this item-name+restaurant combo is how to "get full customization
-    details" (variants/variantsV2/addons) for one specific dish -- unverified
-    against the real tool, since every response actually seen from it so
-    far (broad, unscoped queries) has been a condensed text summary, not
-    the structured JSON the docs describe for variants/addons.
+    details" (variants/variantsV2/addons) for one specific dish. CONFIRMED
+    live (captured in logger.txt, item "Falafel Hummus Pita Pocket",
+    restaurant 300897): a targeted call like this returns real, structured
+    addon group/choice ids (group:NNNN, choice:NNNN) -- but in a THIRD text
+    shape, different from both the broad-search line format and the JSON
+    the docs describe. See `_parse_detailed_search_menu_items` for that
+    shape's parser; its output shows up here under `detailed_items` when
+    the broad-format parser finds nothing. No example with `variants`/
+    `variantsV2` (as opposed to `addons`) has been seen in this shape yet,
+    and no min/maxAddons-style "is this group mandatory" field is exposed
+    in it either -- only name/price/ids.
     """
     arguments: dict[str, Any] = {"addressId": address_id, "query": query, "offset": offset}
     if veg_only:
@@ -268,7 +368,20 @@ def search_menu_items(
     debug("food_mcp", f"raw search_menu response: {raw!r}")
 
     if isinstance(raw, str):
-        return {"items": _parse_search_menu_items(raw), "has_more": False, "next_offset": None}
+        parsed_items = _parse_search_menu_items(raw)
+        result: dict[str, Any] = {"items": parsed_items, "has_more": False, "next_offset": None}
+        if not parsed_items:
+            # The broad-search line format didn't match -- this may be the
+            # other real shape a targeted (restaurant_id-scoped) query
+            # returns instead (see _parse_detailed_search_menu_items). Only
+            # populated when it actually found something, so callers can
+            # tell "nothing usable" (both empty) from "detailed shape only"
+            # (items empty, detailed_items populated) without re-parsing raw
+            # text themselves.
+            detailed = _parse_detailed_search_menu_items(raw)
+            if detailed:
+                result["detailed_items"] = detailed
+        return result
 
     if not isinstance(raw, dict):
         return {"items": [], "has_more": False, "next_offset": None}

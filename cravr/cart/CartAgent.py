@@ -363,20 +363,43 @@ def add_dish_to_cart(
         return _cart_reply(content)
 
     if _requires_customization(dish.get("tags") or ""):
-        # TEMPORARY verification instrumentation (remove once answered):
-        # docs.md says a targeted search_menu(item name, restaurantIdOfAdded
-        # Item=restaurant) call returns the item's full variants/variantsV2/
-        # addons breakdown -- untested, since every response Cravr has
-        # actually seen from search_menu/get_restaurant_menu so far (broad,
-        # unscoped queries) has been condensed text, not that structured
-        # data. This makes that exact targeted call and logs the raw
-        # response, purely to find out what comes back -- it does not
-        # change the refusal below either way, and never blocks it.
+        # Diagnostic-only probe (does not change the refusal below either
+        # way, never blocks it). CONFIRMED live (logger.txt, "Falafel
+        # Hummus Pita Pocket", restaurant 300897): a targeted
+        # search_menu(item name, restaurantIdOfAddedItem=restaurant) call
+        # DOES return the item's real addon groups with group/choice ids --
+        # docs.md was right about that. food_mcp.search_menu_items() now
+        # parses that shape itself (see _parse_detailed_search_menu_items)
+        # and surfaces it under result["detailed_items"] when the
+        # broad-format parser finds nothing; log the parsed group/choice
+        # names here instead of the raw dict so this stays readable as more
+        # items get tested. No min/maxAddons-style "mandatory" flag is
+        # exposed in this response shape -- only name/price/ids -- so
+        # whether any of these groups are actually required is still
+        # unknown from this data alone.
         try:
             probe = food_mcp.search_menu_items(
                 str(dish.get("item_name") or ""), address_id, restaurant_id=str(restaurant_id),
             )
-            debug("cart_agent", f"customization probe for {dish.get('item_name')!r} -> {probe!r}")
+            detailed = probe.get("detailed_items") or {}
+            match = detailed.get(str(dish.get("menu_item_id") or ""))
+            if match:
+                group_summary = [
+                    f"{g['group_name']} ({len(g['choices'])} choices, group_id={g['group_id']})"
+                    for g in match.get("addon_groups", [])
+                ]
+                debug(
+                    "cart_agent",
+                    f"customization probe for {dish.get('item_name')!r} (id={dish.get('menu_item_id')!r}) "
+                    f"-> matched item with addon groups: {group_summary!r}",
+                )
+            else:
+                debug(
+                    "cart_agent",
+                    f"customization probe for {dish.get('item_name')!r} (id={dish.get('menu_item_id')!r}) "
+                    f"-> no matching item id in response; {len(detailed)} detailed item(s), "
+                    f"{len(probe.get('items') or [])} broad-format item(s) found instead",
+                )
         except Exception as exc:  # noqa: BLE001 -- diagnostic only, must never break the refusal path
             debug("cart_agent", f"customization probe FAILED: {exc}")
 
