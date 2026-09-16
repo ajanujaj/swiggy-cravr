@@ -394,7 +394,7 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         self.assertEqual(sent_cart_items, [{"menu_item_id": "179082816", "quantity": 2}])
 
 
-    def test_add_dish_to_cart_refuses_items_that_need_addon_or_variant_choices(self):
+    def test_add_dish_to_cart_falls_back_to_refusal_when_the_addon_only_attempt_does_not_land(self):
         """Real-world regression: THREE separate live occurrences (Jamie
         Oliver Kitchen's "Mediterranean Veg Pizza [11 inches]" via a normal
         search+pick, plus Mister Edamame's "Manchow Soup" and "Sichuan Hot
@@ -402,9 +402,15 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         item into a non-empty cart and got back
         'Cart updated.\nCart is empty.' from the real update_food_cart --
         the whole update silently rejected, with Cravr then falsely
-        telling the user it worked. Cravr can't collect the required
-        choice, so it must refuse before ever calling update_cart/get_cart
-        -- this covers the normal pick path, not just "add more"."""
+        telling the user it worked.
+
+        Cravr now attempts addon-only items (no "has variants" tag) with an
+        explicit empty addon selection instead of refusing outright (see
+        CartAgent's attempt_addon_only comment) -- but it must still verify
+        the item actually landed before trusting that, and fall back to
+        this same honest refusal if it didn't. This fixture simulates that
+        exact real 'Cart updated.\nCart is empty.' outcome to prove the
+        fallback still holds even though update_cart itself now gets called."""
         dish = {"item_name": "Mediterranean Veg Pizza [11 inches]", "menu_item_id": "136714282",
                 "restaurant_id": "855114", "restaurant_name": "Jamie Oliver Kitchen",
                 "tags": "has addons"}
@@ -412,6 +418,11 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
              patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
              patch("cravr.cart.CartAgent.food_mcp.search_menu_items") as mock_probe:
+            mock_get_cart.side_effect = [
+                {"status": "empty", "message": "Cart is empty."},  # cart fetched before the merge
+                {"status": "empty", "message": "Cart is empty."},  # verify after the attempt -- item never landed
+            ]
+            mock_update.return_value = {"status": "success", "message": "Cart updated.\nCart is empty."}
             # A non-empty lead_in mirrors RecommendAgent._reply_with_pick's
             # "Great -- X it is." -- it must be dropped, not prefixed, or
             # the reply contradicts itself (confirmed live: see CartAgent).
@@ -420,11 +431,14 @@ class RealTextResponseRegressionTests(unittest.TestCase):
                 lead_in="Great — Mediterranean Veg Pizza [11 inches] from Jamie Oliver Kitchen (₹699.0) it is.",
             )
 
-        mock_get_cart.assert_not_called()
-        mock_update.assert_not_called()
-        # Temporary verification probe -- see CartAgent's comment. Must
-        # target the SPECIFIC dish+restaurant the docs point at, not the
-        # broad unscoped query CartAgent otherwise never makes here.
+        self.assertEqual(mock_get_cart.call_count, 2)
+        mock_update.assert_called_once()
+        sent_items = mock_update.call_args[0][2]
+        target_entry = next(e for e in sent_items if e["menu_item_id"] == "136714282")
+        self.assertEqual(target_entry.get("addons"), [], "addon-only attempt must send an explicit empty selection")
+        # Diagnostic probe -- see CartAgent's comment. Must target the
+        # SPECIFIC dish+restaurant the docs point at, not the broad
+        # unscoped query CartAgent otherwise never makes here.
         mock_probe.assert_called_once_with(
             "Mediterranean Veg Pizza [11 inches]", "addr1", restaurant_id="855114",
         )
@@ -432,6 +446,44 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         self.assertIn("Mediterranean Veg Pizza [11 inches]", content)
         self.assertIn("add-on", content)
         self.assertNotIn("Great —", content, "a success lead-in must not precede a refusal")
+
+    def test_add_dish_to_cart_accepts_an_addon_only_item_when_the_empty_selection_verifiably_lands(self):
+        """The new, opposite case from the fallback test above: real
+        evidence (logger.txt, "Korean Honey Gochujang Chicken Wings (4 Pcs)
+        (Its extra Spicy)", tagged has-addons only with one "Add on Sauce"
+        group -- no variants) is what motivated trying an explicit empty
+        addon selection instead of refusing every has-addons item outright.
+        When get_cart afterward actually shows the item present, Cravr must
+        accept it as a real success (cart shown, restaurant recorded) --
+        not the old unconditional refusal."""
+        dish = {
+            "item_name": "Korean Honey Gochujang Chicken Wings (4 Pcs) (Its extra Spicy)",
+            "menu_item_id": "182602816", "restaurant_id": "300123",
+            "restaurant_name": "Some Korean Place", "tags": "has addons",
+        }
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items"):
+            landed_message = (
+                "Items (1):\n  - Korean Honey Gochujang Chicken Wings (4 Pcs) (Its extra Spicy) "
+                "— ₹279 (ID: 182602816)\n\nTO PAY: ₹279"
+            )
+            mock_get_cart.side_effect = [
+                {"status": "empty", "message": "Cart is empty."},  # before the merge
+                {"status": "text", "message": landed_message},  # verify after the attempt -- item landed this time
+                {"status": "text", "message": landed_message},  # _show_cart_with_next_steps' own get_cart call
+            ]
+            mock_update.return_value = {"status": "success", "message": "Cart updated."}
+            result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="Great — X it is.")
+
+        mock_update.assert_called_once()
+        sent_items = mock_update.call_args[0][2]
+        target_entry = next(e for e in sent_items if e["menu_item_id"] == "182602816")
+        self.assertEqual(target_entry.get("addons"), [])
+        content = result["messages"][0].content
+        self.assertNotIn("needs a variant/add-on choice", content)
+        self.assertEqual(result["cart_state"]["restaurant"], {"id": "300123", "name": "Some Korean Place"})
 
     def test_add_dish_to_cart_refuses_items_with_variant_choices_too(self):
         dish = {"item_name": "Fiery Avocado Roll", "menu_item_id": "157423529",

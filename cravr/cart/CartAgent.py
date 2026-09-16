@@ -362,7 +362,15 @@ def add_dish_to_cart(
         # ("Great -- X it is."), so it is dropped rather than prefixed.
         return _cart_reply(content)
 
+    # Set below when this item is addon-only (no variant/size choice) --
+    # threads through to the merged cart_items_payload build and gets a
+    # dedicated post-add verification, instead of an unconditional refusal.
+    attempt_addon_only = False
+
     if _requires_customization(dish.get("tags") or ""):
+        tags_haystack = (dish.get("tags") or "").lower()
+        needs_variant_choice = "has variants" in tags_haystack
+
         # Diagnostic-only probe (does not change the refusal below either
         # way, never blocks it). CONFIRMED live (logger.txt, "Falafel
         # Hummus Pita Pocket", restaurant 300897): a targeted
@@ -414,7 +422,32 @@ def add_dish_to_cart(
             f"{dish.get('item_name', 'That item')} needs a variant/add-on choice I can't set for you yet, "
             "so I haven't added it to your cart -- pick something else, or add it with add-ons directly in the Swiggy app."
         )
-        return _cart_reply(content)
+
+        if needs_variant_choice:
+            # A variant (size/base choice, e.g. "Choice of Cheese: With/
+            # Without") changes what the item actually IS -- there's no safe
+            # default to guess (the live response shape confirmed this
+            # segment carries no "default" flag either), so this case still
+            # refuses outright, unlike the addon-only case below.
+            return _cart_reply(content)
+
+        # Addon-only item (e.g. live-confirmed "Korean Honey Gochujang
+        # Chicken Wings", tagged has-addons with one optional-looking
+        # "Add on Sauce" group, no variants): every addon group actually
+        # seen live so far (sauces, dressings, drinks, desserts, sides) reads
+        # as an optional upsell, not a mandatory choice -- and the repeated
+        # real failure pattern (update_food_cart silently replying 'Cart
+        # updated.\nCart is empty.') is consistent with Swiggy's validation
+        # wanting an explicit answer for these groups, not with every group
+        # actually being required. UNTESTED hypothesis, first attempted here
+        # live: try the add with an explicit empty addon selection
+        # ("addons": []) instead of refusing outright. `attempt_addon_only`
+        # threads this into the normal merge-and-send flow below, which
+        # already re-fetches the cart afterward to verify -- if that
+        # verification shows the item didn't actually land, this same
+        # `content` refusal is returned instead of a broken/misleading
+        # cart display.
+        attempt_addon_only = True
 
     # Swiggy's update_food_cart is documented as additive ("Add items to
     # cart"), but a live run showed the opposite: two consecutive calls
@@ -438,8 +471,16 @@ def add_dish_to_cart(
           f"parsed_items={existing_items!r}")
 
     merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
-    merged[str(menu_item_id)] = merged.get(str(menu_item_id), 0) + quantity
-    cart_items_payload = [{"menu_item_id": mid, "quantity": qty} for mid, qty in merged.items()]
+    target_quantity = merged.get(str(menu_item_id), 0) + quantity
+    merged[str(menu_item_id)] = target_quantity
+    cart_items_payload = []
+    for mid, qty in merged.items():
+        entry: dict[str, Any] = {"menu_item_id": mid, "quantity": qty}
+        if attempt_addon_only and mid == str(menu_item_id):
+            # See the attempt_addon_only comment above -- explicit empty
+            # selection instead of omitting the field entirely.
+            entry["addons"] = []
+        cart_items_payload.append(entry)
     debug("cart_agent", f"sending merged cartItems={cart_items_payload!r}")
 
     result = food_mcp.update_cart(
@@ -449,8 +490,43 @@ def add_dish_to_cart(
     )
     debug("cart_agent", f"update_cart -> {result!r}")
     if result.get("status") != "success":
+        if attempt_addon_only:
+            debug("cart_agent", "addon-only attempt: update_cart call itself failed -- falling back to refusal")
+            return _cart_reply(
+                f"{dish.get('item_name', 'That item')} needs a variant/add-on choice I can't set for you yet, "
+                "so I haven't added it to your cart -- pick something else, or add it with add-ons directly in the Swiggy app."
+            )
         content = f"Couldn't add that to your cart: {result.get('message', 'unknown error')}"
         return _cart_reply(f"{lead_in} {content}".strip())
+
+    if attempt_addon_only:
+        # update_cart reporting "success" doesn't mean the item actually
+        # landed -- the whole reason this path exists is that has-addons
+        # items previously came back 'Cart updated.\nCart is empty.' while
+        # still reporting success. Re-fetch and confirm the item is really
+        # there (at the expected quantity) before trusting this attempt;
+        # if not, fall back to the same honest refusal rather than show the
+        # user a cart that silently dropped their item.
+        verify_cart = food_mcp.get_cart(address_id)
+        verify_items = (
+            _parse_existing_cart_items(verify_cart.get("message") or "")
+            if verify_cart.get("status") in ("text", "success", "empty")
+            else []
+        )
+        landed = next(
+            (i for i in verify_items if str(i.get("menu_item_id")) == str(menu_item_id)), None,
+        )
+        debug(
+            "cart_agent",
+            f"addon-only attempt verify -> landed={landed!r} target_quantity={target_quantity} "
+            f"all_items={verify_items!r}",
+        )
+        if not landed or landed.get("quantity", 0) < target_quantity:
+            return _cart_reply(
+                f"{dish.get('item_name', 'That item')} needs a variant/add-on choice I can't set for you yet, "
+                "so I haven't added it to your cart -- pick something else, or add it with add-ons directly in the Swiggy app."
+            )
+        debug("cart_agent", "addon-only attempt VERIFIED -- explicit empty addons selection worked live")
 
     # update_cart succeeding doesn't guarantee the item actually landed --
     # a real response was 'Cart updated.\nCart is empty.' -- so its own

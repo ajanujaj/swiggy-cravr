@@ -252,23 +252,39 @@ _DETAILED_ITEM_HEADER_RE = re.compile(
     r"\(ID:[ \t]*(?P<id>[^)]+)\)[ \t]*$",
     re.MULTILINE,
 )
+# "Addons (...)" and "Variants (...)" lines share the same overall shape
+# but are NOT interchangeable: confirmed live (logger.txt, "Korean Honey
+# Gochujang Fried Chicken Burger", restaurant of ID 187075710) a variant
+# group ("Variants (Choice of Cheese): [With Cheese ... (group:X,
+# var:Y), ...]") uses "var:" for its id token, not "choice:" -- an earlier
+# version of this parser only recognised "Addons (...)" lines at all, so
+# every Variants group for every item was silently dropped rather than
+# just mis-parsed. `kind` distinguishes the two so callers can tell a real
+# size/base choice (variants -- changes what the item IS, no safe default)
+# from an optional upsell (addons -- see CartAgent's attempt_addon_only).
 _DETAILED_ADDON_GROUP_RE = re.compile(
-    r"^[ \t]*Addons \((?P<group_name>[^)]+)\):[ \t]*\[(?P<body>.*)\][ \t]*$",
+    r"^[ \t]*(?P<kind>Addons|Variants) \((?P<group_name>[^)]+)\):[ \t]*\[(?P<body>.*)\][ \t]*$",
     re.MULTILINE,
 )
 _DETAILED_ADDON_CHOICE_RE = re.compile(
     r"(?P<name>.+?)[ \t]*₹(?P<price>[\d,]+(?:\.\d+)?)[ \t]*"
-    r"\(group:(?P<group_id>\d+),[ \t]*choice:(?P<choice_id>\d+)\)"
+    r"\(group:(?P<group_id>\d+),[ \t]*(?:choice|var):(?P<choice_id>\d+)\)"
 )
 
 
 def _parse_detailed_search_menu_items(text: str) -> dict[str, dict[str, Any]]:
     """Parse the targeted-lookup shape above into
-    {menu_item_id: {"item_name", "price_inr", "addon_groups": [
-        {"group_id", "group_name", "choices": [{"id", "name", "price_inr"}, ...]}
-    ]}}. Returns {} if the text does not match this shape at all (e.g. it
-    was actually the broad-search shape instead) -- callers should treat
-    an empty dict as "nothing usable", not as "this item has no addons".
+    {menu_item_id: {"item_name", "price_inr",
+        "addon_groups": [{"group_id", "group_name", "choices": [...]}],
+        "variant_groups": [{"group_id", "group_name", "choices": [...]}],
+    }}. addon_groups are optional upsells (see CartAgent's
+    attempt_addon_only); variant_groups are real size/base-item choices
+    (e.g. "Choice of Cheese") that change what the item IS -- kept
+    separate rather than merged, since only the addon kind currently gets
+    a safe default. Returns {} if the text does not match this shape at
+    all (e.g. it was actually the broad-search shape instead) -- callers
+    should treat an empty dict as "nothing usable", not as "this item has
+    no addons/variants".
     """
     headers = list(_DETAILED_ITEM_HEADER_RE.finditer(text))
     items: dict[str, dict[str, Any]] = {}
@@ -282,7 +298,8 @@ def _parse_detailed_search_menu_items(text: str) -> dict[str, dict[str, Any]]:
         except ValueError:
             price_inr = 0
 
-        groups = []
+        addon_groups = []
+        variant_groups = []
         for gm in _DETAILED_ADDON_GROUP_RE.finditer(block):
             choices = []
             for cm in _DETAILED_ADDON_CHOICE_RE.finditer(gm.group("body")):
@@ -301,19 +318,22 @@ def _parse_detailed_search_menu_items(text: str) -> dict[str, dict[str, Any]]:
                     "price_inr": choice_price,
                     "group_id": cm.group("group_id"),
                 })
-            # The group header line ("Addons (<name>): [...]") never carries a
-            # group_id itself -- only the choices inside it do, via
-            # "(group:X, choice:Y)". Every choice in one group shares the same
-            # group_id, so promote the first choice's id to the group level.
-            groups.append({
+            # The group header line ("Addons (<name>): [...]" or "Variants
+            # (<name>): [...]") never carries a group_id itself -- only the
+            # choices inside it do, via "(group:X, choice:Y)"/"(group:X,
+            # var:Y)". Every choice in one group shares the same group_id,
+            # so promote the first choice's id to the group level.
+            group_record = {
                 "group_id": choices[0]["group_id"] if choices else None,
                 "group_name": gm.group("group_name").strip(),
                 "choices": choices,
-            })
+            }
+            (variant_groups if gm.group("kind") == "Variants" else addon_groups).append(group_record)
         items[item_id] = {
             "item_name": m.group("name").strip(),
             "price_inr": price_inr,
-            "addon_groups": groups,
+            "addon_groups": addon_groups,
+            "variant_groups": variant_groups,
         }
     return items
 
