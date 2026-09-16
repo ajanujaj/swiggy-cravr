@@ -394,6 +394,43 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         self.assertEqual(sent_cart_items, [{"menu_item_id": "179082816", "quantity": 2}])
 
 
+    def test_add_dish_to_cart_refuses_items_that_need_addon_or_variant_choices(self):
+        """Real-world regression: THREE separate live occurrences (Jamie
+        Oliver Kitchen's "Mediterranean Veg Pizza [11 inches]" via a normal
+        search+pick, plus Mister Edamame's "Manchow Soup" and "Sichuan Hot
+        & Sour Soup" via "add more") all merged a has-addons/has-variants
+        item into a non-empty cart and got back
+        'Cart updated.\nCart is empty.' from the real update_food_cart --
+        the whole update silently rejected, with Cravr then falsely
+        telling the user it worked. Cravr can't collect the required
+        choice, so it must refuse before ever calling update_cart/get_cart
+        -- this covers the normal pick path, not just "add more"."""
+        dish = {"item_name": "Mediterranean Veg Pizza [11 inches]", "menu_item_id": "136714282",
+                "restaurant_id": "855114", "restaurant_name": "Jamie Oliver Kitchen",
+                "tags": "has addons"}
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update:
+            result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="")
+
+        mock_get_cart.assert_not_called()
+        mock_update.assert_not_called()
+        content = result["messages"][0].content
+        self.assertIn("Mediterranean Veg Pizza [11 inches]", content)
+        self.assertIn("add-on", content)
+
+    def test_add_dish_to_cart_refuses_items_with_variant_choices_too(self):
+        dish = {"item_name": "Fiery Avocado Roll", "menu_item_id": "157423529",
+                "restaurant_id": "996967", "restaurant_name": "Mister Edamame",
+                "tags": "Veg, has variants"}
+
+        with patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update:
+            result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="")
+
+        mock_update.assert_not_called()
+        self.assertIn("Fiery Avocado Roll", result["messages"][0].content)
+
+
 class CartNextStepTests(unittest.TestCase):
     """The post-add "what next" buttons: add more from this restaurant /
     proceed (placeholder) / browse other restaurants -- offered any time a
@@ -466,6 +503,78 @@ class CartNextStepTests(unittest.TestCase):
         self.assertNotIn("Bowl", names, "the item already in the cart must never be re-suggested")
         self.assertIn("Lemonade", names[:2])
         self.assertIn("Brownie", names[:2])
+
+    def test_add_more_excludes_items_requiring_customization_even_as_fallback(self):
+        """Real-world regression (Mister Edamame, live CRAVR_DEBUG log):
+        suggesting "Manchow Soup" / "Sichuan Hot & Sour Soup" -- both
+        tagged "has addons" -- and picking one made the real
+        update_food_cart respond 'Cart updated.\nCart is empty.', silently
+        rejecting the WHOLE merged cart update. Only one addon-free main
+        (besides the cart item) is on this menu, so without the hard
+        filter the old "top up with whatever's left" fallback would have
+        pulled in a has-addons item to fill the limit=5 quota."""
+        full_menu = (
+            "## Gourmet Soups\n"
+            "- Manchow Soup — ₹399 | Veg, has addons (ID: 156291316)\n"
+            "- Sichuan Hot & Sour Soup — ₹399 | Veg, has addons (ID: 156291303)\n"
+            "## Recommended\n"
+            "- Burmese Khao Suey — ₹499 | Veg, has addons (ID: 182049278)\n"
+            "- Fiery Avocado Roll — ₹499 | Veg, has variants (ID: 157423529)\n"
+            "- Stuffed Mushroom In Thai Sauce — ₹509 | Veg, Bestseller (ID: 157253913)\n"
+            "## Mains\n"
+            "- Veg Stir Fried Udon Noodles — ₹409 | Veg (ID: 157423586)\n"
+        )
+
+        def fake_call_tool_sync(tool_name, arguments):
+            if tool_name == "get_food_cart":
+                return ("Items (1):\n  - Veg Stir Fried Udon Noodles — ₹284 (ID: 157423586)"
+                        "\n\nTO PAY: ₹426\n\nCart widget is displayed.")
+            if tool_name == "get_restaurant_menu":
+                return full_menu
+            raise AssertionError(tool_name)
+
+        chosen = [{"item_name": "Veg Stir Fried Udon Noodles", "menu_item_id": "157423586",
+                   "restaurant_id": "996967", "restaurant_name": "Mister Edamame"}]
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync):
+            result = cart_agent_node(self._state_with_brief(
+                CartAgent.CART_ADD_MORE_VALUE, chosen=chosen,
+                cart_state={"status": "text",
+                            "message": "Items (1):\n  - Veg Stir Fried Udon Noodles — ₹284 (ID: 157423586)"},
+            ))
+
+        self.assertEqual(result["messages"][0].name, "recommendation_agent")
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        for addon_item in ("Manchow Soup", "Sichuan Hot & Sour Soup", "Burmese Khao Suey", "Fiery Avocado Roll"):
+            self.assertNotIn(addon_item, names, f"{addon_item!r} needs a variant/add-on choice Cravr can't supply")
+        self.assertEqual(names, ["Stuffed Mushroom In Thai Sauce"])
+
+    def test_add_more_reports_nothing_left_when_every_remaining_item_needs_customization(self):
+        full_menu = (
+            "## Gourmet Soups\n"
+            "- Manchow Soup — ₹399 | Veg, has addons (ID: 156291316)\n"
+            "## Mains\n"
+            "- Veg Stir Fried Udon Noodles — ₹409 | Veg (ID: 157423586)\n"
+        )
+
+        def fake_call_tool_sync(tool_name, arguments):
+            if tool_name == "get_food_cart":
+                return ("Items (1):\n  - Veg Stir Fried Udon Noodles — ₹284 (ID: 157423586)"
+                        "\n\nTO PAY: ₹426\n\nCart widget is displayed.")
+            if tool_name == "get_restaurant_menu":
+                return full_menu
+            raise AssertionError(tool_name)
+
+        chosen = [{"item_name": "Veg Stir Fried Udon Noodles", "menu_item_id": "157423586",
+                   "restaurant_id": "996967", "restaurant_name": "Mister Edamame"}]
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync):
+            result = cart_agent_node(self._state_with_brief(
+                CartAgent.CART_ADD_MORE_VALUE, chosen=chosen,
+                cart_state={"status": "text",
+                            "message": "Items (1):\n  - Veg Stir Fried Udon Noodles — ₹284 (ID: 157423586)"},
+            ))
+
+        self.assertNotEqual(result["messages"][0].name, "recommendation_agent")
+        self.assertIn("everything worth adding", result["messages"][0].content)
 
     def test_add_more_with_no_restaurant_in_context_fails_gracefully(self):
         with patch("cravr.food_mcp.get_cart") as mock_get_cart:

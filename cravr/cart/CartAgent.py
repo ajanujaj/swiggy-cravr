@@ -157,6 +157,25 @@ def _menu_bucket(category_text: str) -> str:
     return "main"
 
 
+def _requires_customization(tags: str) -> bool:
+    """True if get_restaurant_menu flagged this item "has addons"/"has
+    variants" (food_mcp._parse_menu_items folds that straight into the
+    item's `tags` field). Confirmed via a live CRAVR_DEBUG log for
+    restaurant "Mister Edamame": suggesting "Manchow Soup" and "Sichuan
+    Hot & Sour Soup" (both tagged "has addons") and picking either one made
+    the real update_food_cart respond 'Cart updated.\nCart is empty.' --
+    the WHOLE merged cart update was rejected, not just that one item --
+    while the same restaurant's addon-free items (e.g. the cart's own
+    "Veg Stir Fried Udon Noodles") added fine. Matches the residual risk
+    flagged in food_mcp.update_cart's docstring: Cravr has no UI to
+    capture a required variant/add-on choice, so these items are excluded
+    from "add more" suggestions entirely -- not just deprioritised --
+    rather than let Cravr silently fail the add and then lie to the user
+    that it worked."""
+    haystack = (tags or "").lower()
+    return "has addons" in haystack or "has variants" in haystack
+
+
 def _suggest_complementary_items(
     menu_items: list[dict[str, Any]],
     cart_item_id: str | None,
@@ -170,13 +189,23 @@ def _suggest_complementary_items(
     info, see food_mcp._parse_search_menu_items), then prefer OTHER
     buckets per `_COMPLEMENT_ORDER`. Tops up with whatever's left (any
     bucket) if the preferred ones don't reach `limit` -- a preference, not
-    a hard filter, so "add more" never comes back emptier than it has to."""
+    a hard filter, so "add more" never comes back emptier than it has to.
+    Items needing a variant/add-on choice ARE hard-filtered out first
+    (see _requires_customization) -- unlike the bucket preference, that
+    one is not negotiable, since Cravr can't supply the required choice
+    and a bare add silently fails against the real API."""
     by_id = {str(i.get("menu_item_id")): i for i in menu_items if i.get("menu_item_id")}
     cart_item = by_id.get(str(cart_item_id)) if cart_item_id else None
     cart_bucket = _menu_bucket((cart_item or {}).get("tags") or "")
     preferred_buckets = _COMPLEMENT_ORDER.get(cart_bucket, ["drink", "dessert", "side"])
 
-    candidates = [i for i in menu_items if str(i.get("menu_item_id")) not in exclude_ids]
+    # Hard exclusion, not a bucket preference: an item needing a variant/
+    # add-on choice must never be suggested -- see _requires_customization.
+    candidates = [
+        i for i in menu_items
+        if str(i.get("menu_item_id")) not in exclude_ids
+        and not _requires_customization(i.get("tags") or "")
+    ]
     bucketed: dict[str, list[dict[str, Any]]] = {}
     for item in candidates:
         bucketed.setdefault(_menu_bucket(item.get("tags") or ""), []).append(item)
@@ -292,6 +321,26 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
     )
     if not menu_item_id or not restaurant_id:
         content = "I don't have enough details on that dish to add it to your cart -- try searching again."
+        return _cart_reply(f"{lead_in} {content}".strip())
+
+    # Live evidence (3 separate real CRAVR_DEBUG occurrences, 2 restaurants:
+    # Jamie Oliver Kitchen's "Mediterranean Veg Pizza [11 inches]", Mister
+    # Edamame's "Manchow Soup" and "Sichuan Hot & Sour Soup" -- all tagged
+    # "has addons"/"has variants" in search_menu/get_restaurant_menu's own
+    # `tags` text): merging a has-addons/has-variants item into a
+    # non-empty cart made the real update_food_cart respond
+    # 'Cart updated.\nCart is empty.' -- the WHOLE update rejected, not
+    # just that item -- and Cravr then falsely told the user it worked.
+    # Cravr has no UI to collect the required variant/add-on choice, so
+    # refuse before sending rather than attempt-and-lie. (Only checked for
+    # the item being ADDED here -- an item already sitting in the real
+    # cart already went through Swiggy's own validation once and doesn't
+    # need re-checking.)
+    if _requires_customization(dish.get("tags") or ""):
+        content = (
+            f"{dish.get('item_name', 'That item')} needs a variant/add-on choice I can't set for you yet, "
+            "so I haven't added it -- pick something else, or add it with add-ons directly in the Swiggy app."
+        )
         return _cart_reply(f"{lead_in} {content}".strip())
 
     # Swiggy's update_food_cart is documented as additive ("Add items to
