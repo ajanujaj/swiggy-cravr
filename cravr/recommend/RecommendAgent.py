@@ -10,7 +10,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from .. import food_mcp
-from ..cart.CartAgent import add_dish_to_cart
+from ..cart.CartAgent import add_dish_to_cart, _current_restaurant_id, _current_restaurant_name
 from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
@@ -614,12 +614,18 @@ def _reply(content: str, **rec_state: Any) -> dict:
     }
 
 
-def _reply_with_pick(chosen: dict[str, Any], address_id: str | None, **rec_state: Any) -> dict:
+def _reply_with_pick(
+    chosen: dict[str, Any], address_id: str | None, state: CravrState | None = None, **rec_state: Any
+) -> dict:
     """Terminal "user picked a dish" reply. Auto-adds it to the real cart --
     picking isn't spending money (place_food_order's hard confirmation gate
     is where that risk actually lives), so no extra ask here, just add and
     show the cart. Goes through cart.CartAgent.add_dish_to_cart so this and
-    "add it to cart" share one code path.
+    "add it to cart" share one code path. `state`, when the caller has it,
+    lets add_dish_to_cart catch a cross-restaurant add before it reaches
+    the real API -- live evidence: merging an item from a different
+    restaurant into a non-empty cart made update_food_cart wipe the whole
+    cart rather than just fail to add the new item.
     """
     lead_in = f"Great — {_describe(chosen)} it is."
     if not address_id:
@@ -627,7 +633,12 @@ def _reply_with_pick(chosen: dict[str, Any], address_id: str | None, **rec_state
             f"{lead_in} I don't have a delivery address yet, so I couldn't add it to your cart.",
             **rec_state,
         )
-    result = add_dish_to_cart(chosen, address_id, lead_in=lead_in)
+    known_restaurant_id = _current_restaurant_id(state) if state is not None else None
+    known_restaurant_name = _current_restaurant_name(state) if state is not None else None
+    result = add_dish_to_cart(
+        chosen, address_id, lead_in=lead_in,
+        known_restaurant_id=known_restaurant_id, known_restaurant_name=known_restaurant_name,
+    )
     result["recommendation_state"] = rec_state
     return result
 
@@ -690,7 +701,7 @@ def recommendation_agent_node(state: CravrState) -> dict:
         if chosen:
             debug("recommendation_agent", f"user chose {chosen.get('item_name')!r}")
             return _reply_with_pick(
-                chosen, address_id,
+                chosen, address_id, state=state,
                 awaiting_feedback=False, satisfied=True, last_recommendations=[chosen],
             )
 
@@ -721,7 +732,7 @@ def recommendation_agent_node(state: CravrState) -> dict:
         if _looks_like_acceptance(user_input):
             if len(offered) == 1:
                 return _reply_with_pick(
-                    offered[0], address_id,
+                    offered[0], address_id, state=state,
                     awaiting_feedback=False, satisfied=True, last_recommendations=offered,
                 )
             # Ambiguous against a list of three -- don't guess which one.

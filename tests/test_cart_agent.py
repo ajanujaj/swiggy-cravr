@@ -411,13 +411,20 @@ class RealTextResponseRegressionTests(unittest.TestCase):
 
         with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
              patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update:
-            result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="")
+            # A non-empty lead_in mirrors RecommendAgent._reply_with_pick's
+            # "Great -- X it is." -- it must be dropped, not prefixed, or
+            # the reply contradicts itself (confirmed live: see CartAgent).
+            result = CartAgent.add_dish_to_cart(
+                dish, "addr1", quantity=1,
+                lead_in="Great — Mediterranean Veg Pizza [11 inches] from Jamie Oliver Kitchen (₹699.0) it is.",
+            )
 
         mock_get_cart.assert_not_called()
         mock_update.assert_not_called()
         content = result["messages"][0].content
         self.assertIn("Mediterranean Veg Pizza [11 inches]", content)
         self.assertIn("add-on", content)
+        self.assertNotIn("Great —", content, "a success lead-in must not precede a refusal")
 
     def test_add_dish_to_cart_refuses_items_with_variant_choices_too(self):
         dish = {"item_name": "Fiery Avocado Roll", "menu_item_id": "157423529",
@@ -429,6 +436,78 @@ class RealTextResponseRegressionTests(unittest.TestCase):
 
         mock_update.assert_not_called()
         self.assertIn("Fiery Avocado Roll", result["messages"][0].content)
+
+
+    def test_add_dish_to_cart_refuses_a_different_restaurant_than_the_known_cart(self):
+        """Real-world regression: adding a Domino's Pizza item while the
+        cart already held a Mister Edamame item (neither tagged
+        has-addons/has-variants) made the real update_food_cart respond
+        'Cart updated.\nCart is empty.' -- and unlike the addon failures,
+        the follow-up get_food_cart showed the cart fully wiped
+        (status='empty' item_count=0), not just the new item missing.
+        Swiggy carts are single-restaurant; must refuse before sending."""
+        dish = {"item_name": "Rich molten cheddar & cheesy melt", "menu_item_id": "208239838",
+                "restaurant_id": "879984", "restaurant_name": "Domino's Pizza"}
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update:
+            result = CartAgent.add_dish_to_cart(
+                dish, "addr1", quantity=1,
+                lead_in="Great — Rich molten cheddar & cheesy melt from Domino's Pizza (₹699.0) it is.",
+                known_restaurant_id="996967", known_restaurant_name="Mister Edamame",
+            )
+
+        mock_get_cart.assert_not_called()
+        mock_update.assert_not_called()
+        content = result["messages"][0].content
+        self.assertIn("Mister Edamame", content)
+        self.assertIn("Domino's Pizza", content)
+        self.assertNotIn("Great —", content, "a success lead-in must not precede a refusal")
+
+    def test_add_dish_to_cart_proceeds_when_known_restaurant_matches(self):
+        """Same-restaurant adds must not trip the new guard -- this is the
+        ordinary "add a second item" path the guard must not break."""
+        dish = {"item_name": "All Fungi Pizza", "menu_item_id": "179082813",
+                "restaurant_id": "351682", "restaurant_name": "Timpano - The Pasta Shop"}
+        existing_cart_text = (
+            "Items (1):\n  - Italian Meat Lover Pizza — ₹260 (ID: 179082816)\n\nTO PAY: ₹398"
+        )
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "text", "message": existing_cart_text}), \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart",
+                   return_value={"status": "success", "message": "Cart updated."}) as mock_update:
+            result = CartAgent.add_dish_to_cart(
+                dish, "addr1", quantity=1,
+                known_restaurant_id="351682", known_restaurant_name="Timpano - The Pasta Shop",
+            )
+
+        mock_update.assert_called_once()
+        self.assertNotIn("Swiggy carts can only hold", result["messages"][0].content)
+
+    def test_add_dish_to_cart_records_the_restaurant_it_just_used(self):
+        """get_food_cart's real (text-mode) response never fills in
+        `restaurant` (food_mcp.get_cart hardcodes it to None off that
+        path), so without this the cross-restaurant guard would have
+        nothing to compare against on the NEXT add. A successful add must
+        record what it used so _current_restaurant_id/_name can see it."""
+        dish = {"item_name": "Bowl", "menu_item_id": "111", "restaurant_id": "R1",
+                "restaurant_name": "Healthy Eats"}
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "text", "message": "Items (1):\n  - Bowl — ₹200 (ID: 111)\n\nTO PAY: ₹200"}), \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart",
+                   return_value={"status": "success", "message": "Cart updated."}):
+            result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1)
+
+        self.assertEqual(
+            result["cart_state"]["restaurant"], {"id": "R1", "name": "Healthy Eats"},
+        )
+
+    def test_current_restaurant_helpers_read_the_recorded_restaurant(self):
+        state = _state("view", cart_state={"status": "text", "restaurant": {"id": "R1", "name": "Healthy Eats"}})
+        self.assertEqual(CartAgent._current_restaurant_id(state), "R1")
+        self.assertEqual(CartAgent._current_restaurant_name(state), "Healthy Eats")
 
 
 class CartNextStepTests(unittest.TestCase):

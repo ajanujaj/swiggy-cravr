@@ -306,7 +306,10 @@ def _current_restaurant_name(state: CravrState) -> str | None:
     return None
 
 
-def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, lead_in: str = "") -> dict:
+def add_dish_to_cart(
+    dish: dict[str, Any], address_id: str, quantity: int = 1, lead_in: str = "",
+    known_restaurant_id: str | None = None, known_restaurant_name: str | None = None,
+) -> dict:
     """Add one dish via update_cart, then show the result via get_cart.
     Single call site for "how a dish gets added" -- used by both this
     node's own "add" action and RecommendAgent's pick-to-cart handoff, so
@@ -336,12 +339,42 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
     # the item being ADDED here -- an item already sitting in the real
     # cart already went through Swiggy's own validation once and doesn't
     # need re-checking.)
+    # Live evidence (Domino's Pizza item added while the cart already held
+    # a Mister Edamame item, addon-free on both sides): merging an item
+    # from a DIFFERENT restaurant into a non-empty cart made the real
+    # update_food_cart respond 'Cart updated.\nCart is empty.' -- and this
+    # time it didn't just fail to add the new item, it wiped the
+    # PRE-EXISTING item too (get_food_cart afterward showed status='empty'
+    # item_count=0). Swiggy carts are single-restaurant; refuse before
+    # sending rather than risk destroying what's already there.
+    if (
+        known_restaurant_id
+        and str(known_restaurant_id) != str(restaurant_id)
+    ):
+        existing_name = known_restaurant_name or "your current restaurant"
+        content = (
+            f"Your cart already has items from {existing_name}, and Swiggy carts can only hold one "
+            f"restaurant at a time -- so I haven't added {dish.get('item_name', 'that item')} from "
+            f"{dish.get('restaurant_name') or 'this restaurant'}. Use \"Browse other restaurants\" from "
+            "your cart to clear it and start fresh here, or pick something from your current restaurant instead."
+        )
+        # Same lesson as the addon guard below: lead_in assumes success
+        # ("Great -- X it is."), so it is dropped rather than prefixed.
+        return _cart_reply(content)
+
     if _requires_customization(dish.get("tags") or ""):
+        # Deliberately drop `lead_in` here, not prefix it -- callers build
+        # it assuming a successful add (RecommendAgent._reply_with_pick:
+        # "Great -- X it is."), and prefixing that onto a refusal produced
+        # a self-contradicting reply confirmed live: "Great -- The Veggie
+        # Melt Pizza from Captain Grub (Rs675.0) it is. The Veggie Melt
+        # Pizza needs a variant/add-on choice I can't set for you yet, so
+        # I haven't added it..." -- say plainly it wasn't added instead.
         content = (
             f"{dish.get('item_name', 'That item')} needs a variant/add-on choice I can't set for you yet, "
-            "so I haven't added it -- pick something else, or add it with add-ons directly in the Swiggy app."
+            "so I haven't added it to your cart -- pick something else, or add it with add-ons directly in the Swiggy app."
         )
-        return _cart_reply(f"{lead_in} {content}".strip())
+        return _cart_reply(content)
 
     # Swiggy's update_food_cart is documented as additive ("Add items to
     # cart"), but a live run showed the opposite: two consecutive calls
@@ -401,7 +434,19 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
         prefix = f"{lead_in} {update_message}".strip()
     else:
         prefix = lead_in
-    return _show_cart_with_next_steps(address_id, lead_in=prefix)
+    outcome = _show_cart_with_next_steps(address_id, lead_in=prefix)
+    # get_cart's real (text-mode) response never fills in `restaurant`
+    # (food_mcp.get_cart hardcodes it to None off that path), so the
+    # cross-restaurant guard above would never have anything to compare
+    # against on the NEXT add unless we record it ourselves here, on our
+    # own successful add.
+    cart_state = outcome.get("cart_state") or {}
+    if cart_state.get("status") in ("text", "success"):
+        outcome["cart_state"] = {
+            **cart_state,
+            "restaurant": {"id": restaurant_id, "name": dish.get("restaurant_name")},
+        }
+    return outcome
 
 
 def _offer_dishes(lead_in: str, batch: list[dict[str, Any]], filters: dict[str, Any]) -> dict:
@@ -544,7 +589,11 @@ def cart_agent_node(state: CravrState) -> dict:
         debug("cart_agent", f"add requested, {len(chosen)} dish(es) in last_recommendations")
         if len(chosen) != 1:
             return _cart_reply("Which dish should I add? Pick one from the options first.")
-        return add_dish_to_cart(chosen[0], address_id, quantity=arg or 1)
+        return add_dish_to_cart(
+            chosen[0], address_id, quantity=arg or 1,
+            known_restaurant_id=_current_restaurant_id(state),
+            known_restaurant_name=_current_restaurant_name(state),
+        )
 
     if action == "suggest_more":
         return _suggest_more_from_restaurant(state, address_id)
