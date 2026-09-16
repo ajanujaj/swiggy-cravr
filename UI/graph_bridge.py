@@ -79,6 +79,13 @@ async def process_result(result: dict[str, Any] | None) -> None:
         rec_state = result.get("recommendation_state") or {}
         dishes = rec_state.get("last_recommendations") or None
         options = rec_state.get("options") or None
+    elif source == "cart_agent":
+        # The post-add "what next" buttons (add more / proceed / browse
+        # other restaurants) -- cart_agent's own dish-offer replies (e.g.
+        # "add more from this restaurant") instead carry
+        # name="recommendation_agent" so they render through the branch
+        # above, same as a normal recommendation list.
+        options = (result.get("cart_state") or {}).get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
 

@@ -55,18 +55,60 @@ _CART_LINE_RE = re.compile(
     re.MULTILINE,
 )
 
+# Sentinels for the post-add "what next" buttons -- same convention as
+# cravr.options.OTHER_VALUE (a fixed, unmistakable value a tap always
+# sends, independent of the button's display label).
+CART_ADD_MORE_VALUE = "__cart_add_more__"
+CART_PROCEED_VALUE = "__cart_proceed__"
+CART_START_OVER_VALUE = "__cart_start_over__"
+_NEXT_STEP_SENTINELS = {CART_ADD_MORE_VALUE, CART_PROCEED_VALUE, CART_START_OVER_VALUE}
+
+_NEXT_STEP_OPTIONS = [
+    {"value": CART_ADD_MORE_VALUE, "label": "Add more from this restaurant"},
+    {"value": CART_PROCEED_VALUE, "label": "Proceed"},
+    {"value": CART_START_OVER_VALUE, "label": "Browse other restaurants"},
+]
+
+# Menu category header text -> a coarse bucket, for pairing "add more"
+# suggestions with what's already in the cart. Matched against
+# get_restaurant_menu's "## Category" headers (see food_mcp._parse_menu_items'
+# `tags` field), not free text -- a smaller, more literal vocabulary than
+# RecommendAgent's intent-parsing cues is enough for menu section names.
+_DRINK_CUES = ("beverage", "drink", "juice", "shake", "lassi", "soda", "mocktail", "smoothie")
+_DESSERT_CUES = ("dessert", "sweet", "ice cream", "cake", "pastry", "pudding")
+_SIDE_CUES = ("side", "starter", "appetizer", "appetiser", "snack", "add-on", "addon")
+
+# Which buckets to prefer suggesting, given what's already in the cart --
+# a main course pairs with a drink/dessert/side, not five more mains.
+_COMPLEMENT_ORDER = {
+    "main": ["drink", "dessert", "side"],
+    "side": ["main", "drink"],
+    "drink": ["main", "dessert"],
+    "dessert": ["main", "drink"],
+}
+
 
 def is_cart_request(text: str) -> bool:
     """Entry-router gate (graph.py) -- only messages with a strong cart/
     coupon signal get routed here at all. Also catches a bare "apply
     SAVE20"/"use FREESHIP" with no "coupon"/"cart" word in it, since
-    `_classify_cart_action` supports that phrasing too."""
+    `_classify_cart_action` supports that phrasing too. The post-add "what
+    next" buttons send an exact sentinel (see `_NEXT_STEP_SENTINELS`) that
+    wouldn't otherwise match any of the natural-language patterns below."""
     t = (text or "").strip()
+    if t in _NEXT_STEP_SENTINELS:
+        return True
     return bool(_CART_TOPIC_RE.search(t) or _COUPON_APPLY_RE.search(t))
 
 
 def _classify_cart_action(text: str) -> tuple[str, Any]:
     t = (text or "").strip()
+    if t == CART_ADD_MORE_VALUE:
+        return "suggest_more", None
+    if t == CART_PROCEED_VALUE:
+        return "proceed_placeholder", None
+    if t == CART_START_OVER_VALUE:
+        return "start_over", None
     if _CLEAR_RE.search(t):
         return "clear", None
     coupon_match = _COUPON_APPLY_RE.search(t)
@@ -97,6 +139,63 @@ def _parse_existing_cart_items(cart_message: str) -> list[dict[str, Any]]:
             "quantity": int(match.group("qty")) if match.group("qty") else 1,
         })
     return items
+
+
+def _menu_bucket(category_text: str) -> str:
+    """Coarse bucket (main/side/drink/dessert) for one menu item's category
+    text, via _DRINK_CUES/_DESSERT_CUES/_SIDE_CUES. Defaults to "main" --
+    that's the safe default for an uncategorised or genuinely-main item,
+    and also what makes an empty/unknown bucket fall back to suggesting
+    drinks/desserts/sides rather than more unclassified items."""
+    haystack = (category_text or "").lower()
+    if any(cue in haystack for cue in _DRINK_CUES):
+        return "drink"
+    if any(cue in haystack for cue in _DESSERT_CUES):
+        return "dessert"
+    if any(cue in haystack for cue in _SIDE_CUES):
+        return "side"
+    return "main"
+
+
+def _suggest_complementary_items(
+    menu_items: list[dict[str, Any]],
+    cart_item_id: str | None,
+    exclude_ids: set[str],
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Up to `limit` items from `menu_items` that pair with what's already
+    in the cart: look up the cart item's own bucket from the freshly
+    fetched menu (its category header is the only reliable source -- the
+    dish record captured when it was originally picked has no category
+    info, see food_mcp._parse_search_menu_items), then prefer OTHER
+    buckets per `_COMPLEMENT_ORDER`. Tops up with whatever's left (any
+    bucket) if the preferred ones don't reach `limit` -- a preference, not
+    a hard filter, so "add more" never comes back emptier than it has to."""
+    by_id = {str(i.get("menu_item_id")): i for i in menu_items if i.get("menu_item_id")}
+    cart_item = by_id.get(str(cart_item_id)) if cart_item_id else None
+    cart_bucket = _menu_bucket((cart_item or {}).get("tags") or "")
+    preferred_buckets = _COMPLEMENT_ORDER.get(cart_bucket, ["drink", "dessert", "side"])
+
+    candidates = [i for i in menu_items if str(i.get("menu_item_id")) not in exclude_ids]
+    bucketed: dict[str, list[dict[str, Any]]] = {}
+    for item in candidates:
+        bucketed.setdefault(_menu_bucket(item.get("tags") or ""), []).append(item)
+
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _take(items: list[dict[str, Any]]) -> None:
+        for item in items:
+            item_id = str(item.get("menu_item_id"))
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            ordered.append(item)
+
+    for bucket in preferred_buckets:
+        _take(bucketed.get(bucket, []))
+    _take(candidates)
+    return ordered[:limit]
 
 
 def _cart_reply(content: str, **cart_state: Any) -> dict:
@@ -138,6 +237,21 @@ def _show_cart(address_id: str, lead_in: str = "") -> dict:
     return _cart_reply(content, **cart)
 
 
+def _show_cart_with_next_steps(address_id: str, lead_in: str = "") -> dict:
+    """`_show_cart`, plus the "what next" buttons (add more / proceed /
+    browse other restaurants) whenever the cart actually has something in
+    it -- attached after the fact rather than threading an `options` param
+    through every `_show_cart` caller, so the buttons show up everywhere
+    the cart does (every add, "show my cart", after applying a coupon),
+    per the design: offer them any time the cart is displayed, not just
+    right after the first add."""
+    result = _show_cart(address_id, lead_in=lead_in)
+    cart_state = result.get("cart_state") or {}
+    if cart_state.get("status") in ("text", "success"):
+        result["cart_state"] = {**cart_state, "options": _NEXT_STEP_OPTIONS}
+    return result
+
+
 def _current_restaurant_id(state: CravrState) -> str | None:
     """Cart is single-restaurant on Swiggy -- prefer whatever's already in
     the cart, else fall back to a just-picked dish's restaurant."""
@@ -148,6 +262,18 @@ def _current_restaurant_id(state: CravrState) -> str | None:
     chosen = (state.get("recommendation_state") or {}).get("last_recommendations") or []
     if len(chosen) == 1:
         return chosen[0].get("restaurant_id")
+    return None
+
+
+def _current_restaurant_name(state: CravrState) -> str | None:
+    """Same fallback chain as `_current_restaurant_id`, for the name."""
+    cart_state = state.get("cart_state") or {}
+    restaurant = cart_state.get("restaurant") or {}
+    if isinstance(restaurant, dict) and restaurant.get("name"):
+        return restaurant.get("name")
+    chosen = (state.get("recommendation_state") or {}).get("last_recommendations") or []
+    if len(chosen) == 1:
+        return chosen[0].get("restaurant_name")
     return None
 
 
@@ -226,7 +352,97 @@ def add_dish_to_cart(dish: dict[str, Any], address_id: str, quantity: int = 1, l
         prefix = f"{lead_in} {update_message}".strip()
     else:
         prefix = lead_in
-    return _show_cart(address_id, lead_in=prefix)
+    return _show_cart_with_next_steps(address_id, lead_in=prefix)
+
+
+def _offer_dishes(lead_in: str, batch: list[dict[str, Any]], filters: dict[str, Any]) -> dict:
+    """Hand a dish batch off through the SAME "offer -> pick -> add to
+    cart" machinery RecommendAgent already uses, instead of building a
+    parallel one here: `name="recommendation_agent"` on the reply message
+    is what makes graph_bridge.py render it exactly like a normal
+    recommendation (card view or the consolidated list+buttons, depending
+    on count -- see UI/components.py), and setting `recommendation_state`
+    the same way `_reply(...)` does is what makes next turn's bare-digit
+    reply resolve as a pick via `is_pure_feedback` -> `_resolve_choice` ->
+    `_reply_with_pick` -> `add_dish_to_cart`, with zero new state-tracking
+    code. Deferred import: RecommendAgent imports `add_dish_to_cart` from
+    this module at load time, so importing back at module scope would be
+    circular -- safe here since both modules are fully loaded by the time
+    any node actually runs."""
+    from ..recommend.RecommendAgent import ONLY_MATCH_OPTIONS, _build_recommendation_text, _dish_pick_options
+
+    body = _build_recommendation_text(batch)
+    content = f"{lead_in}\n{body}".strip() if lead_in else body
+    options = ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch)
+    return {
+        "recommendation_state": {
+            "last_recommendations": batch,
+            "alternates": [],
+            "filters": filters,
+            "awaiting_feedback": True,
+            "satisfied": False,
+            "options": options,
+        },
+        "messages": [AIMessage(content=content, name="recommendation_agent")],
+    }
+
+
+def _suggest_more_from_restaurant(state: CravrState, address_id: str) -> dict:
+    """Option (a): pull more items from the SAME restaurant, preferring
+    ones that pair with what's already in the cart (see
+    `_suggest_complementary_items`)."""
+    restaurant_id = _current_restaurant_id(state)
+    if not restaurant_id:
+        return _cart_reply("I've lost track of which restaurant your cart is from -- try viewing your cart first.")
+
+    cart = food_mcp.get_cart(address_id)
+    existing_items = _parse_existing_cart_items(cart.get("message") or "")
+    existing_ids = {str(item["menu_item_id"]) for item in existing_items}
+    cart_item_id = existing_items[0]["menu_item_id"] if existing_items else None
+
+    restaurant_name = _current_restaurant_name(state) or ""
+    menu_items = food_mcp.get_restaurant_menu_items(restaurant_id, address_id, restaurant_name)
+    debug(
+        "cart_agent",
+        f"suggest_more: restaurant_id={restaurant_id!r} menu_items={len(menu_items)} "
+        f"existing_ids={existing_ids!r} cart_item_id={cart_item_id!r}",
+    )
+    if not menu_items:
+        return _cart_reply("Couldn't load that restaurant's menu right now -- try again in a moment.")
+
+    suggestions = _suggest_complementary_items(menu_items, cart_item_id, existing_ids, limit=5)
+    if not suggestions:
+        return _cart_reply("Looks like you've already got everything worth adding from this restaurant!")
+
+    filters = dict((state.get("recommendation_state") or {}).get("filters") or {})
+    return _offer_dishes("Goes well with what's in your cart:", suggestions, filters)
+
+
+def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
+    """Option (c): clear the cart and re-search the same craving/category,
+    excluding the restaurant just cleared."""
+    restaurant_id = _current_restaurant_id(state)
+
+    flush_result = food_mcp.flush_cart()
+    debug("cart_agent", f"start_over: flush_cart -> {flush_result!r}")
+    if flush_result.get("status") != "success":
+        return _cart_reply(f"Couldn't clear the cart: {flush_result.get('message', 'unknown error')}")
+
+    brief = state.get("recommendation_brief") or {}
+    if not brief:
+        return _cart_reply("Cart's cleared. Tell me what you're craving and I'll find some other restaurants.")
+
+    from ..recommend.RecommendAgent import fetch_recommendations  # deferred -- see _offer_dishes
+
+    exclude = {str(restaurant_id)} if restaurant_id else set()
+    filters = dict(brief.get("filters") or {})
+    ranked = fetch_recommendations(brief, address_id=address_id, exclude_restaurant_ids=exclude)
+    if not ranked:
+        return _cart_reply(
+            "Cart's cleared, but I couldn't find another restaurant with the same kind of food "
+            "right now -- tell me what to change and I'll look again."
+        )
+    return _offer_dishes("Cart's cleared. Other restaurants with what you were after:", ranked, filters)
 
 
 def cart_agent_node(state: CravrState) -> dict:
@@ -257,7 +473,7 @@ def cart_agent_node(state: CravrState) -> dict:
         debug("cart_agent", f"apply_coupon({arg!r}) -> {result!r}")
         if result.get("status") != "success":
             return _cart_reply(f"Couldn't apply that coupon: {result.get('message', 'unknown error')}")
-        return _show_cart(address_id, lead_in=result.get("message") or "Coupon applied.")
+        return _show_cart_with_next_steps(address_id, lead_in=result.get("message") or "Coupon applied.")
 
     if action == "coupons":
         restaurant_id = _current_restaurant_id(state)
@@ -281,4 +497,19 @@ def cart_agent_node(state: CravrState) -> dict:
             return _cart_reply("Which dish should I add? Pick one from the options first.")
         return add_dish_to_cart(chosen[0], address_id, quantity=arg or 1)
 
-    return _show_cart(address_id)
+    if action == "suggest_more":
+        return _suggest_more_from_restaurant(state, address_id)
+
+    if action == "proceed_placeholder":
+        # Sub-phase 2 (place_food_order) isn't built yet -- this is
+        # intentionally just a stub reply for now.
+        return _show_cart_with_next_steps(
+            address_id,
+            lead_in="Checkout isn't wired up yet -- that's next on the list. "
+                    "For now you can keep adding items or browse other restaurants.",
+        )
+
+    if action == "start_over":
+        return _start_over_new_restaurant(state, address_id)
+
+    return _show_cart_with_next_steps(address_id)

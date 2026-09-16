@@ -475,13 +475,19 @@ def _call_recommendation_tool(filters: dict[str, Any], address_id: str | None = 
     return _unwrap_tool_result(result)
 
 
-def fetch_recommendations(brief: dict[str, Any], address_id: str | None = None) -> list[dict[str, Any]]:
+def fetch_recommendations(
+    brief: dict[str, Any], address_id: str | None = None, exclude_restaurant_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """Call the MCP recommendation tool, relaxing filters until something
     matches. Takes only the frozen brief from decision_agent, plus the
-    address already resolved by context_agent."""
+    address already resolved by context_agent. `exclude_restaurant_ids` is
+    for cart_agent's "browse other restaurants" -- drop whatever's already
+    in (or was just cleared from) the cart so it can't reappear as its own
+    suggestion."""
     brief = _coerce_profile(brief)
     filters = dict(brief.get("filters") or {})
     history = _coerce_profile(brief.get("history"))
+    exclude_ids = {str(r) for r in (exclude_restaurant_ids or ())}
     debug("recommendation_agent", f"brief summary={brief.get('summary')!r}")
     debug("recommendation_agent", f"strict filters={filters} history={history}")
 
@@ -491,6 +497,10 @@ def fetch_recommendations(brief: dict[str, Any], address_id: str | None = None) 
 
     for attempt, variant in enumerate(_filter_variants(filters), start=1):
         recommendations = _call_recommendation_tool(variant, address_id=address_id)
+        if exclude_ids:
+            recommendations = [
+                r for r in recommendations if str(r.get("restaurant_id")) not in exclude_ids
+            ]
         debug("recommendation_agent", f"attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
             ranked = _rank_candidates(

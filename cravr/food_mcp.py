@@ -376,6 +376,40 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
     return dishes
 
 
+def get_restaurant_menu_items(
+    restaurant_id: str, address_id: str | None, restaurant_name: str = ""
+) -> list[dict[str, Any]]:
+    """get_restaurant_menu for ONE already-known restaurant -- e.g. the one
+    already in the cart, when cart_agent wants to suggest more from it.
+    Unlike `search_dishes`, which loops over several restaurants from a
+    fresh search, this fetches exactly one restaurant's full menu. Reuses
+    `_parse_menu_items`, the same text parser `search_dishes` already
+    relies on for get_restaurant_menu, so category/tags attribution
+    (## / ### headers) is identical -- that's what lets a caller work out
+    which items are mains vs. sides vs. drinks vs. desserts.
+    """
+    arguments: dict[str, Any] = {"restaurantId": restaurant_id, "addressId": address_id}
+    try:
+        raw = _unwrap(call_tool_sync("get_restaurant_menu", arguments))
+    except Exception as exc:
+        debug("food_mcp", f"get_restaurant_menu FAILED for {restaurant_id}: {exc}")
+        return []
+
+    if isinstance(raw, str):
+        raw = _IMAGE_REF_RE.sub("", raw)
+    debug("food_mcp", f"raw get_restaurant_menu response for {restaurant_id}: {raw!r}")
+
+    if isinstance(raw, str):
+        return _parse_menu_items(raw, restaurant_name, "", restaurant_id)
+    if isinstance(raw, dict):
+        raw_items = raw.get("items") if isinstance(raw.get("items"), list) else []
+        return [
+            _normalize_item(item, restaurant_name, "", restaurant_id)
+            for item in raw_items if isinstance(item, dict)
+        ]
+    return []
+
+
 def _normalize_item(
     item: dict[str, Any], restaurant_name: str, restaurant_cuisine: Any, restaurant_id: str | None = None
 ) -> dict[str, Any]:

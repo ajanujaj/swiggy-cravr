@@ -394,5 +394,142 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         self.assertEqual(sent_cart_items, [{"menu_item_id": "179082816", "quantity": 2}])
 
 
+class CartNextStepTests(unittest.TestCase):
+    """The post-add "what next" buttons: add more from this restaurant /
+    proceed (placeholder) / browse other restaurants -- offered any time a
+    non-empty cart is shown (Anuj's answer), and the sentinel values they
+    send must round-trip through is_cart_request/_classify_cart_action
+    without colliding with a normal pick reply."""
+
+    NON_EMPTY_CART = {"status": "text", "message": "Items (1):\n  - Bowl — ₹200 (ID: 111)\n\nTO PAY: ₹250"}
+
+    def _state_with_brief(self, text, **kwargs):
+        state = _state(text, **kwargs)
+        state["recommendation_brief"] = {"filters": {"tags": "high-protein", "craving": "Protein bowl", "course": "main"}}
+        return state
+
+    def test_sentinels_route_to_cart_and_classify_distinctly(self):
+        for value, expected_action in (
+            (CartAgent.CART_ADD_MORE_VALUE, "suggest_more"),
+            (CartAgent.CART_PROCEED_VALUE, "proceed_placeholder"),
+            (CartAgent.CART_START_OVER_VALUE, "start_over"),
+        ):
+            self.assertTrue(is_cart_request(value), value)
+            action, _ = _classify_cart_action(value)
+            self.assertEqual(action, expected_action)
+
+    def test_a_normal_pick_reply_is_not_swallowed_by_cart_routing(self):
+        """A bare digit or dish name must keep going to recommendation_agent's
+        feedback branch -- the sentinels are exact-match only."""
+        for text in ("2", "9", "the pizza", "yes"):
+            self.assertFalse(is_cart_request(text), text)
+
+    def test_viewing_a_non_empty_cart_offers_the_three_options(self):
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=self.NON_EMPTY_CART):
+            result = cart_agent_node(_state("show my cart", cart_state=self.NON_EMPTY_CART))
+        self.assertEqual(result["cart_state"].get("options"), CartAgent._NEXT_STEP_OPTIONS)
+
+    def test_an_empty_cart_does_not_offer_the_three_options(self):
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value={"status": "empty", "message": "Cart is empty."}):
+            result = cart_agent_node(_state("show my cart"))
+        self.assertNotIn("options", result["cart_state"])
+
+    def test_proceed_is_a_stub_that_still_shows_the_cart_and_buttons(self):
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=self.NON_EMPTY_CART):
+            result = cart_agent_node(_state(CartAgent.CART_PROCEED_VALUE, cart_state=self.NON_EMPTY_CART))
+        self.assertIn("isn't wired up yet", result["messages"][0].content)
+        self.assertEqual(result["cart_state"].get("options"), CartAgent._NEXT_STEP_OPTIONS)
+
+    def test_add_more_suggests_complementary_items_and_excludes_the_cart_item(self):
+        full_menu = (
+            "## Mains\n- Bowl — ₹200 | Veg (ID: 111)\n- Big Bowl — ₹250 | Veg (ID: 222)\n"
+            "## Beverages\n- Lemonade — ₹80 | Veg (ID: 333)\n"
+            "## Desserts\n- Brownie — ₹90 | Veg (ID: 444)\n"
+        )
+
+        def fake_call_tool_sync(tool_name, arguments):
+            if tool_name == "get_food_cart":
+                return "Items (1):\n  - Bowl — ₹200 (ID: 111)\n\nTO PAY: ₹250\n\nCart widget is displayed."
+            if tool_name == "get_restaurant_menu":
+                return full_menu
+            raise AssertionError(tool_name)
+
+        chosen = [{"item_name": "Bowl", "menu_item_id": "111", "restaurant_id": "R1", "restaurant_name": "Healthy Eats"}]
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync):
+            result = cart_agent_node(self._state_with_brief(
+                CartAgent.CART_ADD_MORE_VALUE, chosen=chosen,
+                cart_state={"status": "text", "message": "Items (1):\n  - Bowl — ₹200 (ID: 111)"},
+            ))
+
+        self.assertEqual(result["messages"][0].name, "recommendation_agent")
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertNotIn("Bowl", names, "the item already in the cart must never be re-suggested")
+        self.assertIn("Lemonade", names[:2])
+        self.assertIn("Brownie", names[:2])
+
+    def test_add_more_with_no_restaurant_in_context_fails_gracefully(self):
+        with patch("cravr.food_mcp.get_cart") as mock_get_cart:
+            result = cart_agent_node(_state(CartAgent.CART_ADD_MORE_VALUE, chosen=[]))
+        mock_get_cart.assert_not_called()
+        self.assertIn("lost track", result["messages"][0].content)
+
+    def test_start_over_flushes_the_cart_and_excludes_that_restaurant_from_the_new_search(self):
+        raw_results = [
+            {"item_name": "Protein Bowl v2", "menu_item_id": "555", "restaurant_id": "R1",
+             "restaurant_name": "Healthy Eats", "price_inr": 300, "course": "main", "tags": "high-protein"},
+            {"item_name": "Grain Bowl", "menu_item_id": "666", "restaurant_id": "R2",
+             "restaurant_name": "Green Table", "price_inr": 320, "course": "main", "tags": "high-protein"},
+        ]
+
+        def fake_flush(tool_name, arguments):
+            if tool_name == "flush_food_cart":
+                return "Cart cleared.\n\nCart widget is displayed."
+            raise AssertionError(tool_name)
+
+        chosen = [{"item_name": "Bowl", "menu_item_id": "111", "restaurant_id": "R1", "restaurant_name": "Healthy Eats"}]
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_flush), \
+             patch("cravr.recommend.RecommendAgent._call_recommendation_tool", return_value=raw_results):
+            result = cart_agent_node(self._state_with_brief(CartAgent.CART_START_OVER_VALUE, chosen=chosen))
+
+        self.assertEqual(result["messages"][0].name, "recommendation_agent")
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertNotIn("Protein Bowl v2", names, "must exclude the restaurant just cleared")
+        self.assertIn("Grain Bowl", names)
+
+    def test_picking_a_suggested_item_lands_in_the_cart_via_the_normal_pick_machinery(self):
+        """End-to-end: "add more" hands off to recommendation_agent's own
+        pick-resolution, so a follow-up "2" must resolve and add to cart --
+        no separate pick-tracking code to maintain."""
+        from cravr.recommend.RecommendAgent import recommendation_agent_node
+
+        suggestions_state = {
+            "last_recommendations": [
+                {"item_name": "Lemonade", "menu_item_id": "333", "restaurant_id": "R1", "restaurant_name": "Healthy Eats"},
+                {"item_name": "Brownie", "menu_item_id": "444", "restaurant_id": "R1", "restaurant_name": "Healthy Eats"},
+            ],
+            "alternates": [], "filters": {}, "awaiting_feedback": True, "satisfied": False,
+        }
+
+        def fake_call_tool_sync(tool_name, arguments):
+            if tool_name == "get_food_cart":
+                return ("Items (2):\n  - Bowl — ₹200 (ID: 111)\n  - Brownie — ₹90 (ID: 444)\n\n"
+                        "TO PAY: ₹340\n\nCart widget is displayed — do not repeat.")
+            if tool_name == "update_food_cart":
+                return ("Cart updated.\nRestaurant: Healthy Eats\nItems (2):\n"
+                        "  - Bowl — ₹200 (ID: 111)\n  - Brownie — ₹90 (ID: 444)\n\nTO PAY: ₹340\n\n"
+                        "Cart widget is displayed. Wait for the user to review and confirm.")
+            raise AssertionError(tool_name)
+
+        state = _state("2", address_id="addr1", recommendation_state=suggestions_state)
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync):
+            result = recommendation_agent_node(state)
+
+        content = result["messages"][0].content
+        self.assertIn("Brownie", content)
+        self.assertEqual(content.count("Items (2):"), 1)
+        self.assertIn("TO PAY: ₹340", content)
+        self.assertEqual(result["cart_state"].get("options"), CartAgent._NEXT_STEP_OPTIONS)
+
+
 if __name__ == "__main__":
     unittest.main()
