@@ -63,8 +63,10 @@ def build_graph():
     workflow.add_edge("recommendation_agent", END)
     workflow.add_edge("cart_agent", END)
 
-    # A checkpointer is required so intent_discovery_node can pause mid-graph (via `interrupt()`)
-    # to ask a clarifying question, then resume with just the answer instead of restarting.
+    # A checkpointer is required so intent_discovery_node and cart_agent (via
+    # add_flow._ask_for_addon_choices) can pause mid-graph (via `interrupt()`) to
+    # ask a clarifying/addon question, then resume with just the answer instead
+    # of restarting.
     return workflow.compile(checkpointer=MemorySaver())
 
 

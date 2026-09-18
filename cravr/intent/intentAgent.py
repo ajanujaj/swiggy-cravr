@@ -1,5 +1,5 @@
 """Intent Discovery agent: turns a food-ordering request into structured
-intent. Owns the graph's only `interrupt()` call -- extracts, derives, then
+intent. Owns the intent-clarification `interrupt()` loop -- extracts, derives, then
 pauses once per still-missing field (category, then a specific dish/cuisine).
 """
 
@@ -276,8 +276,9 @@ def intent_discovery_node(state: CravrState) -> dict:
     The extraction call re-runs on each resume too, harmlessly, since
     `merge_profile` only adds non-empty values.
 
-    Also the *only* place that calls `interrupt()` in the whole graph --
-    decision_agent_node never does (see `DecisionAgentNeverAsksTests`).
+    cart_agent (see cart/add_flow.py's _ask_for_addon_choices) is the only
+    other node that calls `interrupt()` -- decision_agent_node never does
+    (see `DecisionAgentNeverAsksTests`).
     """
     now = datetime.now()
 

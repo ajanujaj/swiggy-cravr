@@ -13,8 +13,9 @@ def state_with(intent_profile, user_text="Suggest something for dinner", **extra
 
 
 class DecisionAgentNeverAsksTests(unittest.TestCase):
-    """intent_discovery_node is the only node that ever calls `interrupt()`
-    -- decision_agent_node always recommends immediately, it never asks."""
+    """decision_agent_node never calls `interrupt()` -- it always
+    recommends immediately. (intent_discovery_node and cart_agent's
+    add_flow._ask_for_addon_choices are the two nodes that do.)"""
 
     def test_does_not_import_or_use_interrupt(self):
         import cravr.decision.decisionAgent as module

@@ -8,6 +8,12 @@ from cravr.cart import CartAgent
 from cravr.cart.CartAgent import _classify_cart_action, cart_agent_node, is_cart_request
 from cravr.graph import CART, FEEDBACK, NEW_REQUEST, _route_entry
 
+import uuid
+
+from langgraph.types import Command
+
+from cravr.graph import app as cravr_app
+
 
 class CartRoutingTests(unittest.TestCase):
     """is_cart_request gates graph.py's entry router -- must catch cart/
@@ -838,6 +844,122 @@ class CartNextStepTests(unittest.TestCase):
         self.assertEqual(content.count("Items (2):"), 1)
         self.assertIn("TO PAY: ₹340", content)
         self.assertEqual(result["cart_state"].get("options"), CartAgent._NEXT_STEP_OPTIONS)
+
+
+
+class AddonSelectionInterruptTests(unittest.TestCase):
+    """add_flow._ask_for_addon_choices asks about real addon groups (via
+    interrupt()/Command(resume=...), the same pause-and-resume mechanism
+    intent_discovery_node uses -- see add_flow.py and graph.py) instead of
+    always attempting an item with an unconditional empty addons selection.
+
+    Exercised through the compiled graph (cravr.graph.app), not
+    add_dish_to_cart directly -- interrupt() only actually pauses/resumes
+    inside a real graph run backed by a checkpointer, same reason
+    test_graph.py's ClarificationContextTests goes through `app` rather
+    than calling intent_discovery_node bare.
+
+    The node function re-runs from the top on resume (replaying the
+    already-answered interrupt instead of pausing again), so
+    search_menu_items legitimately gets called once per invoke -- twice
+    total here -- while get_cart/update_cart (which only run AFTER the
+    addon question is resolved) run exactly once each, all during the
+    resume. Same idempotent-replay shape intentAgent.py documents for its
+    own extraction call.
+    """
+
+    _DISH = {
+        "item_name": "Korean Honey Gochujang Chicken Wings (4 Pcs) (Its extra Spicy)",
+        "menu_item_id": "182602816", "restaurant_id": "300123",
+        "restaurant_name": "Some Korean Place", "tags": "has addons",
+    }
+    # Real live shape (see test_food_mcp.py's KOREAN_WINGS_RESPONSE_TEXT),
+    # already parsed into what _fetch_addon_groups expects back.
+    _DETAILED_PROBE = {
+        "items": {}, "has_more": False, "next_offset": None,
+        "detailed_items": {
+            "182602816": {
+                "item_name": _DISH["item_name"], "price_inr": 279,
+                "addon_groups": [{
+                    "group_id": "306232169", "group_name": "Add on Sauce",
+                    "choices": [
+                        {"id": "115016421", "name": "Korean Buffalo Sauce",
+                         "price_inr": 49, "group_id": "306232169"},
+                        {"id": "115016420", "name": "Korean BBQ Sauce",
+                         "price_inr": 49, "group_id": "306232169"},
+                    ],
+                }],
+                "variant_groups": [],
+            },
+        },
+    }
+    _LANDED_MESSAGE = (
+        "Items (1):\n  - Korean Honey Gochujang Chicken Wings (4 Pcs) (Its extra Spicy) "
+        "— ₹328 (ID: 182602816)\n\nTO PAY: ₹328"
+    )
+
+    def _run_addon_flow(self, resume_value):
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        state = {
+            "messages": [HumanMessage(content="add it to cart")],
+            "recommendation_state": {"last_recommendations": [self._DISH]},
+            "context_profile": {"address_id": "addr1"},
+            "intent_profile": {}, "history_profile": {},
+        }
+
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items",
+                   return_value=self._DETAILED_PROBE) as mock_probe:
+            mock_get_cart.side_effect = [
+                {"status": "empty", "message": "Cart is empty."},  # before the merge
+                {"status": "text", "message": self._LANDED_MESSAGE},  # verify after the attempt
+                {"status": "text", "message": self._LANDED_MESSAGE},  # _show_cart_with_next_steps' own call
+            ]
+            mock_update.return_value = {"status": "success", "message": "Cart updated."}
+
+            first = cravr_app.invoke(state, config=config)
+            self.assertTrue(first.get("__interrupt__"),
+                             "expected cart_agent to pause and ask about the addon group")
+            pending = first["__interrupt__"][0].value
+            self.assertEqual(pending["agent"], "cart_agent")
+            self.assertIn("Add on Sauce", pending["question"])
+            option_values = {o["value"] for o in pending["options"]}
+            self.assertEqual(option_values, {"115016421", "115016420", "__no_addon__"})
+
+            second = cravr_app.invoke(Command(resume=resume_value), config=config)
+
+        mock_probe.assert_any_call(self._DISH["item_name"], "addr1", restaurant_id="300123")
+        mock_update.assert_called_once()
+        sent_items = mock_update.call_args[0][2]
+        target_entry = next(e for e in sent_items if e["menu_item_id"] == "182602816")
+        return target_entry, second
+
+    def test_picking_a_real_addon_sends_its_actual_id_not_an_empty_selection(self):
+        target_entry, result = self._run_addon_flow("115016421")
+        self.assertEqual(
+            target_entry.get("addons"),
+            [{"id": "115016421", "name": "Korean Buffalo Sauce", "group_id": "306232169",
+              "quantity": 1, "price": 49}],
+        )
+        content = result["messages"][0].content
+        self.assertNotIn("needs a variant/add-on choice", content)
+
+    def test_choosing_none_still_sends_an_explicit_empty_selection(self):
+        target_entry, result = self._run_addon_flow("__no_addon__")
+        self.assertEqual(target_entry.get("addons"), [])
+        content = result["messages"][0].content
+        self.assertNotIn("needs a variant/add-on choice", content)
+
+    def test_a_reply_the_menu_never_offered_is_skipped_not_guessed_at(self):
+        """Free text the option list didn't anticipate (typed instead of
+        tapped) must never be forwarded to Swiggy as if it were a real
+        choice id -- see the comment in _ask_for_addon_choices."""
+        target_entry, result = self._run_addon_flow("surprise me")
+        self.assertEqual(target_entry.get("addons"), [])
+        content = result["messages"][0].content
+        self.assertNotIn("needs a variant/add-on choice", content)
+
 
 
 if __name__ == "__main__":

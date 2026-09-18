@@ -19,7 +19,9 @@ class ClarificationContextTests(unittest.TestCase):
     `messages` right before the answer, in the right role, after a resume.
 
     Exercises intent_discovery_node's interrupt loop end-to-end through the
-    real graph -- it is the only node that ever calls interrupt().
+    real graph. (cart_agent's add_flow._ask_for_addon_choices is the only
+    other place that calls interrupt() -- see test_cart_agent.py's
+    AddonSelectionInterruptTests for that one.)
     """
 
     def test_question_is_recorded_in_messages_alongside_the_answer(self):

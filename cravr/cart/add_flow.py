@@ -9,11 +9,151 @@ from __future__ import annotations
 
 from typing import Any
 
+from langgraph.types import interrupt
+
 from .. import food_mcp
 from ..debug_utils import debug
+from ..options import resolve_option_choice
 from .display import _cart_reply, _show_cart_with_next_steps
 from .guards import _customization_refusal, _requires_customization
 from .parsing import _parse_existing_cart_items
+
+# Sentinel for "none of these" on an addon-group question -- same
+# fixed-value-independent-of-label convention as options.OTHER_VALUE and
+# routing.CART_ADD_MORE_VALUE.
+_NONE_ADDON_VALUE = "__no_addon__"
+
+# An item can carry several addon groups (the live "Falafel Hummus Pita
+# Pocket" fixture has four: Extra Toppings, Dressing Add On's, Make Your
+# Own Meal, Desserts) -- capped so "want any add-ons?" doesn't turn into an
+# interrogation before the item lands in the cart. Addons are optional
+# upsells (see _requires_customization), never a required choice, so
+# silently leaving the remaining groups unselected is the safe default,
+# not a broken flow.
+_MAX_ADDON_GROUPS_TO_ASK = 3
+# Tappable-button budget per group, same ballpark as options.suggest_options'
+# own default of 5 -- some groups run to 8-9 real choices.
+_MAX_CHOICES_PER_GROUP = 6
+
+
+def _fetch_addon_groups(
+    item_name: str, menu_item_id: str, address_id: str, restaurant_id: str,
+) -> list[dict[str, Any]]:
+    """Real addon groups/choices for one dish, via the targeted search_menu
+    lookup Swiggy's own docs point at ("use search_menu with the item name
+    and restaurantId to get full customization details"). CONFIRMED live
+    (logger.txt, "Falafel Hummus Pita Pocket", restaurant 300897) to return
+    real group/choice ids in a third text shape food_mcp.search_menu_items
+    parses separately and surfaces under `detailed_items` (see
+    food_mcp.search._parse_detailed_search_menu_items).
+
+    Returns [] whenever the lookup doesn't yield a usable match for this
+    exact item id -- no result, an unfamiliar response shape, or a
+    transient failure -- never raises. Callers must treat [] as "nothing
+    usable" and fall back to the old empty-addons attempt, not block the
+    add on it: this fetch is a best-effort upgrade over that fallback, not
+    a new required step.
+    """
+    try:
+        probe = food_mcp.search_menu_items(item_name, address_id, restaurant_id=str(restaurant_id))
+    except Exception as exc:  # noqa: BLE001 -- must never break the add path
+        debug("cart_agent", f"addon-group fetch FAILED for {item_name!r}: {exc}")
+        return []
+    detailed = probe.get("detailed_items") if isinstance(probe, dict) else None
+    if not isinstance(detailed, dict):
+        return []
+    match = detailed.get(str(menu_item_id))
+    if not isinstance(match, dict):
+        return []
+    groups = match.get("addon_groups")
+    return groups if isinstance(groups, list) else []
+
+
+def _ask_for_addon_choices(item_name: str, addon_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ask the user, one addon group at a time, which optional extra (if
+    any) they want -- via `interrupt()`/`Command(resume=...)`, the same
+    pause-mid-graph mechanism intent_discovery_node uses for its own
+    clarification loop (see graph.py, intentAgent.py). cart_agent is now
+    the second (and, as of this change, only other) node that ever calls
+    `interrupt()`.
+
+    Options are built directly from the real group/choice ids
+    `_fetch_addon_groups` returned -- deliberately NOT run through
+    options.suggest_options()'s LLM paraphrasing. A paraphrased label could
+    stop round-tripping to the exact choice id Swiggy expects, and these
+    ids are the one thing in this flow that must never be guessed at.
+
+    Every group is treated as single-choice-or-none: no minAddons/
+    maxAddons-style "how many can I pick" field has been observed in any
+    response shape seen so far (see _parse_detailed_search_menu_items), so
+    this is the safe simplification -- worst case, a user who wanted two
+    items from one group only gets to pick one, never a rejected/garbled
+    request. Capped at `_MAX_ADDON_GROUPS_TO_ASK` groups /
+    `_MAX_CHOICES_PER_GROUP` choices each; remaining groups/choices are
+    silently left unselected rather than asked about, since an addon group
+    is always optional (see _requires_customization) -- never worth
+    refusing the whole add over.
+
+    Returns FoodCartAddon-shaped entries ready to send: [{"id", "name",
+    "group_id", "quantity", "price"}].
+    """
+    selected: list[dict[str, Any]] = []
+    for group in addon_groups[:_MAX_ADDON_GROUPS_TO_ASK]:
+        choices = [c for c in (group.get("choices") or []) if c.get("id") and c.get("name")]
+        choices = choices[:_MAX_CHOICES_PER_GROUP]
+        if not choices:
+            continue
+        group_name = group.get("group_name") or "add-on"
+
+        options = [
+            {
+                "value": str(c["id"]),
+                "label": f"{c['name']} (+₹{c['price_inr']:.0f})" if c.get("price_inr") else str(c["name"]),
+            }
+            for c in choices
+        ]
+        options.append({"value": _NONE_ADDON_VALUE, "label": "None of these"})
+
+        raw_answer = interrupt({
+            "question": f"{item_name} has a {group_name} add-on -- want any of these, or none?",
+            "options": options,
+            "agent": "cart_agent",
+            "field": f"addon_group:{group.get('group_id')}",
+        })
+        debug("cart_agent", f"addon group {group_name!r} raw_answer={raw_answer!r}")
+
+        # Try an EXACT id match first, before resolve_option_choice --
+        # unlike intent_discovery_node's options (short text labels),
+        # these option "value"s are themselves real numeric Swiggy ids.
+        # resolve_option_choice treats an all-digit reply as a 1-based
+        # *position* in the list, which happens to still fall through to
+        # the raw value unchanged here (a real choice id is always far
+        # larger than this short option list), but that's a coincidence of
+        # id size, not a guarantee -- matching the id directly first
+        # avoids depending on it.
+        answer_text = str(raw_answer).strip()
+        if answer_text == _NONE_ADDON_VALUE:
+            continue
+        chosen = next((c for c in choices if str(c.get("id")) == answer_text), None)
+        if not chosen:
+            resolved = resolve_option_choice(answer_text, options)
+            if resolved == _NONE_ADDON_VALUE:
+                continue
+            chosen = next((c for c in choices if str(c.get("id")) == str(resolved)), None)
+        if not chosen:
+            # Free text the option menu didn't anticipate (e.g. the user
+            # typed something instead of tapping) -- no safe id to send
+            # Swiggy for it, so this group is skipped rather than guessed at.
+            debug("cart_agent", f"addon group {group_name!r}: unresolved answer {raw_answer!r}, skipping")
+            continue
+        selected.append({
+            "id": chosen["id"],
+            "name": chosen["name"],
+            "group_id": chosen.get("group_id") or group.get("group_id"),
+            "quantity": 1,
+            "price": chosen.get("price_inr", 0),
+        })
+    return selected
 
 
 def add_dish_to_cart(
@@ -76,81 +216,69 @@ def add_dish_to_cart(
     # threads through to the merged cart_items_payload build and gets a
     # dedicated post-add verification, instead of an unconditional refusal.
     attempt_addon_only = False
+    # The addon entries actually sent for the item being added -- real
+    # user choices when _fetch_addon_groups found usable groups and
+    # _ask_for_addon_choices got answers for them, otherwise [] (the
+    # original explicit-empty-selection guess, kept as the fallback for
+    # whenever the targeted lookup comes up empty).
+    selected_addons: list[dict[str, Any]] = []
 
     if _requires_customization(dish.get("tags") or ""):
         tags_haystack = (dish.get("tags") or "").lower()
-        needs_variant_choice = "has variants" in tags_haystack
 
-        # Diagnostic-only probe (does not change the refusal below either
-        # way, never blocks it). CONFIRMED live (logger.txt, "Falafel
-        # Hummus Pita Pocket", restaurant 300897): a targeted
-        # search_menu(item name, restaurantIdOfAddedItem=restaurant) call
-        # DOES return the item's real addon groups with group/choice ids --
-        # Swiggy's own docs were right about that. food_mcp.search_menu_items()
-        # parses that shape itself (see _parse_detailed_search_menu_items)
-        # and surfaces it under result["detailed_items"] when the
-        # broad-format parser finds nothing; log the parsed group/choice
-        # names here instead of the raw dict so this stays readable as more
-        # items get tested. No min/maxAddons-style "mandatory" flag is
-        # exposed in this response shape -- only name/price/ids -- so
-        # whether any of these groups are actually required is still
-        # unknown from this data alone.
-        try:
-            probe = food_mcp.search_menu_items(
-                str(dish.get("item_name") or ""), address_id, restaurant_id=str(restaurant_id),
-            )
-            detailed = probe.get("detailed_items") or {}
-            match = detailed.get(str(dish.get("menu_item_id") or ""))
-            if match:
-                group_summary = [
-                    f"{g['group_name']} ({len(g['choices'])} choices, group_id={g['group_id']})"
-                    for g in match.get("addon_groups", [])
-                ]
-                debug(
-                    "cart_agent",
-                    f"customization probe for {dish.get('item_name')!r} (id={dish.get('menu_item_id')!r}) "
-                    f"-> matched item with addon groups: {group_summary!r}",
-                )
-            else:
-                debug(
-                    "cart_agent",
-                    f"customization probe for {dish.get('item_name')!r} (id={dish.get('menu_item_id')!r}) "
-                    f"-> no matching item id in response; {len(detailed)} detailed item(s), "
-                    f"{len(probe.get('items') or [])} broad-format item(s) found instead",
-                )
-        except Exception as exc:  # noqa: BLE001 -- diagnostic only, must never break the refusal path
-            debug("cart_agent", f"customization probe FAILED: {exc}")
-
-        # Deliberately drop `lead_in` here, not prefix it -- callers build
-        # it assuming a successful add (RecommendAgent._reply_with_pick:
-        # "Great -- X it is."), and prefixing that onto a refusal produced
-        # a self-contradicting reply confirmed live: "Great -- The Veggie
-        # Melt Pizza from Captain Grub (Rs675.0) it is. The Veggie Melt
-        # Pizza needs a variant/add-on choice I can't set for you yet, so
-        # I haven't added it..." -- say plainly it wasn't added instead.
-        if needs_variant_choice:
-            # A variant (size/base choice, e.g. "Choice of Cheese: With/
-            # Without") changes what the item actually IS -- there's no safe
-            # default to guess (the live response shape confirmed this
-            # segment carries no "default" flag either), so this case still
-            # refuses outright, unlike the addon-only case below.
+        # A variant (size/base choice, e.g. "Choice of Cheese: With/
+        # Without") changes what the item actually IS -- there's no safe
+        # default to guess (the live detailed-lookup response shape
+        # confirmed this segment carries no "default" flag either), so
+        # this case still refuses outright, unlike the addon-only case
+        # below. Checked and returned FIRST, before any addon-group
+        # fetch/ask, so a variant-only item never triggers a pointless
+        # (and confusing -- "want any add-ons?" right before a refusal)
+        # round of interrupts for an add that's about to be declined anyway.
+        if "has variants" in tags_haystack:
+            # Deliberately drop `lead_in` here, not prefix it -- callers build
+            # it assuming a successful add (RecommendAgent._reply_with_pick:
+            # "Great -- X it is."), and prefixing that onto a refusal produced
+            # a self-contradicting reply confirmed live: "Great -- The Veggie
+            # Melt Pizza from Captain Grub (Rs675.0) it is. The Veggie Melt
+            # Pizza needs a variant/add-on choice I can't set for you yet, so
+            # I haven't added it..." -- say plainly it wasn't added instead.
             return _cart_reply(_customization_refusal(dish.get("item_name")))
 
         # Addon-only item (e.g. live-confirmed "Korean Honey Gochujang
         # Chicken Wings", tagged has-addons with one optional-looking
         # "Add on Sauce" group, no variants): every addon group actually
         # seen live so far (sauces, dressings, drinks, desserts, sides) reads
-        # as an optional upsell, not a mandatory choice -- and the repeated
+        # as an optional upsell, not a mandatory choice, and the repeated
         # real failure pattern (update_food_cart silently replying 'Cart
         # updated.\nCart is empty.') is consistent with Swiggy's validation
         # wanting an explicit answer for these groups, not with every group
-        # actually being required. UNTESTED hypothesis, first attempted here
-        # live: try the add with an explicit empty addon selection
-        # ("addons": []) instead of refusing outright. `attempt_addon_only`
-        # threads this into the normal merge-and-send flow below, which
-        # already re-fetches the cart afterward to verify -- if that
-        # verification shows the item didn't actually land, this same
-        # refusal is returned instead of a broken/misleading cart display.
+        # actually being required.
+        #
+        # First try for the user's REAL preference: a targeted search_menu
+        # lookup (_fetch_addon_groups) returns real group/choice ids when it
+        # matches this item, and _ask_for_addon_choices asks about each one
+        # via interrupt() -- so "extra cheese" actually means extra cheese,
+        # not a silently-dropped preference. If that lookup comes up empty
+        # (unfamiliar response shape, no match, a transient failure),
+        # `selected_addons` stays [] and the item is still attempted with
+        # an explicit empty selection, same as before this existed -- the
+        # merge-and-send flow below always re-fetches the cart afterward to
+        # verify either way; if verification shows the item didn't actually
+        # land, the same honest refusal is returned rather than a broken/
+        # misleading cart display.
+        addon_groups = _fetch_addon_groups(
+            str(dish.get("item_name") or ""), str(dish.get("menu_item_id") or ""),
+            address_id, str(restaurant_id),
+        )
+        debug(
+            "cart_agent",
+            f"addon groups for {dish.get('item_name')!r}: "
+            f"{[g.get('group_name') for g in addon_groups]!r}",
+        )
+        if addon_groups:
+            selected_addons = _ask_for_addon_choices(str(dish.get("item_name") or ""), addon_groups)
+            debug("cart_agent", f"user-selected addons for {dish.get('item_name')!r}: {selected_addons!r}")
         attempt_addon_only = True
 
     # Swiggy's update_food_cart is documented as additive ("Add items to
@@ -181,9 +309,10 @@ def add_dish_to_cart(
     for mid, qty in merged.items():
         entry: dict[str, Any] = {"menu_item_id": mid, "quantity": qty}
         if attempt_addon_only and mid == str(menu_item_id):
-            # See the attempt_addon_only comment above -- explicit empty
-            # selection instead of omitting the field entirely.
-            entry["addons"] = []
+            # Real user selections when _ask_for_addon_choices got any,
+            # else the explicit-empty-selection fallback -- see the
+            # attempt_addon_only comment above.
+            entry["addons"] = selected_addons
         cart_items_payload.append(entry)
     debug("cart_agent", f"sending merged cartItems={cart_items_payload!r}")
 
