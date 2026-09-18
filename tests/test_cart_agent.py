@@ -967,19 +967,31 @@ class AddonSelectionInterruptTests(unittest.TestCase):
 
 
 class MultiGroupAddonSelectionTests(unittest.TestCase):
-    """Real-world regression (logger.txt, 'Spaghetti Aglio Olio [Veg]',
-    4 real addon groups: Choose Your Gourmet Topping, Choose Your Veg
-    Toppings, Choose Your Cheese, Choose Your Non Veg Toppings): the old
-    group-by-group loop capped at 3 groups and never even asked about the
-    4th before sending the add -- which still came back 'Cart updated.
-    \\nCart is empty.' from the real update_food_cart. Whether the
-    unanswered 4th group caused that specific failure is unconfirmed, but
-    _ask_for_all_addons no longer caps groups at all: every group shows up
-    in one consolidated question, and one reply can pick addons from
-    several of them at once. Ids/names/prices for the first three groups
-    are the real ones from that log line; the 4th group's choice is a
-    fixture (the real run never got asked about it, since it never got
-    beyond group 3)."""
+    """Real-world regressions (logger.txt, 'Spaghetti Aglio Olio [Veg]' /
+    'Spaghetti Carbonara Pasta', 4 real addon groups: Choose Your Gourmet
+    Topping, Choose Your Veg Toppings, Choose Your Cheese, Choose Your Non
+    Veg Toppings). Two separate live bugs this class guards against:
+
+    1. The original group-by-group loop capped at 3 groups and never even
+       asked about the 4th before sending the add. _ask_for_all_addons
+       shows every group in one consolidated first question -- no cap.
+
+    2. The first "all at once" version fixed (1) but broke something else,
+       also confirmed live: a real user naturally TAPPED one button, and
+       since a tap only ever returns ONE value, that silently finalized
+       the whole add with just one group answered and the other three
+       left as an implicit (unintended) "none" -- "can use only 1, WTF".
+       _ask_for_all_addons now treats one round's reply as "at least
+       this": unresolved groups get a shorter FOLLOWUP question instead of
+       being dropped, repeating until the user says done/none or every
+       group's had a real answer. See
+       test_tapping_one_choice_gets_asked_again_about_the_rest for the
+       direct regression test.
+
+    Ids/names/prices for the first three groups are the real ones from
+    the log; the 4th group's choice is a fixture (the real runs never got
+    asked about it, since they either capped at 3 groups or stopped after
+    the first tap)."""
 
     _DISH = {
         "item_name": "Spaghetti Aglio Olio [Veg]", "menu_item_id": "32257515",
@@ -1007,7 +1019,77 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
     }
     _LANDED_MESSAGE = "Items (1):\n  - Spaghetti Aglio Olio [Veg] — ₹664 (ID: 32257515)\n\nTO PAY: ₹664"
 
-    def _run(self, resume_value):
+    def _run(self, *resume_sequence):
+        """Drives the graph through as many interrupt rounds as it takes
+        to finish. Supplied resume values are used in order; once
+        exhausted, any further round is closed out with "__no_addon__"
+        ("nothing else") so a test that doesn't care about the later
+        rounds doesn't have to spell them all out."""
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        state = {
+            "messages": [HumanMessage(content="add it to cart")],
+            "recommendation_state": {"last_recommendations": [self._DISH]},
+            "context_profile": {"address_id": "addr1"},
+            "intent_profile": {}, "history_profile": {},
+        }
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items", return_value=self._DETAILED_PROBE):
+            mock_get_cart.side_effect = [
+                {"status": "empty", "message": "Cart is empty."},
+                {"status": "text", "message": self._LANDED_MESSAGE},
+                {"status": "text", "message": self._LANDED_MESSAGE},
+            ]
+            mock_update.return_value = {"status": "success", "message": "Cart updated."}
+
+            result = cravr_app.invoke(state, config=config)
+            self.assertTrue(result.get("__interrupt__"))
+            first_question = result["__interrupt__"][0].value["question"]
+            for group_name in (
+                "Choose Your Gourmet Topping", "Choose Your Veg Toppings",
+                "Choose Your Cheese", "Choose Your Non Veg Toppings",
+            ):
+                self.assertIn(group_name, first_question)
+
+            pending = list(resume_sequence)
+            rounds = 0
+            while result.get("__interrupt__"):
+                rounds += 1
+                self.assertLessEqual(rounds, 4, "should never loop more rounds than there are groups")
+                value = pending.pop(0) if pending else "__no_addon__"
+                result = cravr_app.invoke(Command(resume=value), config=config)
+
+        sent_items = mock_update.call_args[0][2]
+        target_entry = next(e for e in sent_items if e["menu_item_id"] == "32257515")
+        return target_entry, result
+
+    def test_all_four_groups_are_surfaced_in_one_question_not_capped_at_three(self):
+        target_entry, result = self._run("Sundried Tomato, Mushroom, and Extra Mozzarella Cheese")
+        self.assertEqual(
+            {a["name"] for a in target_entry.get("addons", [])},
+            {"Sundried Tomato", "Mushroom", "Extra Mozzarella Cheese"},
+        )
+        content = result["messages"][0].content
+        self.assertNotIn("needs a variant/add-on choice", content)
+
+    def test_numbered_positions_across_groups_pick_the_right_choices(self):
+        # 1=Sundried Tomato, 2=Mushroom, 3=Extra Mozzarella Cheese, 4=Chicken Sausage
+        target_entry, _ = self._run("1, 4")
+        self.assertEqual(
+            {a["name"] for a in target_entry.get("addons", [])},
+            {"Sundried Tomato", "Chicken Sausage"},
+        )
+
+    def test_none_clears_every_group_at_once(self):
+        target_entry, _ = self._run("no thanks")
+        self.assertEqual(target_entry.get("addons"), [])
+
+    def test_tapping_one_choice_gets_asked_again_about_the_rest(self):
+        """The exact live complaint this fixes ('Now I got all at once,
+        but can use only 1, WTF'): tapping ONE button used to silently
+        finalize the whole add with only that one group answered. Now a
+        tap resolves just that group, and the remaining groups get a
+        shorter followup question instead of being dropped."""
         config = {"configurable": {"thread_id": str(uuid.uuid4())}}
         state = {
             "messages": [HumanMessage(content="add it to cart")],
@@ -1027,46 +1109,30 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
 
             first = cravr_app.invoke(state, config=config)
             self.assertTrue(first.get("__interrupt__"))
-            question = first["__interrupt__"][0].value["question"]
-            for group_name in (
-                "Choose Your Gourmet Topping", "Choose Your Veg Toppings",
-                "Choose Your Cheese", "Choose Your Non Veg Toppings",
-            ):
-                self.assertIn(group_name, question)
 
-            second = cravr_app.invoke(Command(resume=resume_value), config=config)
+            # Tap Mushroom's real id, exactly what a real button click sends.
+            second = cravr_app.invoke(Command(resume="25698096"), config=config)
+            self.assertTrue(
+                second.get("__interrupt__"),
+                "a single tap must not silently finalize the whole add -- "
+                "the other 3 groups still need asking about",
+            )
+            followup_question = second["__interrupt__"][0].value["question"]
+            self.assertIn("Anything else", followup_question)
+            # The already-answered group drops out of the followup; the
+            # other three are still there to answer.
+            self.assertNotIn("Choose Your Veg Toppings", followup_question)
+            for group_name in (
+                "Choose Your Gourmet Topping", "Choose Your Cheese", "Choose Your Non Veg Toppings",
+            ):
+                self.assertIn(group_name, followup_question)
+
+            third = cravr_app.invoke(Command(resume="__no_addon__"), config=config)
+            self.assertFalse(third.get("__interrupt__"), "should be done after saying 'nothing else'")
 
         sent_items = mock_update.call_args[0][2]
         target_entry = next(e for e in sent_items if e["menu_item_id"] == "32257515")
-        return target_entry, second
-
-    def test_all_four_groups_are_surfaced_in_one_question_not_capped_at_three(self):
-        target_entry, result = self._run("Sundried Tomato, Mushroom, and Extra Mozzarella Cheese")
-        self.assertEqual(
-            {a["name"] for a in target_entry.get("addons", [])},
-            {"Sundried Tomato", "Mushroom", "Extra Mozzarella Cheese"},
-        )
-        content = result["messages"][0].content
-        self.assertNotIn("needs a variant/add-on choice", content)
-
-    def test_numbered_positions_across_groups_pick_the_right_choices(self):
-        # 1=Sundried Tomato, 2=Mushroom, 3=Extra Mozzarella Cheese, 4=Chicken Sausage
-        target_entry, _ = self._run("1, 4")
-        self.assertEqual(
-            {a["name"] for a in target_entry.get("addons", [])},
-            {"Sundried Tomato", "Chicken Sausage"},
-        )
-
-    def test_a_tapped_id_still_works_as_a_single_pick(self):
-        target_entry, _ = self._run("25698096")
-        self.assertEqual(
-            [a["name"] for a in target_entry.get("addons", [])],
-            ["Mushroom"],
-        )
-
-    def test_none_clears_every_group_at_once(self):
-        target_entry, _ = self._run("no thanks")
-        self.assertEqual(target_entry.get("addons"), [])
+        self.assertEqual([a["name"] for a in target_entry.get("addons", [])], ["Mushroom"])
 
 
 class MatchAddonReplyTests(unittest.TestCase):

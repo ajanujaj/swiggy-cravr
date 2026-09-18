@@ -71,41 +71,81 @@ def _fetch_addon_groups(
     return groups if isinstance(groups, list) else []
 
 
+def _addon_question_and_options(
+    item_name: str, choices: list[dict[str, Any]], is_followup: bool,
+) -> tuple[str, list[dict[str, str]]]:
+    """The question text + tap options for one round of
+    `_ask_for_all_addons` -- `choices` is whatever's still unanswered
+    going into this round (every choice on round 1, fewer on a followup).
+    Numbering restarts at 1 each round; that's fine because
+    `_match_addon_reply` is always handed exactly THIS round's `choices`,
+    so a position always means "this round's Nth listed item", never a
+    stale one from an earlier round."""
+    if is_followup:
+        lines = [
+            f'Anything else for {item_name}? (numbers, names, or comma-separated), or say "done":',
+            "",
+        ]
+        none_label = "Nothing else"
+    else:
+        lines = [
+            f'{item_name} has these add-ons -- reply with any you want '
+            '(numbers, names, or comma-separated), or say "none":',
+            "",
+        ]
+        none_label = "None of these"
+
+    options: list[dict[str, str]] = []
+    current_group_name: str | None = None
+    for i, choice in enumerate(choices, start=1):
+        if choice["group_name"] != current_group_name:
+            current_group_name = choice["group_name"]
+            lines.append(f"{current_group_name}:")
+        price_bit = f" (+₹{choice['price_inr']:.0f})" if choice.get("price_inr") else ""
+        lines.append(f"  {i}. {choice['name']}{price_bit}")
+        options.append({"value": str(choice["id"]), "label": f"{choice['name']}{price_bit}"})
+    options.append({"value": _NONE_ADDON_VALUE, "label": none_label})
+    return "\n".join(lines), options
+
+
 def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ask about every addon group in ONE `interrupt()`, not one per group.
+    """Ask about every addon group, starting from ONE consolidated
+    `interrupt()` that lists all of them at once -- not one per group.
 
     Live evidence this replaces (logger.txt, "Spaghetti Aglio Olio [Veg]",
-    4 real addon groups): the previous group-by-group loop took 3 separate
+    4 real addon groups): the original group-by-group loop took 3 separate
     conversation turns to answer 3 groups, AND -- because it capped at a
     fixed group count -- never even asked about the 4th group ("Choose
     Your Non Veg Toppings") before sending the add, which still came back
     'Cart updated.\nCart is empty.' from the real update_food_cart.
-    Whether the unanswered 4th group actually caused that failure is
-    unconfirmed (no minAddons/maxAddons-style "this group is required"
-    flag is exposed in any response shape seen so far -- see
-    _parse_detailed_search_menu_items), but there was never a good reason
-    to leave a group unasked either way, and asking one-by-one across
-    multiple turns was worse UX regardless. This version always surfaces
-    every group, in one consolidated, numbered question, e.g.:
 
-        Spaghetti Aglio Olio [Veg] has these add-ons -- reply with any you
-        want (numbers, names, or comma-separated), or say "none":
+    The FIRST version of this "all at once" question (a single
+    interrupt(), no loop) fixed the missing-4th-group problem but broke
+    something else, also confirmed live: a real user's natural move was to
+    TAP one button, same as every other options menu in this app -- and
+    chainlit's Action buttons only ever return ONE value per click, so a
+    single tap could only ever pick from ONE of the groups shown, with the
+    rest implicitly left unanswered ("can use only 1" -- accurate
+    complaint, not a misunderstanding). Free-text multi-select ("1, 3" or
+    comma-separated names) still worked, but nothing about the UI
+    suggested that was necessary over just tapping.
 
-        Choose Your Gourmet Topping:
-          1. Sundried Tomato (+₹95)
-        Choose Your Veg Toppings:
-          2. Mushroom (+₹75)
-        ...
-
-    The reply is free text by design, not a single tap: addons here are
-    genuinely multi-select (one or more, across one or more groups), and
-    chainlit's Action buttons -- same as every other `interrupt()` menu in
-    this codebase -- only ever return ONE value per click. A tap (via
-    `options`, still real ids) remains a same-turn shortcut for "just this
-    one thing"; typing "1, 3" or "sundried tomato and mozzarella" is how
-    multiple picks across groups happen in a single turn. See
-    `_match_addon_reply` for how the reply is resolved back to real
-    choices.
+    This version keeps the single big question up front (every group
+    still shown at once, so nothing requires several turns just to be
+    SEEN), but treats one round's reply as "at least this," not "only
+    this": whatever groups the reply didn't resolve go into a shorter
+    FOLLOWUP question (only the still-open groups, with a "done"/"nothing
+    else" way out), repeating until either every group has a real answer
+    or the user says they're done. A single free-text reply naming
+    several groups at once (still fully supported) finishes in one round,
+    same as before; a user who taps is walked through the remaining groups
+    a tap at a time instead of being capped at whichever one group they
+    happened to hit first. Bounded by the number of distinct groups --
+    each round that matches anything resolves at least one whole group
+    (single-choice-or-none per group, same simplification as before; see
+    _match_addon_reply), so `remaining` strictly shrinks every successful
+    round, and an unproductive reply (unmatched text, or "none"/"done")
+    ends the loop immediately rather than re-asking.
 
     Returns FoodCartAddon-shaped entries: [{"id", "name", "group_id",
     "quantity", "price"}].
@@ -124,31 +164,42 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
     if not indexed_choices:
         return []
 
-    lines = [
-        f'{item_name} has these add-ons -- reply with any you want '
-        '(numbers, names, or comma-separated), or say "none":',
-        "",
-    ]
-    options: list[dict[str, str]] = []
-    current_group_name: str | None = None
-    for i, choice in enumerate(indexed_choices, start=1):
-        if choice["group_name"] != current_group_name:
-            current_group_name = choice["group_name"]
-            lines.append(f"{current_group_name}:")
-        price_bit = f" (+₹{choice['price_inr']:.0f})" if choice.get("price_inr") else ""
-        lines.append(f"  {i}. {choice['name']}{price_bit}")
-        options.append({"value": str(choice["id"]), "label": f"{choice['name']}{price_bit}"})
-    options.append({"value": _NONE_ADDON_VALUE, "label": "None of these"})
+    selected: list[dict[str, Any]] = []
+    picked_ids: set[str] = set()
+    remaining = indexed_choices
+    group_count = len({c.get("group_id") for c in indexed_choices})
+    round_number = 0
 
-    raw_answer = interrupt({
-        "question": "\n".join(lines),
-        "options": options,
-        "agent": "cart_agent",
-        "field": "addon_groups",
-    })
-    debug("cart_agent", f"addon selection raw_answer={raw_answer!r}")
-    return _match_addon_reply(str(raw_answer), indexed_choices)
+    # Belt-and-suspenders bound -- the break-on-no-match below already
+    # guarantees termination, this just caps it defensively at the number
+    # of groups (each successful round removes at least one whole group).
+    while remaining and round_number < max(group_count, 1):
+        round_number += 1
+        question, options = _addon_question_and_options(item_name, remaining, round_number > 1)
+        raw_answer = interrupt({
+            "question": question,
+            "options": options,
+            "agent": "cart_agent",
+            "field": f"addon_groups:round{round_number}",
+        })
+        debug("cart_agent", f"addon selection round {round_number} raw_answer={raw_answer!r}")
 
+        reply_matches = _match_addon_reply(str(raw_answer), remaining)
+        if not reply_matches:
+            # A genuine "none"/"done", or free text that matched nothing
+            # in THIS round's list -- either way, stop asking rather than
+            # loop on an unproductive reply.
+            break
+
+        newly_answered_group_ids: set[Any] = set()
+        for choice in reply_matches:
+            if choice["id"] not in picked_ids:
+                picked_ids.add(choice["id"])
+                selected.append(choice)
+            newly_answered_group_ids.add(choice.get("group_id"))
+        remaining = [c for c in remaining if c.get("group_id") not in newly_answered_group_ids]
+
+    return selected
 
 def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Resolve one free-text (or tapped) reply against every choice
