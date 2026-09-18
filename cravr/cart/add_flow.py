@@ -7,33 +7,35 @@ instead.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from langgraph.types import interrupt
 
 from .. import food_mcp
 from ..debug_utils import debug
-from ..options import resolve_option_choice
 from .display import _cart_reply, _show_cart_with_next_steps
 from .guards import _customization_refusal, _requires_customization
 from .parsing import _parse_existing_cart_items
 
-# Sentinel for "none of these" on an addon-group question -- same
+# Sentinel for "none of these" on an addon question -- same
 # fixed-value-independent-of-label convention as options.OTHER_VALUE and
 # routing.CART_ADD_MORE_VALUE.
 _NONE_ADDON_VALUE = "__no_addon__"
 
-# An item can carry several addon groups (the live "Falafel Hummus Pita
-# Pocket" fixture has four: Extra Toppings, Dressing Add On's, Make Your
-# Own Meal, Desserts) -- capped so "want any add-ons?" doesn't turn into an
-# interrogation before the item lands in the cart. Addons are optional
-# upsells (see _requires_customization), never a required choice, so
-# silently leaving the remaining groups unselected is the safe default,
-# not a broken flow.
-_MAX_ADDON_GROUPS_TO_ASK = 3
-# Tappable-button budget per group, same ballpark as options.suggest_options'
-# own default of 5 -- some groups run to 8-9 real choices.
-_MAX_CHOICES_PER_GROUP = 6
+# Sanity ceiling only -- NOT a UX cap. Showing every group/choice at once
+# is the whole point of _ask_for_all_addons (see its docstring); this just
+# stops a pathological response (a parser bug, a menu with hundreds of
+# choices) from producing an unusably huge interrupt payload.
+_MAX_TOTAL_ADDON_CHOICES = 40
+
+# Whole-reply phrases that mean "no add-ons at all" -- checked against the
+# ENTIRE reply before any per-token matching, so "none" or "no thanks"
+# never gets misread as a (nonexistent) choice named "none".
+_NONE_REPLY_PHRASES = {
+    "none", "no", "nothing", "no thanks", "no thank you", "skip",
+    "nope", "no addons", "no addon", "not now", "none of these",
+}
 
 
 def _fetch_addon_groups(
@@ -69,91 +71,141 @@ def _fetch_addon_groups(
     return groups if isinstance(groups, list) else []
 
 
-def _ask_for_addon_choices(item_name: str, addon_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ask the user, one addon group at a time, which optional extra (if
-    any) they want -- via `interrupt()`/`Command(resume=...)`, the same
-    pause-mid-graph mechanism intent_discovery_node uses for its own
-    clarification loop (see graph.py, intentAgent.py). cart_agent is now
-    the second (and, as of this change, only other) node that ever calls
-    `interrupt()`.
+def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ask about every addon group in ONE `interrupt()`, not one per group.
 
-    Options are built directly from the real group/choice ids
-    `_fetch_addon_groups` returned -- deliberately NOT run through
-    options.suggest_options()'s LLM paraphrasing. A paraphrased label could
-    stop round-tripping to the exact choice id Swiggy expects, and these
-    ids are the one thing in this flow that must never be guessed at.
+    Live evidence this replaces (logger.txt, "Spaghetti Aglio Olio [Veg]",
+    4 real addon groups): the previous group-by-group loop took 3 separate
+    conversation turns to answer 3 groups, AND -- because it capped at a
+    fixed group count -- never even asked about the 4th group ("Choose
+    Your Non Veg Toppings") before sending the add, which still came back
+    'Cart updated.\nCart is empty.' from the real update_food_cart.
+    Whether the unanswered 4th group actually caused that failure is
+    unconfirmed (no minAddons/maxAddons-style "this group is required"
+    flag is exposed in any response shape seen so far -- see
+    _parse_detailed_search_menu_items), but there was never a good reason
+    to leave a group unasked either way, and asking one-by-one across
+    multiple turns was worse UX regardless. This version always surfaces
+    every group, in one consolidated, numbered question, e.g.:
 
-    Every group is treated as single-choice-or-none: no minAddons/
-    maxAddons-style "how many can I pick" field has been observed in any
-    response shape seen so far (see _parse_detailed_search_menu_items), so
-    this is the safe simplification -- worst case, a user who wanted two
-    items from one group only gets to pick one, never a rejected/garbled
-    request. Capped at `_MAX_ADDON_GROUPS_TO_ASK` groups /
-    `_MAX_CHOICES_PER_GROUP` choices each; remaining groups/choices are
-    silently left unselected rather than asked about, since an addon group
-    is always optional (see _requires_customization) -- never worth
-    refusing the whole add over.
+        Spaghetti Aglio Olio [Veg] has these add-ons -- reply with any you
+        want (numbers, names, or comma-separated), or say "none":
 
-    Returns FoodCartAddon-shaped entries ready to send: [{"id", "name",
-    "group_id", "quantity", "price"}].
+        Choose Your Gourmet Topping:
+          1. Sundried Tomato (+₹95)
+        Choose Your Veg Toppings:
+          2. Mushroom (+₹75)
+        ...
+
+    The reply is free text by design, not a single tap: addons here are
+    genuinely multi-select (one or more, across one or more groups), and
+    chainlit's Action buttons -- same as every other `interrupt()` menu in
+    this codebase -- only ever return ONE value per click. A tap (via
+    `options`, still real ids) remains a same-turn shortcut for "just this
+    one thing"; typing "1, 3" or "sundried tomato and mozzarella" is how
+    multiple picks across groups happen in a single turn. See
+    `_match_addon_reply` for how the reply is resolved back to real
+    choices.
+
+    Returns FoodCartAddon-shaped entries: [{"id", "name", "group_id",
+    "quantity", "price"}].
     """
-    selected: list[dict[str, Any]] = []
-    for group in addon_groups[:_MAX_ADDON_GROUPS_TO_ASK]:
-        choices = [c for c in (group.get("choices") or []) if c.get("id") and c.get("name")]
-        choices = choices[:_MAX_CHOICES_PER_GROUP]
-        if not choices:
-            continue
+    indexed_choices: list[dict[str, Any]] = []
+    for group in addon_groups:
         group_name = group.get("group_name") or "add-on"
-
-        options = [
-            {
-                "value": str(c["id"]),
-                "label": f"{c['name']} (+₹{c['price_inr']:.0f})" if c.get("price_inr") else str(c["name"]),
-            }
-            for c in choices
-        ]
-        options.append({"value": _NONE_ADDON_VALUE, "label": "None of these"})
-
-        raw_answer = interrupt({
-            "question": f"{item_name} has a {group_name} add-on -- want any of these, or none?",
-            "options": options,
-            "agent": "cart_agent",
-            "field": f"addon_group:{group.get('group_id')}",
-        })
-        debug("cart_agent", f"addon group {group_name!r} raw_answer={raw_answer!r}")
-
-        # Try an EXACT id match first, before resolve_option_choice --
-        # unlike intent_discovery_node's options (short text labels),
-        # these option "value"s are themselves real numeric Swiggy ids.
-        # resolve_option_choice treats an all-digit reply as a 1-based
-        # *position* in the list, which happens to still fall through to
-        # the raw value unchanged here (a real choice id is always far
-        # larger than this short option list), but that's a coincidence of
-        # id size, not a guarantee -- matching the id directly first
-        # avoids depending on it.
-        answer_text = str(raw_answer).strip()
-        if answer_text == _NONE_ADDON_VALUE:
-            continue
-        chosen = next((c for c in choices if str(c.get("id")) == answer_text), None)
-        if not chosen:
-            resolved = resolve_option_choice(answer_text, options)
-            if resolved == _NONE_ADDON_VALUE:
+        for choice in group.get("choices") or []:
+            if not (choice.get("id") and choice.get("name")):
                 continue
-            chosen = next((c for c in choices if str(c.get("id")) == str(resolved)), None)
-        if not chosen:
-            # Free text the option menu didn't anticipate (e.g. the user
-            # typed something instead of tapping) -- no safe id to send
-            # Swiggy for it, so this group is skipped rather than guessed at.
-            debug("cart_agent", f"addon group {group_name!r}: unresolved answer {raw_answer!r}, skipping")
+            indexed_choices.append({**choice, "group_name": group_name})
+            if len(indexed_choices) >= _MAX_TOTAL_ADDON_CHOICES:
+                break
+        if len(indexed_choices) >= _MAX_TOTAL_ADDON_CHOICES:
+            break
+    if not indexed_choices:
+        return []
+
+    lines = [
+        f'{item_name} has these add-ons -- reply with any you want '
+        '(numbers, names, or comma-separated), or say "none":',
+        "",
+    ]
+    options: list[dict[str, str]] = []
+    current_group_name: str | None = None
+    for i, choice in enumerate(indexed_choices, start=1):
+        if choice["group_name"] != current_group_name:
+            current_group_name = choice["group_name"]
+            lines.append(f"{current_group_name}:")
+        price_bit = f" (+₹{choice['price_inr']:.0f})" if choice.get("price_inr") else ""
+        lines.append(f"  {i}. {choice['name']}{price_bit}")
+        options.append({"value": str(choice["id"]), "label": f"{choice['name']}{price_bit}"})
+    options.append({"value": _NONE_ADDON_VALUE, "label": "None of these"})
+
+    raw_answer = interrupt({
+        "question": "\n".join(lines),
+        "options": options,
+        "agent": "cart_agent",
+        "field": "addon_groups",
+    })
+    debug("cart_agent", f"addon selection raw_answer={raw_answer!r}")
+    return _match_addon_reply(str(raw_answer), indexed_choices)
+
+
+def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Resolve one free-text (or tapped) reply against every choice
+    `_ask_for_all_addons` listed, split on commas/"and"/"&" so one reply
+    can name several choices across different groups at once.
+
+    Per token, most-certain match first: an exact choice id (a button tap
+    always sends one, verbatim) -- then a 1-based position in the numbered
+    list the question showed -- then a case-insensitive exact name match --
+    then a loose substring match (so "mozzarella" still finds "Extra
+    Mozzarella Cheese"). A token matching nothing is dropped rather than
+    guessed at -- never forwarded to Swiggy as if it were a real id. A
+    whole reply that's a bare "none"/"no"/"skip" (see _NONE_REPLY_PHRASES)
+    short-circuits to [] before any per-token matching, so it can't be
+    misread as a search for a choice literally named "none". Dedupes by
+    id, keeping first-mention order.
+    """
+    text = (raw_answer or "").strip()
+    if not text:
+        return []
+    normalized_whole = text.lower().rstrip(".!")
+    if normalized_whole == _NONE_ADDON_VALUE or normalized_whole in _NONE_REPLY_PHRASES:
+        return []
+
+    tokens = [t.strip() for t in re.split(r",|\band\b|&", text, flags=re.IGNORECASE) if t.strip()]
+    matched: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for token in tokens:
+        token_norm = token.lower().rstrip(".!")
+        if not token_norm or token_norm in _NONE_REPLY_PHRASES:
             continue
-        selected.append({
-            "id": chosen["id"],
-            "name": chosen["name"],
-            "group_id": chosen.get("group_id") or group.get("group_id"),
+
+        choice = next((c for c in indexed_choices if str(c["id"]) == token), None)
+        if not choice and token_norm.isdigit():
+            position = int(token_norm)
+            if 1 <= position <= len(indexed_choices):
+                choice = indexed_choices[position - 1]
+        if not choice:
+            choice = next((c for c in indexed_choices if c["name"].strip().lower() == token_norm), None)
+        if not choice:
+            choice = next(
+                (c for c in indexed_choices
+                 if token_norm in c["name"].lower() or c["name"].lower() in token_norm),
+                None,
+            )
+        if not choice or str(choice["id"]) in seen_ids:
+            continue
+        seen_ids.add(str(choice["id"]))
+        matched.append({
+            "id": choice["id"],
+            "name": choice["name"],
+            "group_id": choice.get("group_id"),
             "quantity": 1,
-            "price": chosen.get("price_inr", 0),
+            "price": choice.get("price_inr", 0),
         })
-    return selected
+    return matched
 
 
 def add_dish_to_cart(
@@ -277,7 +329,7 @@ def add_dish_to_cart(
             f"{[g.get('group_name') for g in addon_groups]!r}",
         )
         if addon_groups:
-            selected_addons = _ask_for_addon_choices(str(dish.get("item_name") or ""), addon_groups)
+            selected_addons = _ask_for_all_addons(str(dish.get("item_name") or ""), addon_groups)
             debug("cart_agent", f"user-selected addons for {dish.get('item_name')!r}: {selected_addons!r}")
         attempt_addon_only = True
 

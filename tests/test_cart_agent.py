@@ -848,10 +848,13 @@ class CartNextStepTests(unittest.TestCase):
 
 
 class AddonSelectionInterruptTests(unittest.TestCase):
-    """add_flow._ask_for_addon_choices asks about real addon groups (via
-    interrupt()/Command(resume=...), the same pause-and-resume mechanism
-    intent_discovery_node uses -- see add_flow.py and graph.py) instead of
-    always attempting an item with an unconditional empty addons selection.
+    """add_flow._ask_for_all_addons asks about every real addon group in
+    ONE consolidated question (via interrupt()/Command(resume=...), the
+    same pause-and-resume mechanism intent_discovery_node uses -- see
+    add_flow.py and graph.py) instead of always attempting an item with an
+    unconditional empty addons selection. This fixture has just one group,
+    so it also covers the single-group case; MultiGroupAddonSelectionTests
+    below covers several groups answered in one reply.
 
     Exercised through the compiled graph (cravr.graph.app), not
     add_dish_to_cart directly -- interrupt() only actually pauses/resumes
@@ -954,11 +957,179 @@ class AddonSelectionInterruptTests(unittest.TestCase):
     def test_a_reply_the_menu_never_offered_is_skipped_not_guessed_at(self):
         """Free text the option list didn't anticipate (typed instead of
         tapped) must never be forwarded to Swiggy as if it were a real
-        choice id -- see the comment in _ask_for_addon_choices."""
+        choice id -- see _match_addon_reply."""
         target_entry, result = self._run_addon_flow("surprise me")
         self.assertEqual(target_entry.get("addons"), [])
         content = result["messages"][0].content
         self.assertNotIn("needs a variant/add-on choice", content)
+
+
+
+
+class MultiGroupAddonSelectionTests(unittest.TestCase):
+    """Real-world regression (logger.txt, 'Spaghetti Aglio Olio [Veg]',
+    4 real addon groups: Choose Your Gourmet Topping, Choose Your Veg
+    Toppings, Choose Your Cheese, Choose Your Non Veg Toppings): the old
+    group-by-group loop capped at 3 groups and never even asked about the
+    4th before sending the add -- which still came back 'Cart updated.
+    \\nCart is empty.' from the real update_food_cart. Whether the
+    unanswered 4th group caused that specific failure is unconfirmed, but
+    _ask_for_all_addons no longer caps groups at all: every group shows up
+    in one consolidated question, and one reply can pick addons from
+    several of them at once. Ids/names/prices for the first three groups
+    are the real ones from that log line; the 4th group's choice is a
+    fixture (the real run never got asked about it, since it never got
+    beyond group 3)."""
+
+    _DISH = {
+        "item_name": "Spaghetti Aglio Olio [Veg]", "menu_item_id": "32257515",
+        "restaurant_id": "30449", "restaurant_name": "Some Italian Place",
+        "tags": "has addons",
+    }
+    _ADDON_GROUPS = [
+        {"group_id": "37840179", "group_name": "Choose Your Gourmet Topping",
+         "choices": [{"id": "25698072", "name": "Sundried Tomato", "price_inr": 95.0, "group_id": "37840179"}]},
+        {"group_id": "37840188", "group_name": "Choose Your Veg Toppings",
+         "choices": [{"id": "25698096", "name": "Mushroom", "price_inr": 75.0, "group_id": "37840188"}]},
+        {"group_id": "37840199", "group_name": "Choose Your Cheese",
+         "choices": [{"id": "25698108", "name": "Extra Mozzarella Cheese", "price_inr": 95.0, "group_id": "37840199"}]},
+        {"group_id": "37840200", "group_name": "Choose Your Non Veg Toppings",
+         "choices": [{"id": "25698200", "name": "Chicken Sausage", "price_inr": 60.0, "group_id": "37840200"}]},
+    ]
+    _DETAILED_PROBE = {
+        "items": {}, "has_more": False, "next_offset": None,
+        "detailed_items": {
+            "32257515": {
+                "item_name": _DISH["item_name"], "price_inr": 399,
+                "addon_groups": _ADDON_GROUPS, "variant_groups": [],
+            },
+        },
+    }
+    _LANDED_MESSAGE = "Items (1):\n  - Spaghetti Aglio Olio [Veg] — ₹664 (ID: 32257515)\n\nTO PAY: ₹664"
+
+    def _run(self, resume_value):
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        state = {
+            "messages": [HumanMessage(content="add it to cart")],
+            "recommendation_state": {"last_recommendations": [self._DISH]},
+            "context_profile": {"address_id": "addr1"},
+            "intent_profile": {}, "history_profile": {},
+        }
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items", return_value=self._DETAILED_PROBE):
+            mock_get_cart.side_effect = [
+                {"status": "empty", "message": "Cart is empty."},
+                {"status": "text", "message": self._LANDED_MESSAGE},
+                {"status": "text", "message": self._LANDED_MESSAGE},
+            ]
+            mock_update.return_value = {"status": "success", "message": "Cart updated."}
+
+            first = cravr_app.invoke(state, config=config)
+            self.assertTrue(first.get("__interrupt__"))
+            question = first["__interrupt__"][0].value["question"]
+            for group_name in (
+                "Choose Your Gourmet Topping", "Choose Your Veg Toppings",
+                "Choose Your Cheese", "Choose Your Non Veg Toppings",
+            ):
+                self.assertIn(group_name, question)
+
+            second = cravr_app.invoke(Command(resume=resume_value), config=config)
+
+        sent_items = mock_update.call_args[0][2]
+        target_entry = next(e for e in sent_items if e["menu_item_id"] == "32257515")
+        return target_entry, second
+
+    def test_all_four_groups_are_surfaced_in_one_question_not_capped_at_three(self):
+        target_entry, result = self._run("Sundried Tomato, Mushroom, and Extra Mozzarella Cheese")
+        self.assertEqual(
+            {a["name"] for a in target_entry.get("addons", [])},
+            {"Sundried Tomato", "Mushroom", "Extra Mozzarella Cheese"},
+        )
+        content = result["messages"][0].content
+        self.assertNotIn("needs a variant/add-on choice", content)
+
+    def test_numbered_positions_across_groups_pick_the_right_choices(self):
+        # 1=Sundried Tomato, 2=Mushroom, 3=Extra Mozzarella Cheese, 4=Chicken Sausage
+        target_entry, _ = self._run("1, 4")
+        self.assertEqual(
+            {a["name"] for a in target_entry.get("addons", [])},
+            {"Sundried Tomato", "Chicken Sausage"},
+        )
+
+    def test_a_tapped_id_still_works_as_a_single_pick(self):
+        target_entry, _ = self._run("25698096")
+        self.assertEqual(
+            [a["name"] for a in target_entry.get("addons", [])],
+            ["Mushroom"],
+        )
+
+    def test_none_clears_every_group_at_once(self):
+        target_entry, _ = self._run("no thanks")
+        self.assertEqual(target_entry.get("addons"), [])
+
+
+class MatchAddonReplyTests(unittest.TestCase):
+    """Direct unit tests of add_flow._match_addon_reply -- the free-text
+    matcher _ask_for_all_addons hands a resumed reply to. Exercised
+    without the graph since it's a pure function of (reply, choices)."""
+
+    _CHOICES = [
+        {"id": "1001", "name": "Sundried Tomato", "price_inr": 95.0,
+         "group_id": "g1", "group_name": "Toppings"},
+        {"id": "1002", "name": "Mushroom", "price_inr": 75.0,
+         "group_id": "g1", "group_name": "Toppings"},
+        {"id": "1003", "name": "Extra Mozzarella Cheese", "price_inr": 95.0,
+         "group_id": "g2", "group_name": "Cheese"},
+    ]
+
+    def _names(self, reply):
+        from cravr.cart.add_flow import _match_addon_reply
+        return [c["name"] for c in _match_addon_reply(reply, self._CHOICES)]
+
+    def test_bare_none_phrase_returns_nothing(self):
+        for phrase in ("none", "No", "nothing", "no thanks", "skip", "  Nope.  "):
+            self.assertEqual(self._names(phrase), [], phrase)
+
+    def test_exact_id_matches_regardless_of_list_position(self):
+        self.assertEqual(self._names("1002"), ["Mushroom"])
+
+    def test_1_based_position_in_the_shown_list(self):
+        self.assertEqual(self._names("3"), ["Extra Mozzarella Cheese"])
+
+    def test_out_of_range_position_matches_nothing(self):
+        self.assertEqual(self._names("99"), [])
+
+    def test_exact_name_is_case_insensitive(self):
+        self.assertEqual(self._names("sundried tomato"), ["Sundried Tomato"])
+
+    def test_partial_name_still_matches(self):
+        self.assertEqual(self._names("mozzarella"), ["Extra Mozzarella Cheese"])
+
+    def test_comma_and_ampersand_separated_multi_select(self):
+        self.assertEqual(
+            set(self._names("Sundried Tomato, mushroom & mozzarella")),
+            {"Sundried Tomato", "Mushroom", "Extra Mozzarella Cheese"},
+        )
+
+    def test_the_word_and_also_splits_tokens(self):
+        self.assertEqual(
+            set(self._names("mushroom and mozzarella")),
+            {"Mushroom", "Extra Mozzarella Cheese"},
+        )
+
+    def test_an_unmatched_token_is_dropped_not_guessed_at(self):
+        self.assertEqual(self._names("extra spicy sauce"), [])
+
+    def test_a_matched_token_survives_alongside_an_unmatched_one(self):
+        self.assertEqual(self._names("mushroom, extra spicy sauce"), ["Mushroom"])
+
+    def test_repeating_the_same_choice_twice_is_deduped(self):
+        self.assertEqual(self._names("mushroom, mushroom"), ["Mushroom"])
+
+    def test_empty_reply_matches_nothing(self):
+        self.assertEqual(self._names(""), [])
+        self.assertEqual(self._names("   "), [])
 
 
 
