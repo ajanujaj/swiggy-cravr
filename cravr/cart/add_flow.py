@@ -427,6 +427,22 @@ def add_dish_to_cart(
     debug("cart_agent", f"update_cart -> {result!r}")
     if result.get("status") != "success":
         if attempt_addon_only:
+            # `error_codes` only shows up when Swiggy's own structured_content
+            # said `successful: False` (see food_mcp.cart.update_cart) -- a
+            # real, specific rejection, not the old "reported success but the
+            # item silently never landed" mystery. Say what Swiggy actually
+            # said instead of the generic "can't set that yet" refusal,
+            # which is actively misleading here: Cravr DID try, and DID send
+            # the add-ons the user picked -- Swiggy turned them down.
+            error_codes = result.get("error_codes")
+            if error_codes:
+                reason = result.get("message") or "one or more add-ons weren't accepted"
+                debug("cart_agent", f"addon-only attempt: explicit rejection {error_codes!r} -- {reason!r}")
+                return _cart_reply(
+                    f"{dish.get('item_name') or 'That item'} couldn't be added -- Swiggy rejected the "
+                    f"add-on(s) you picked ({', '.join(error_codes)}): {reason} Try again without those "
+                    f"specific add-ons, or add it with add-ons directly in the Swiggy app."
+                )
             debug("cart_agent", "addon-only attempt: update_cart call itself failed -- falling back to refusal")
             return _cart_reply(_customization_refusal(dish.get("item_name")))
         content = f"Couldn't add that to your cart: {result.get('message', 'unknown error')}"

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from langchain_core.messages import HumanMessage
@@ -964,6 +965,105 @@ class AddonSelectionInterruptTests(unittest.TestCase):
         self.assertNotIn("needs a variant/add-on choice", content)
 
 
+
+
+class UpdateCartStructuredRejectionTests(unittest.TestCase):
+    """Live regression (logger.txt, 'Roasted Veggie Pita Pocket', 2026-09-
+    18): update_food_cart's TEXT content said 'Cart updated.\nCart is
+    empty.' -- which update_cart used to report as plain success -- while
+    fastmcp's `structured_content` (never inspected before this) carried
+    the real, explicit verdict the whole time: `{'successful': False,
+    'errorCodes': ['INVALID_ADDON'], 'titleMessage': 'Apologies! one or
+    more items in your cart are no longer available', ...}`. Two things
+    must hold now: food_mcp.cart.update_cart treats that as an error (not
+    text-mode "success"), and add_flow's addon-only attempt tells the user
+    Swiggy rejected the add-on(s) they picked, not the generic "needs a
+    variant/add-on choice I can't set for you yet" refusal -- which is
+    actively misleading here, since Cravr DID try and DID send the
+    add-ons; Swiggy turned them down.
+    """
+
+    def _fake_call_tool_result(self, text, structured_content):
+        # Minimal stand-in for fastmcp's own CallToolResult dataclass --
+        # only the attributes _unwrap()/update_cart() actually read
+        # (content[i].text, .structured_content, .data, .is_error).
+        content_item = SimpleNamespace(type="text", text=text)
+        return SimpleNamespace(
+            content=[content_item],
+            structured_content=structured_content,
+            data=structured_content,
+            is_error=False,
+        )
+
+    def test_food_mcp_update_cart_treats_an_explicit_rejection_as_an_error(self):
+        raw_result = self._fake_call_tool_result(
+            "Cart updated.\nCart is empty.\n\nCart widget is displayed. "
+            "Wait for the user to review and confirm.",
+            {
+                "successful": False,
+                "errorCodes": ["INVALID_ADDON"],
+                "titleMessage": "Apologies! one or more items in your cart are no longer available",
+                "statusMessage": "Restaurant may have removed the item(s) from their menu.",
+            },
+        )
+        with patch("cravr.food_mcp.call_tool_sync", return_value=raw_result):
+            result = food_mcp.update_cart(
+                "58024", "addr1",
+                [{"menu_item_id": "188424395", "quantity": 1, "addons": [
+                    {"id": "133264885", "name": "Hummus Cup", "group_id": "259942536",
+                     "quantity": 1, "price": 80.0},
+                ]}],
+                restaurant_name="Saladspoint",
+            )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_codes"], ["INVALID_ADDON"])
+        self.assertIn("no longer available", result["message"])
+
+    def test_addon_only_attempt_relays_the_real_rejection_not_the_generic_refusal(self):
+        dish = {
+            "item_name": "Roasted Veggie Pita Pocket",
+            "menu_item_id": "188424395", "restaurant_id": "58024",
+            "restaurant_name": "Saladspoint", "tags": "has addons",
+        }
+        probe = {
+            "items": {}, "has_more": False, "next_offset": None,
+            "detailed_items": {
+                "188424395": {
+                    "item_name": dish["item_name"], "price_inr": 259,
+                    "addon_groups": [{
+                        "group_id": "259942536", "group_name": "Dressing Add On's",
+                        "choices": [
+                            {"id": "133264885", "name": "Hummus Cup", "price_inr": 80, "group_id": "259942536"},
+                        ],
+                    }],
+                    "variant_groups": [],
+                },
+            },
+        }
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        state = {
+            "messages": [HumanMessage(content="add it to cart")],
+            "recommendation_state": {"last_recommendations": [dish]},
+            "context_profile": {"address_id": "addr1"},
+            "intent_profile": {}, "history_profile": {},
+        }
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items", return_value=probe):
+            mock_get_cart.return_value = {"status": "empty", "message": "Cart is empty."}
+            mock_update.return_value = {
+                "status": "error",
+                "message": "Apologies! one or more items in your cart are no longer available",
+                "error_codes": ["INVALID_ADDON"],
+            }
+
+            cravr_app.invoke(state, config=config)
+            second = cravr_app.invoke(Command(resume="133264885"), config=config)
+
+        content = second["messages"][-1].content
+        self.assertIn("Swiggy rejected the add-on(s) you picked", content)
+        self.assertIn("INVALID_ADDON", content)
+        self.assertNotIn("needs a variant/add-on choice I can't set for you yet", content)
 
 
 class MultiGroupAddonSelectionTests(unittest.TestCase):

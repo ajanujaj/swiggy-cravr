@@ -32,7 +32,10 @@ from ..debug_utils import debug
 from ._shared import _unwrap
 
 
-def _call_tool(name: str, arguments: dict[str, Any], *, log_request: bool = False, context: str = "") -> Any:
+def _call_tool(
+    name: str, arguments: dict[str, Any], *, log_request: bool = False, context: str = "",
+    return_meta: bool = False,
+) -> Any:
     """The one place every food_mcp function calls a Swiggy MCP tool
     through: unwraps the response and logs it (`raw <name> response
     [context]: ...`), optionally logging the outgoing request first too.
@@ -56,6 +59,23 @@ def _call_tool(name: str, arguments: dict[str, Any], *, log_request: bool = Fals
     decide their own fallback, since a failure means something different
     per tool (an empty cart vs. an empty search result vs. a hard error),
     so it is deliberately NOT swallowed here.
+
+    `return_meta=True` additionally returns `(raw, meta)`, `meta` being
+    `{"is_error", "structured_content", "data"}` off fastmcp's own
+    `CallToolResult` (see the diagnostic log line above -- same fields,
+    just handed back instead of only logged). Opt-in and defaulted off so
+    every existing call site keeps getting just `raw` back unchanged.
+    Added for update_food_cart specifically: a live INVALID_ADDON rejection
+    (logger.txt, 'Roasted Veggie Pita Pocket', 2026-09-18) came back as
+    `status: success` / `'Cart updated.\nCart is empty.'` in the TEXT
+    content block, while `structured_content` had the real, explicit
+    answer the whole time -- `{'successful': False, 'errorCodes':
+    ['INVALID_ADDON'], 'titleMessage': 'Apologies! one or more items in
+    your cart are no longer available', ...}`. `_unwrap`/text-mode parsing
+    never looked at that field, so `update_cart` had no way to tell "Swiggy
+    rejected this specific add-on" apart from "the write silently no-op'd
+    for an unknown reason" -- both surfaced identically as the generic
+    `_customization_refusal` message.
     """
     if log_request:
         debug("food_mcp", f"{name} request: {arguments!r}")
@@ -107,6 +127,13 @@ def _call_tool(name: str, arguments: dict[str, Any], *, log_request: bool = Fals
     raw = _unwrap(result)
     suffix = f" {context}" if context else ""
     debug("food_mcp", f"raw {name} response{suffix}: {raw!r}")
+    if return_meta:
+        meta = {
+            "is_error": getattr(result, "is_error", None),
+            "structured_content": getattr(result, "structured_content", None),
+            "data": getattr(result, "data", None),
+        }
+        return raw, meta
     return raw
 
 

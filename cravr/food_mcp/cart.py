@@ -162,20 +162,55 @@ def update_cart(
         arguments["restaurantName"] = restaurant_name
 
     try:
-        raw = _call_tool("update_food_cart", arguments, log_request=True)
+        raw, meta = _call_tool("update_food_cart", arguments, log_request=True, return_meta=True)
     except Exception as exc:
         debug("food_mcp", f"update_food_cart FAILED: {exc}")
         return {"status": "error", "message": f"Unable to update cart: {exc}"}
 
+    # fastmcp's `structured_content` is a SEPARATE channel from the text
+    # `raw` above carries -- Swiggy's own machine-readable verdict on the
+    # write, not just a human narrative. Live evidence it matters (2026-09-
+    # 18, 'Roasted Veggie Pita Pocket'): the text came back 'Cart updated.
+    # \nCart is empty.' (which text-mode below would otherwise report as
+    # plain success), while `structured_content` had `'successful': False,
+    # 'errorCodes': ['INVALID_ADDON'], 'titleMessage': 'Apologies! one or
+    # more items in your cart are no longer available'` the whole time.
+    # Guarded with isinstance checks throughout -- this field is undocumented
+    # (Swiggy's docs don't mention it at all), so nothing about its shape is
+    # trusted beyond "a dict, maybe".
+    structured = meta.get("structured_content") if isinstance(meta, dict) else None
+    explicit_failure = isinstance(structured, dict) and structured.get("successful") is False
+    error_codes = structured.get("errorCodes") if explicit_failure else None
+    explicit_reason = None
+    if explicit_failure:
+        explicit_reason = _first(structured, "titleMessage", "statusMessage", default=None)
+
     if isinstance(raw, str):
         message = _strip_widget_disclaimer(raw)
+        if explicit_failure:
+            debug(
+                "food_mcp",
+                f"update_food_cart parsed (text mode) but structured_content says "
+                f"successful=False errorCodes={error_codes!r} reason={explicit_reason!r} -- "
+                f"treating as an error despite the 'Cart updated' text",
+            )
+            return {
+                "status": "error",
+                "message": explicit_reason or message,
+                "error_codes": error_codes,
+            }
         debug("food_mcp", f"update_food_cart parsed (text mode): message={message!r}")
         return {"status": "success", "message": message}
 
     error = _check_success(raw)
-    if error:
-        debug("food_mcp", f"update_food_cart parsed: status='error' message={error!r}")
-        return {"status": "error", "message": error}
+    if error or explicit_failure:
+        final_message = error or explicit_reason or "Request failed"
+        debug(
+            "food_mcp",
+            f"update_food_cart parsed: status='error' message={final_message!r} "
+            f"error_codes={error_codes!r}",
+        )
+        return {"status": "error", "message": final_message, "error_codes": error_codes}
     result = {"status": "success", "message": raw.get("message") if isinstance(raw, dict) else None}
     debug("food_mcp", f"update_food_cart parsed (json mode): {result!r}")
     return result
