@@ -59,7 +59,52 @@ def _call_tool(name: str, arguments: dict[str, Any], *, log_request: bool = Fals
     """
     if log_request:
         debug("food_mcp", f"{name} request: {arguments!r}")
-    raw = _unwrap(call_tool_sync(name, arguments))
+
+    result = call_tool_sync(name, arguments)
+
+    # `result` here is fastmcp's own `CallToolResult` dataclass, not the
+    # raw MCP-protocol one -- it carries `.content` (the human-text blocks
+    # `_unwrap` below reads) but ALSO `.structured_content`, `.data`,
+    # `.meta` and `.is_error`, none of which `_unwrap` ever looks at, and
+    # which -- until this block -- were never logged either, because
+    # `_unwrap` threw them away before `debug()` ever saw the result. That
+    # gap matters specifically for update_food_cart: every real call so
+    # far has come back `status: success` with message 'Cart updated.
+
+    # Cart is empty.', and the RAW (pre-strip) text additionally contains
+    # '...Cart widget is displayed. Wait for the user to review and
+    # confirm.' -- wording that implies the write is staged behind some
+    # kind of widget/confirmation step rather than committed outright.
+    # The MCP protocol's own `CallToolResult` type has a `resultType`
+    # field (`"complete" | "input_required"`) for exactly this "not done
+    # yet, needs more from the client" case -- but fastmcp's wrapper does
+    # NOT surface it (confirmed by reading fastmcp's own
+    # client/mixins/tools.py: it copies `content`/`structured_content`/
+    # `meta`/`is_error` from the raw result but drops `resultType`
+    # entirely), so it can't be recovered from here. `structured_content`/
+    # `data`/`meta` ARE passed through by fastmcp though, and have never
+    # actually been inspected -- logging them raw so the next live
+    # update_food_cart attempt's logger.txt has a chance of showing
+    # whatever Swiggy is putting there instead of just the text
+    # narrative `_strip_widget_disclaimer` throws away.
+    content = getattr(result, "content", None)
+    content_shape = (
+        [
+            {"type": getattr(item, "type", type(item).__name__), "has_text": getattr(item, "text", None) is not None}
+            for item in content
+        ]
+        if isinstance(content, list)
+        else None
+    )
+    debug(
+        "food_mcp",
+        f"{name} raw protocol fields -- is_error={getattr(result, 'is_error', None)!r} "
+        f"meta={getattr(result, 'meta', None)!r} "
+        f"structured_content={getattr(result, 'structured_content', None)!r} "
+        f"data={getattr(result, 'data', None)!r} content_shape={content_shape!r}",
+    )
+
+    raw = _unwrap(result)
     suffix = f" {context}" if context else ""
     debug("food_mcp", f"raw {name} response{suffix}: {raw!r}")
     return raw
