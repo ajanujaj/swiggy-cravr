@@ -340,6 +340,30 @@ def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -
     return matched
 
 
+def _wire_addon(addon: dict[str, Any]) -> dict[str, Any]:
+    """One add-on as `update_food_cart` wants it on the wire.
+
+    CONFIRMED from Swiggy's real tool schema (tools/list, dumped by
+    local_dev/probe.py): each `addons[]` entry is `{choice_id | choiceId,
+    group_id | groupId, name?, price?}`. There is NO `id` and NO
+    `variation_id` on an add-on -- those belong to variants. Every earlier
+    attempt sent `id`, which Swiggy could not read as a choice and answered
+    INVALID_ADDON ("Restaurant may have removed the item(s)"), for every
+    restaurant and every retry shape. `price` is optional and omitted here:
+    search_menu gives rupees, the cart's valid_addons gives paise, and the
+    server prices the choice itself."""
+    def as_num(v):
+        return int(v) if str(v).isdigit() else v
+
+    entry: dict[str, Any] = {
+        "choice_id": as_num(addon.get("choice_id", addon.get("id"))),
+        "group_id": as_num(addon.get("group_id")),
+    }
+    if addon.get("name"):
+        entry["name"] = addon["name"]
+    return entry
+
+
 def _map_to_valid_addons(
     selected: list[dict[str, Any]], valid_groups: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -374,11 +398,10 @@ def _map_to_valid_addons(
 
 def _addon_shapes(mapped: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
     """Candidate request shapes for the `addons` array, most-likely first.
-    Swiggy's docs never spell the request shape out -- they say cart addons
-    "extend the variant structure" (`id, name, group_id, variation_id, price`
-    + `quantity`), and a cart variant is keyed `variation_id` -- and every
-    shape used so far (`id` only) has been answered INVALID_ADDON, so each
-    is tried in turn and the winner is logged. All numeric ids are sent as
+    The first two ("S", "S2") follow Swiggy's real tool schema (`choice_id` /
+    `choiceId` + `group_id` / `groupId`); the rest are the older guesses
+    (`id` / `variation_id`, all answered INVALID_ADDON live) kept only as a
+    last-resort ladder, each tried in turn and the winner logged. All numeric ids are sent as
     ints (that's what the cart's own `valid_addons` uses); `price` is left
     out where the cart holds it in paise, to avoid a rupee/paise mismatch."""
     def gid(m):  # ints, like the cart's own valid_addons
@@ -388,6 +411,10 @@ def _addon_shapes(mapped: list[dict[str, Any]]) -> list[tuple[str, list[dict[str
         return int(m["id"]) if str(m["id"]).isdigit() else m["id"]
 
     return [
+        ("S: schema shape choice_id+group_id+name",
+         [_wire_addon(m) for m in mapped]),
+        ("S2: schema camelCase choiceId+groupId",
+         [{"choiceId": cid(m), "groupId": gid(m)} for m in mapped]),
         ("A: variation_id+group_id+quantity",
          [{"variation_id": cid(m), "group_id": gid(m), "quantity": 1} for m in mapped]),
         ("B: id+group_id+quantity",
@@ -633,18 +660,18 @@ def add_dish_to_cart(
                 # Real user selections when the addon question got any,
                 # else the explicit-empty-selection fallback -- see the
                 # attempt_addon_only comment above.
-                entry["addons"] = target_addons
+                entry["addons"] = target_addons  # already in wire form (see _wire_addon)
             items.append(entry)
         return items
 
-    cart_items_payload = _build_payload(selected_addons)
+    cart_items_payload = _build_payload([_wire_addon(a) for a in selected_addons])
     debug("cart_agent", f"sending merged cartItems={cart_items_payload!r}")
     if attempt_addon_only:
         import json as _json
         debug(
             "cart_agent",
             "addon-diag first attempt: wire JSON=" + _json.dumps(cart_items_payload, default=str)
-            + " | id types=" + repr(sorted({type(a.get("id")).__name__ for e in cart_items_payload
+            + " | id types=" + repr(sorted({type(a.get("choice_id")).__name__ for e in cart_items_payload
                                              for a in e.get("addons", [])}))
             + " | price units=rupees (search_menu), the cart's valid_addons uses paise",
         )

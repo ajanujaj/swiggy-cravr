@@ -943,8 +943,7 @@ class AddonSelectionInterruptTests(unittest.TestCase):
         target_entry, result = self._run_addon_flow("115016421")
         self.assertEqual(
             target_entry.get("addons"),
-            [{"id": "115016421", "name": "Korean Buffalo Sauce", "group_id": "306232169",
-              "quantity": 1, "price": 49}],
+            [{"choice_id": 115016421, "group_id": 306232169, "name": "Korean Buffalo Sauce"}],
         )
         content = result["messages"][0].content
         self.assertNotIn("needs a variant/add-on choice", content)
@@ -1269,8 +1268,8 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
         step1 = next(e for e in mock_update.call_args_list[1][0][2] if e["menu_item_id"] == "32257515")
         step3 = next(e for e in mock_update.call_args_list[2][0][2] if e["menu_item_id"] == "32257515")
         self.assertEqual(step1["addons"], [])
-        # first candidate shape: variation_id + group_id + quantity, int ids
-        self.assertEqual(step3["addons"], [{"variation_id": 25698096, "group_id": 37840188, "quantity": 1}])
+        # first candidate shape follows Swiggy's real schema: choice_id + group_id (+ name)
+        self.assertEqual(step3["addons"], [{"choice_id": 25698096, "group_id": 37840188, "name": "Mushroom"}])
         self.assertNotIn("couldn't be added", result["messages"][-1].content)
 
     _VALID_ONE = {"32257515": [{
@@ -1283,19 +1282,19 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
     def test_request_shapes_are_tried_in_turn_until_one_is_accepted(self):
         rej = {"status": "error", "message": "x", "error_codes": ["INVALID_ADDON"]}
         ok = {"status": "success", "message": "Cart updated."}
-        # first attempt rejected, item alone ok, shape A rejected, shape B accepted
+        # first attempt rejected, item alone ok, shape S rejected, shape S2 accepted
         _, result, mock_update = self._invoke_once(
             "25698096", update_side_effect=[rej, ok, rej, ok], valid_addons=self._VALID_ONE)
         self.assertEqual(mock_update.call_count, 4)
         shape_b = next(e for e in mock_update.call_args_list[3][0][2] if e["menu_item_id"] == "32257515")
-        self.assertEqual(shape_b["addons"], [{"id": 25698096, "group_id": 37840188, "quantity": 1}])
+        self.assertEqual(shape_b["addons"], [{"choiceId": 25698096, "groupId": 37840188}])
 
     def test_when_no_shape_is_accepted_the_plain_dish_is_kept(self):
         rej = {"status": "error", "message": "x", "error_codes": ["INVALID_ADDON"]}
         ok = {"status": "success", "message": "Cart updated."}
         _, result, mock_update = self._invoke_once(
-            "25698096", update_side_effect=[rej, ok, rej, rej, rej, rej], valid_addons=self._VALID_ONE)
-        self.assertEqual(mock_update.call_count, 6)  # 1 first + 1 alone + 4 shapes
+            "25698096", update_side_effect=[rej, ok] + [rej] * 6, valid_addons=self._VALID_ONE)
+        self.assertEqual(mock_update.call_count, 8)  # 1 first + 1 alone + 6 shapes
         self.assertIn("without them", result["messages"][-1].content)
 
     def test_item_rejected_even_alone_reports_the_rejection(self):
@@ -1509,3 +1508,37 @@ class CartConflictTests(unittest.TestCase):
                    return_value={"status": "text", "message": self._LEFTOVER_CART["message"]}):
             CartAgent.cart_agent_node(state)
         flush.assert_not_called()
+
+
+class ISTClockTests(unittest.TestCase):
+    def test_now_ist_is_utc_plus_530(self):
+        from datetime import datetime, timezone
+        from cravr.clock import now_ist
+        delta = now_ist().utcoffset().total_seconds()
+        self.assertEqual(delta, 5.5 * 3600)
+        self.assertLess(abs((now_ist() - datetime.now(timezone.utc)).total_seconds()), 5)
+
+    def test_meal_window_default_uses_ist_not_host_time(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+        from cravr.intent import meal_clock
+        # 06:30 UTC == 12:00 IST -> a lunch-time window, whatever the host TZ is.
+        fake = datetime(2026, 9, 26, 6, 30, tzinfo=timezone.utc).astimezone(__import__("cravr.clock", fromlist=["IST"]).IST)
+        with patch("cravr.intent.meal_clock.now_ist", return_value=fake):
+            window = meal_clock.current_meal_window()
+        self.assertTrue(window.start <= fake.time() <= window.end or window.spans_midnight())
+
+
+class AddonWireFormatTests(unittest.TestCase):
+    """Swiggy's real update_food_cart schema (dumped via local_dev/probe.py):
+    addons[] entries are {choice_id|choiceId, group_id|groupId, name?, price?}.
+    Sending `id` made every add-on INVALID_ADDON on the live service."""
+
+    def test_wire_addon_uses_choice_id_and_group_id_and_drops_price(self):
+        from cravr.cart.add_flow import _wire_addon
+        wire = _wire_addon({"id": "131955669", "name": "Mirinda", "group_id": "195081163",
+                            "quantity": 1, "price": 66.67})
+        self.assertEqual(wire, {"choice_id": 131955669, "group_id": 195081163, "name": "Mirinda"})
+        self.assertNotIn("id", wire)
+        self.assertNotIn("price", wire)
+        self.assertNotIn("variation_id", wire)
