@@ -136,3 +136,27 @@ def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
         "Cart's cleared. Other restaurants with what you were after:", ranked, filters,
         cart_state=cleared_cart_state,
     )
+
+
+def _clear_cart_and_add_pending(state: CravrState, address_id: str) -> dict:
+    """The "Clear my cart and add this" button (see add_flow's
+    `_cart_conflict_reply`): flush the cart, then add the dish that was
+    waiting -- with the add-ons the user already picked, so they aren't
+    asked again."""
+    from .add_flow import add_dish_to_cart  # deferred -- add_flow imports display/guards, not this module
+
+    cart_state = state.get("cart_state") or {}
+    pending = cart_state.get("pending_dish")
+    if not isinstance(pending, dict):
+        return _cart_reply("I don't have a dish waiting to be added -- pick one from the options first.")
+
+    flush_result = food_mcp.flush_cart()
+    debug("cart_agent", f"clear_and_add: flush_cart -> {flush_result!r}; adding {pending.get('item_name')!r}")
+    if flush_result.get("status") != "success":
+        return _cart_reply(f"Couldn't clear the cart: {flush_result.get('message', 'unknown error')}")
+
+    return add_dish_to_cart(
+        pending, address_id, quantity=cart_state.get("pending_quantity") or 1,
+        lead_in="Cart cleared.",
+        preselected_addons=cart_state.get("pending_addons"),
+    )

@@ -17,6 +17,7 @@ from ..debug_utils import debug
 from .display import _cart_reply, _show_cart_with_next_steps
 from .guards import _customization_refusal, _requires_customization
 from .parsing import _parse_existing_cart_items
+from .routing import _CONFLICT_OPTIONS
 
 # Sentinel for "none of these" on an addon question -- same
 # fixed-value-independent-of-label convention as options.OTHER_VALUE and
@@ -450,9 +451,38 @@ def _retry_addons_via_valid_addons(
     )
 
 
+def _cart_conflict_reply(
+    dish: dict[str, Any], quantity: int, existing_name: str | None,
+    addons: list[dict[str, Any]] | None,
+) -> dict:
+    """The cart holds something from a different restaurant. Swiggy carts are
+    single-restaurant, so say so plainly and offer to clear-and-add -- the
+    dish and any add-ons already picked are parked in `cart_state` for the
+    button (see flows._clear_cart_and_add_pending).
+
+    Live evidence (logger.txt 2026-09-26, two occurrences): a plain dish left
+    in the real cart by an earlier chat, then a dish from another restaurant
+    merged into the same update_food_cart -> `INVALID_ITEM_IDS_IN_REQUEST`.
+    That used to surface as "Swiggy rejected the add-on(s) you picked", which
+    was wrong -- the add-ons were never the problem."""
+    where = f" from {existing_name}" if existing_name else " from another restaurant"
+    content = (
+        f"Your Swiggy cart already has items{where}, and a cart can only hold one restaurant at a time, "
+        f"so I couldn't add {dish.get('item_name') or 'that dish'}"
+        f"{' from ' + str(dish.get('restaurant_name')) if dish.get('restaurant_name') else ''}. "
+        "Want me to clear your cart and add it instead?"
+    )
+    return _cart_reply(
+        content,
+        pending_dish=dish, pending_quantity=quantity, pending_addons=addons,
+        options=_CONFLICT_OPTIONS,
+    )
+
+
 def add_dish_to_cart(
     dish: dict[str, Any], address_id: str, quantity: int = 1, lead_in: str = "",
     known_restaurant_id: str | None = None, known_restaurant_name: str | None = None,
+    preselected_addons: list[dict[str, Any]] | None = None,
 ) -> dict:
     """Add one dish via update_cart, then show the result via get_cart.
     Single call site for "how a dish gets added" -- used by both this
@@ -495,16 +525,7 @@ def add_dish_to_cart(
         known_restaurant_id
         and str(known_restaurant_id) != str(restaurant_id)
     ):
-        existing_name = known_restaurant_name or "your current restaurant"
-        content = (
-            f"Your cart already has items from {existing_name}, and Swiggy carts can only hold one "
-            f"restaurant at a time -- so I haven't added {dish.get('item_name', 'that item')} from "
-            f"{dish.get('restaurant_name') or 'this restaurant'}. Use \"Browse other restaurants\" from "
-            "your cart to clear it and start fresh here, or pick something from your current restaurant instead."
-        )
-        # Same lesson as the addon guard below: lead_in assumes success
-        # ("Great -- X it is."), so it is dropped rather than prefixed.
-        return _cart_reply(content)
+        return _cart_conflict_reply(dish, quantity, known_restaurant_name, preselected_addons)
 
     # Set below when this item is addon-only (no variant/size choice) --
     # threads through to the merged cart_items_payload build and gets a
@@ -561,18 +582,23 @@ def add_dish_to_cart(
         # verify either way; if verification shows the item didn't actually
         # land, the same honest refusal is returned rather than a broken/
         # misleading cart display.
-        addon_groups = _fetch_addon_groups(
-            str(dish.get("item_name") or ""), str(dish.get("menu_item_id") or ""),
-            address_id, str(restaurant_id),
-        )
-        debug(
-            "cart_agent",
-            f"addon groups for {dish.get('item_name')!r}: "
-            f"{[g.get('group_name') for g in addon_groups]!r}",
-        )
-        if addon_groups:
-            selected_addons = _ask_for_all_addons(str(dish.get("item_name") or ""), addon_groups)
-            debug("cart_agent", f"user-selected addons for {dish.get('item_name')!r}: {selected_addons!r}")
+        if preselected_addons is not None:
+            # Re-adding after "Clear my cart and add this": the user already answered.
+            selected_addons = preselected_addons
+            debug("cart_agent", f"re-using previously picked addons for {dish.get('item_name')!r}: {selected_addons!r}")
+        else:
+            addon_groups = _fetch_addon_groups(
+                str(dish.get("item_name") or ""), str(dish.get("menu_item_id") or ""),
+                address_id, str(restaurant_id),
+            )
+            debug(
+                "cart_agent",
+                f"addon groups for {dish.get('item_name')!r}: "
+                f"{[g.get('group_name') for g in addon_groups]!r}",
+            )
+            if addon_groups:
+                selected_addons = _ask_for_all_addons(str(dish.get("item_name") or ""), addon_groups)
+                debug("cart_agent", f"user-selected addons for {dish.get('item_name')!r}: {selected_addons!r}")
         attempt_addon_only = True
 
     # Swiggy's update_food_cart is documented as additive ("Add items to
@@ -630,6 +656,18 @@ def add_dish_to_cart(
     )
     debug("cart_agent", f"update_cart -> {result!r}")
 
+    # Something from ANOTHER restaurant is already in the real Swiggy cart
+    # (typically left over from an earlier chat, so the in-memory guard above
+    # couldn't know) -- see _cart_conflict_reply.
+    if (
+        result.get("status") != "success"
+        and "INVALID_ITEM_IDS_IN_REQUEST" in (result.get("error_codes") or [])
+        and any(str(i.get("menu_item_id")) != str(menu_item_id) for i in existing_items)
+    ):
+        debug("cart_agent", "cart conflict: existing cart items don't belong to this restaurant -- "
+              "offering clear-and-add")
+        return _cart_conflict_reply(dish, quantity, known_restaurant_name, selected_addons if attempt_addon_only else None)
+
     # Live evidence (logger.txt 2026-09-26, 'Greek Falafel Salad', addon
     # 'Sun Dried Tomatoes Topping'): sending the picked add-ons in the same
     # call that adds the item came back INVALID_ADDON ("Restaurant may have
@@ -660,6 +698,14 @@ def add_dish_to_cart(
             # which is actively misleading here: Cravr DID try, and DID send
             # the add-ons the user picked -- Swiggy turned them down.
             error_codes = result.get("error_codes")
+            if error_codes and "INVALID_ADDON" not in error_codes:
+                # Not an add-on problem -- don't blame the add-ons.
+                debug("cart_agent", f"addon-only attempt: non-addon rejection {error_codes!r}")
+                content = (
+                    f"Couldn't add {dish.get('item_name') or 'that item'} to your cart "
+                    f"({', '.join(error_codes)}): {result.get('message') or 'Swiggy rejected the request'}"
+                )
+                return _cart_reply(f"{lead_in} {content}".strip() if False else content)
             if error_codes:
                 reason = result.get("message") or "one or more add-ons weren't accepted"
                 debug("cart_agent", f"addon-only attempt: explicit rejection {error_codes!r} -- {reason!r}")

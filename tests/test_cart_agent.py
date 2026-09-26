@@ -1197,8 +1197,9 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
         }
         with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
              patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
-             patch("cravr.cart.CartAgent.food_mcp.get_cart_valid_addons",
-                   return_value=valid_addons or {}), \
+             patch("cravr.cart.CartAgent.food_mcp.get_cart_item_details",
+                   return_value={k: {"variants": [], "addons": [], "valid_addons": v}
+                                 for k, v in (valid_addons or {}).items()}), \
              patch("cravr.cart.CartAgent.food_mcp.search_menu_items", return_value=self._DETAILED_PROBE):
             mock_get_cart.return_value = {"status": "text", "message": self._LANDED_MESSAGE}
             mock_get_cart.side_effect = None
@@ -1268,8 +1269,40 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
         step1 = next(e for e in mock_update.call_args_list[1][0][2] if e["menu_item_id"] == "32257515")
         step3 = next(e for e in mock_update.call_args_list[2][0][2] if e["menu_item_id"] == "32257515")
         self.assertEqual(step1["addons"], [])
-        self.assertEqual([a["id"] for a in step3["addons"]], ["25698096"])
+        # first candidate shape: variation_id + group_id + quantity, int ids
+        self.assertEqual(step3["addons"], [{"variation_id": 25698096, "group_id": 37840188, "quantity": 1}])
         self.assertNotIn("couldn't be added", result["messages"][-1].content)
+
+    _VALID_ONE = {"32257515": [{
+        "group_id": "37840188", "group_name": "Choose Your Veg Toppings",
+        "min_addons": None, "max_addons": 3,
+        "choices": [{"id": "25698096", "name": "Mushroom", "price_inr": 75, "group_id": "37840188",
+                     "raw": {"id": "25698096", "name": "Mushroom", "price": 7500}}],
+    }]}
+
+    def test_request_shapes_are_tried_in_turn_until_one_is_accepted(self):
+        rej = {"status": "error", "message": "x", "error_codes": ["INVALID_ADDON"]}
+        ok = {"status": "success", "message": "Cart updated."}
+        # first attempt rejected, item alone ok, shape A rejected, shape B accepted
+        _, result, mock_update = self._invoke_once(
+            "25698096", update_side_effect=[rej, ok, rej, ok], valid_addons=self._VALID_ONE)
+        self.assertEqual(mock_update.call_count, 4)
+        shape_b = next(e for e in mock_update.call_args_list[3][0][2] if e["menu_item_id"] == "32257515")
+        self.assertEqual(shape_b["addons"], [{"id": 25698096, "group_id": 37840188, "quantity": 1}])
+
+    def test_when_no_shape_is_accepted_the_plain_dish_is_kept(self):
+        rej = {"status": "error", "message": "x", "error_codes": ["INVALID_ADDON"]}
+        ok = {"status": "success", "message": "Cart updated."}
+        _, result, mock_update = self._invoke_once(
+            "25698096", update_side_effect=[rej, ok, rej, rej, rej, rej], valid_addons=self._VALID_ONE)
+        self.assertEqual(mock_update.call_count, 6)  # 1 first + 1 alone + 4 shapes
+        self.assertIn("without them", result["messages"][-1].content)
+
+    def test_item_rejected_even_alone_reports_the_rejection(self):
+        rej = {"status": "error", "message": "x", "error_codes": ["INVALID_ADDON"]}
+        _, result, mock_update = self._invoke_once("25698096", update_side_effect=[rej, rej])
+        self.assertEqual(mock_update.call_count, 2)
+        self.assertIn("couldn't be added", result["messages"][-1].content)
 
     def test_invalid_addon_with_no_valid_addons_keeps_the_plain_dish(self):
         rejection = {"status": "error", "message": "Apologies!", "error_codes": ["INVALID_ADDON"]}
@@ -1280,6 +1313,43 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
         content = result["messages"][-1].content
         self.assertIn("without them", content)
         self.assertNotIn("couldn't be added", content)
+
+    def test_required_group_is_asked_again_when_the_reply_skips_it(self):
+        """Live regression (Gourmet Veg Caesar Salad): 'Dressing &
+        Accompaniments' had minAddons=1; a reply that skipped it was sent
+        anyway and rejected with INVALID_ADDON -- even the plain item was."""
+        probe = {"items": {}, "has_more": False, "next_offset": None, "detailed_items": {
+            "32257515": {"item_name": "Salad", "price_inr": 399, "variant_groups": [],
+                         "addon_groups": [
+                {"group_id": "gd", "group_name": "Dressing", "min_addons": 1, "max_addons": 1, "choices": [
+                    {"id": "10", "name": "Caesar Yoghurt", "price_inr": 0, "group_id": "gd"},
+                    {"id": "11", "name": "Olive Oil", "price_inr": 0, "group_id": "gd"}]},
+                {"group_id": "gf", "group_name": "Fruit", "max_addons": 5, "choices": [
+                    {"id": "20", "name": "Plum", "price_inr": 40, "group_id": "gf"}]}]}}}
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        state = {"messages": [HumanMessage(content="add it to cart")],
+                 "recommendation_state": {"last_recommendations": [self._DISH]},
+                 "context_profile": {"address_id": "addr1"}, "intent_profile": {}, "history_profile": {}}
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as gc, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as up, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items", return_value=probe):
+            gc.side_effect = [{"status": "empty", "message": "Cart is empty."}] + \
+                [{"status": "text", "message": self._LANDED_MESSAGE}] * 5
+            up.return_value = {"status": "success", "message": "Cart updated."}
+            first = cravr_app.invoke(state, config=config)
+            q1 = first["__interrupt__"][0].value
+            self.assertIn("REQUIRED", q1["question"])
+            # required group listed first
+            self.assertEqual(q1["options"][0]["group"], "Dressing")
+            second = cravr_app.invoke(Command(resume="20"), config=config)  # only the optional fruit
+            self.assertTrue(second.get("__interrupt__"), "must re-ask about the required group")
+            q2 = second["__interrupt__"][0].value
+            self.assertEqual({o["value"] for o in q2["options"]}, {"10", "11"})
+            self.assertNotIn("__no_addon__", {o["value"] for o in q2["options"]})
+            third = cravr_app.invoke(Command(resume="10"), config=config)
+            self.assertFalse(third.get("__interrupt__"))
+        sent = next(e for e in up.call_args[0][2] if e["menu_item_id"] == "32257515")
+        self.assertEqual({a["name"] for a in sent["addons"]}, {"Plum", "Caesar Yoghurt"})
 
 
 class MatchAddonReplyTests(unittest.TestCase):
@@ -1348,3 +1418,94 @@ class MatchAddonReplyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class CartItemDetailsParsingTests(unittest.TestCase):
+    """food_mcp.get_cart_item_details reads valid_addons/variants off
+    get_food_cart's structured_content -- live shape from logger.txt
+    (2026-09-26, Harvest Salad Co): ids are INTs and valid_addons prices are
+    PAISE, group names live under `group_name`."""
+
+    def test_parses_the_live_shape(self):
+        structured = {"statusCode": 6, "data": {"items": [{
+            "menu_item_id": 205083764, "quantity": 1,
+            "variants": [{"variation_id": 226498675, "group_id": 77918327, "name": "Small"}],
+            "addons": [],
+            "valid_addons": [{
+                "group_id": 308598175, "group_name": "Add Grain", "minAddons": 0, "maxAddons": 1,
+                "choices": [{"id": 149928102, "name": "Brown Rice", "price": 4000, "inStock": 1}],
+            }],
+        }]}}
+        result_obj = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="Items (1): ...")],
+            structured_content=structured, data=None, is_error=False, meta=None,
+        )
+        from cravr import food_mcp
+        with patch("cravr.food_mcp.call_tool_sync", return_value=result_obj):
+            details = food_mcp.get_cart_item_details("addr1")
+        item = details["205083764"]
+        self.assertEqual(item["variants"][0]["variation_id"], 226498675)
+        group = item["valid_addons"][0]
+        self.assertEqual((group["group_id"], group["group_name"], group["max_addons"]),
+                         ("308598175", "Add Grain", 1))
+        choice = group["choices"][0]
+        self.assertEqual((choice["id"], choice["price_inr"], choice["raw"]["price"]), ("149928102", 40.0, 4000))
+
+
+class CartConflictTests(unittest.TestCase):
+    """A dish from another restaurant while the real Swiggy cart still holds
+    leftovers -> INVALID_ITEM_IDS_IN_REQUEST. Must be reported as a cart
+    conflict with clear/keep buttons, not as an add-on rejection."""
+
+    _DISH = {"item_name": "Paneer Wrap", "menu_item_id": "555", "restaurant_id": "9",
+             "restaurant_name": "Wrap Place"}
+    _LEFTOVER_CART = {"status": "text", "message": "Items (1):\n- Greek Falafel Salad — ₹300 (ID: 111)"}
+
+    def test_leftover_items_rejected_offers_clear_and_add(self):
+        from cravr.cart.routing import CART_CLEAR_AND_ADD_VALUE, CART_KEEP_VALUE
+        rej = {"status": "error", "message": "Cart updated.\nCart is empty.",
+               "error_codes": ["INVALID_ITEM_IDS_IN_REQUEST"]}
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=self._LEFTOVER_CART), \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart", return_value=rej):
+            result = CartAgent.add_dish_to_cart(self._DISH, "addr1", quantity=1, lead_in="")
+        cs = result["cart_state"]
+        self.assertEqual([o["value"] for o in cs["options"]], [CART_CLEAR_AND_ADD_VALUE, CART_KEEP_VALUE])
+        self.assertEqual(cs["pending_dish"], self._DISH)
+        text = result["messages"][-1].content
+        self.assertIn("one restaurant", text)
+        self.assertNotIn("add-on", text.lower())
+
+    def test_clear_and_add_button_flushes_then_adds(self):
+        from cravr.cart.routing import CART_CLEAR_AND_ADD_VALUE
+        state = {
+            "messages": [HumanMessage(content=CART_CLEAR_AND_ADD_VALUE)],
+            "cart_state": {"pending_dish": self._DISH, "pending_quantity": 1},
+            "context_profile": {"address_id": "addr1"},
+            "intent_profile": {}, "history_profile": {}, "recommendation_state": {},
+        }
+        landed = {"status": "text", "message": "Items (1):\n- Paneer Wrap — ₹200 (ID: 555)\nTO PAY: ₹200"}
+        with patch("cravr.cart.CartAgent.food_mcp.flush_cart",
+                   return_value={"status": "success", "message": "flushed"}) as flush, \
+             patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   side_effect=[{"status": "empty", "message": "Cart is empty."}, landed, landed]), \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart",
+                   return_value={"status": "success", "message": "Cart updated."}) as upd:
+            CartAgent.cart_agent_node(state)
+        flush.assert_called_once()
+        sent = upd.call_args[0][2]
+        self.assertEqual([i["menu_item_id"] for i in sent], ["555"])
+
+    def test_keep_button_leaves_cart_alone(self):
+        from cravr.cart.routing import CART_KEEP_VALUE
+        state = {
+            "messages": [HumanMessage(content=CART_KEEP_VALUE)],
+            "cart_state": {"pending_dish": self._DISH},
+            "context_profile": {"address_id": "addr1"},
+            "intent_profile": {}, "history_profile": {}, "recommendation_state": {},
+        }
+        with patch("cravr.cart.CartAgent.food_mcp.flush_cart") as flush, \
+             patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "text", "message": self._LEFTOVER_CART["message"]}):
+            CartAgent.cart_agent_node(state)
+        flush.assert_not_called()

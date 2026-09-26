@@ -11,7 +11,7 @@ from ..profile_utils import latest_user_text
 from ..state import CravrState
 from .add_flow import add_dish_to_cart
 from .display import _cart_reply, _show_cart_with_next_steps
-from .flows import _start_over_new_restaurant, _suggest_more_from_restaurant
+from .flows import _clear_cart_and_add_pending, _start_over_new_restaurant, _suggest_more_from_restaurant
 from .restaurant_context import _current_restaurant_id, _current_restaurant_name
 from .routing import _classify_cart_action, _log_action
 
@@ -86,5 +86,11 @@ def cart_agent_node(state: CravrState) -> dict:
 
     if action == "start_over":
         return _start_over_new_restaurant(state, address_id)
+
+    if action == "clear_and_add":
+        return _clear_cart_and_add_pending(state, address_id)
+
+    if action == "keep_cart":
+        return _show_cart_with_next_steps(address_id, lead_in="Okay -- keeping your cart as it is.")
 
     return _show_cart_with_next_steps(address_id)

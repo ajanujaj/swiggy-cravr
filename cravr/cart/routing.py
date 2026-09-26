@@ -40,7 +40,19 @@ _QTY_RE = re.compile(r"\b(\d+)\b")
 CART_ADD_MORE_VALUE = "__cart_add_more__"
 CART_PROCEED_VALUE = "__cart_proceed__"
 CART_START_OVER_VALUE = "__cart_start_over__"
-_NEXT_STEP_SENTINELS = {CART_ADD_MORE_VALUE, CART_PROCEED_VALUE, CART_START_OVER_VALUE}
+# Offered when the dish being added belongs to a different restaurant than
+# what the Swiggy cart already holds (Swiggy carts are single-restaurant).
+CART_CLEAR_AND_ADD_VALUE = "__cart_clear_and_add__"
+CART_KEEP_VALUE = "__cart_keep__"
+_NEXT_STEP_SENTINELS = {
+    CART_ADD_MORE_VALUE, CART_PROCEED_VALUE, CART_START_OVER_VALUE,
+    CART_CLEAR_AND_ADD_VALUE, CART_KEEP_VALUE,
+}
+
+_CONFLICT_OPTIONS = [
+    {"value": CART_CLEAR_AND_ADD_VALUE, "label": "Clear my cart and add this"},
+    {"value": CART_KEEP_VALUE, "label": "Keep my cart as it is"},
+]
 
 _NEXT_STEP_OPTIONS = [
     {"value": CART_ADD_MORE_VALUE, "label": "Add more from this restaurant"},
@@ -70,6 +82,10 @@ def _classify_cart_action(text: str) -> tuple[str, Any]:
         return "proceed_placeholder", None
     if t == CART_START_OVER_VALUE:
         return "start_over", None
+    if t == CART_CLEAR_AND_ADD_VALUE:
+        return "clear_and_add", None
+    if t == CART_KEEP_VALUE:
+        return "keep_cart", None
     if _CLEAR_RE.search(t):
         return "clear", None
     coupon_match = _COUPON_APPLY_RE.search(t)

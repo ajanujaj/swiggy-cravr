@@ -172,3 +172,29 @@ class ParseDetailedSearchMenuItemsVariantsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class DetailedAddonGroupNameWithBracketsTests(unittest.TestCase):
+    """Live regression (logger.txt 2026-09-26, Harvest Salad Co): groups whose
+    NAME contains brackets -- ' Add Protein And Veggie Boosts (Veg & Non-veg)',
+    'Make It A Meal (Sides & Drinks)' -- were silently dropped by the parser,
+    so 2 of a dish's 5 add-on groups never reached the user."""
+
+    def test_group_names_containing_brackets_are_kept(self):
+        from cravr.food_mcp import _parse_detailed_search_menu_items
+        text = (
+            'Found 1 menu items for "x":\n'
+            "1. Greek Falafel Salad (Veg) — ₹299 | Veg | 3.8★ (3) (ID: 205083764)\n"
+            "   Addons (Add Grain): [Brown Rice ₹40 (group:308598175, choice:149928102)]\n"
+            "   Addons ( Add Protein And Veggie Boosts (Veg & Non-veg)): "
+            "[Extra Herbed Paneer ₹90 (group:308598176, choice:151898192)]\n"
+            "   Addons (Make It A Meal (Sides & Drinks)): "
+            "[Mixed Berry Cooler ₹99 (group:308598179, choice:152248148)]\n"
+        )
+        groups = _parse_detailed_search_menu_items(text)["205083764"]["addon_groups"]
+        self.assertEqual(
+            [g["group_name"] for g in groups],
+            ["Add Grain", "Add Protein And Veggie Boosts (Veg & Non-veg)", "Make It A Meal (Sides & Drinks)"],
+        )
+        self.assertEqual(groups[1]["choices"][0]["id"], "151898192")
