@@ -54,14 +54,10 @@ DEFAULT_HUNGER = "medium"
 
 @dataclass(frozen=True)
 class MealWindow:
-    """One slice of the day and the meal intents plausible inside it."""
-
     name: str
     start: time
     end: time
-    # First option is the "obvious" answer for this window and is used as the
-    # fallback when the user's reply can't be matched to anything.
-    options: tuple[tuple[str, str], ...]  # (value, human label)
+    options: tuple[tuple[str, str], ...]
 
     @property
     def default_intent(self) -> str:
@@ -71,9 +67,6 @@ class MealWindow:
         return self.start > self.end
 
 
-# Ordered windows covering all 24 hours. The late-night window wraps midnight, hence the
-# explicit `spans_midnight` branch instead of a naive `start <= t <= end`. Option sets encode
-# a real asymmetry -- at 3pm "lunch" is no longer on offer, so fewer options beat an impossible one.
 MEAL_WINDOWS: tuple[MealWindow, ...] = (
     MealWindow(
         name="breakfast",

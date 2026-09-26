@@ -1,9 +1,3 @@
-"""Swiggy OAuth 2.1 + PKCE client: /oauth/login starts it, /oauth/callback
-finishes it. Uses Dynamic Client Registration (RFC 7591) + metadata
-discovery (RFC 8414 / RFC 9728), so the only thing Swiggy needs to
-whitelist is the redirect URI -- no static client_id/secret.
-"""
-
 from __future__ import annotations
 
 import base64
@@ -23,8 +17,6 @@ from starlette.responses import HTMLResponse, RedirectResponse
 TOKENS_PATH = Path(__file__).resolve().parent / "data" / "swiggy_tokens.json"
 CLIENT_PATH = Path(__file__).resolve().parent / "data" / "swiggy_client.json"
 
-# PKCE verifier per pending login `state`, in-memory only -- a restart just
-# means the user clicks "Connect to Swiggy" again.
 _PENDING: dict[str, dict[str, Any]] = {}
 _PENDING_TTL_SECONDS = 600
 
@@ -77,8 +69,6 @@ def _save_client(payload: dict[str, Any]) -> None:
 
 
 def _well_known_candidates(base_url: str, well_known_name: str) -> list[str]:
-    # RFC 8414 / RFC 9728 metadata can live at either the path-aware form
-    # or the origin root -- try path-aware first.
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path.rstrip("/")
@@ -116,8 +106,6 @@ async def _discover_metadata(http_client: httpx.AsyncClient, mcp_url: str) -> di
 
 
 async def _bootstrap(http_client: httpx.AsyncClient, mcp_url: str) -> dict[str, Any]:
-    """Discover Swiggy's OAuth endpoints and register Cravr as a client
-    (RFC 7591) if that hasn't happened yet, caching the result."""
     cached = _load_client()
     if cached and cached.get("client_id") and cached.get("metadata"):
         return cached

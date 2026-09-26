@@ -1,5 +1,3 @@
-"""Context Discovery agent: turns a food-ordering request into structured context."""
-
 from __future__ import annotations
 
 import json
@@ -13,7 +11,6 @@ from ..state import CravrState
 
 
 def fetch_user_location(user_id: str | None) -> dict[str, Any]:
-    """Fetch saved delivery location without asking the user for it."""
     if using_real_food_mcp():
         return food_mcp.get_saved_address()
 
@@ -37,18 +34,10 @@ def fetch_user_location(user_id: str | None) -> dict[str, Any]:
 
 
 def context_discovery_node(state: CravrState) -> dict:
-    """Second workflow node: enrich state with saved delivery context.
-
-    Context is ambient. It must not call an LLM, fabricate live conditions,
-    or create user-facing clarification questions when location data is
-    unavailable.
-    """
     user_id = state.get("user_id")
     existing_profile = state.get("context_profile") or {}
 
     if existing_profile.get("address_id"):
-        # user_preference_node already resolved this earlier this turn -- reuse it
-        # instead of calling get_addresses again for the same account.
         location_result = {"status": "success", **existing_profile}
     else:
         location_result = fetch_user_location(user_id)

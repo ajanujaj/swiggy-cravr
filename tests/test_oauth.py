@@ -1,13 +1,3 @@
-"""Tests for mcp_server/oauth.py -- the Swiggy OAuth callback that has to
-exist (and behave sanely) before Swiggy will whitelist its URL, well before
-real Swiggy credentials are configured.
-
-`login`/`callback` take a Starlette `Request` and don't need FastMCP or the
-HTTP server actually running -- a bare `Request` built from an ASGI-style
-scope is enough to exercise them directly, the same way FastMCP's routing
-would call them.
-"""
-
 import time
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -53,8 +43,6 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("client_id=cravr-client", location)
         self.assertIn("code_challenge_method=S256", location)
         self.assertIn("response_type=code", location)
-        # Exactly one pending PKCE verifier was stashed, keyed by the state
-        # just put on the redirect -- callback() needs to find it later.
         self.assertEqual(len(oauth._PENDING), 1)
         (state, entry) = next(iter(oauth._PENDING.items()))
         self.assertIn(f"state={state}", location)
@@ -75,23 +63,18 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
         self.save_tokens.assert_not_called()
 
     async def test_missing_code_or_state_is_rejected(self):
-        response = await oauth.callback(make_request("code=abc123"))  # no state
+        response = await oauth.callback(make_request("code=abc123"))
 
         self.assertEqual(response.status_code, 400)
         self.save_tokens.assert_not_called()
 
     async def test_unknown_or_expired_state_is_rejected(self):
-        """Guards against a forged/replayed callback -- state must match a
-        login this server actually started."""
         response = await oauth.callback(make_request("code=abc123&state=never-issued"))
 
         self.assertEqual(response.status_code, 400)
         self.save_tokens.assert_not_called()
 
     async def test_not_configured_leaves_the_code_unexchanged(self):
-        """A pending state exists (login happened) but SWIGGY_TOKEN_URL /
-        SWIGGY_CLIENT_ID aren't set yet -- must not crash, and must not
-        silently drop the pending PKCE entry as if it had been used."""
         oauth._PENDING["state-1"] = {"verifier": "v", "created_at": time.time()}
 
         with patch.dict("os.environ", {}, clear=True):
@@ -118,12 +101,9 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.save_tokens.assert_called_once_with(token_payload)
-        # The verifier that came from *this* login, not a fresh one, is what
-        # must be sent back -- that's the whole point of PKCE.
         sent_data = mock_post.call_args.kwargs["data"]
         self.assertEqual(sent_data["code_verifier"], "the-verifier")
         self.assertEqual(sent_data["code"], "abc123")
-        # Consumed -- a replayed callback with the same state must fail.
         self.assertNotIn("state-1", oauth._PENDING)
 
     async def test_upstream_rejection_is_surfaced_and_nothing_is_saved(self):

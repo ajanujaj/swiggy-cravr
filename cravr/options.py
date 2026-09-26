@@ -1,11 +1,3 @@
-"""Generic LLM-backed multiple-choice suggestions for clarification questions.
-`suggest_options()` turns a free-text clarification question into a short,
-tappable menu; `resolve_option_choice()` maps the reply (a digit, an
-option's own text, or unanticipated free text) back into a plain value.
-Any `interrupt({"question": q, "options": []})` call can switch to
-`suggest_options(q, ...)` to get the same treatment.
-"""
-
 from __future__ import annotations
 
 import json
@@ -16,8 +8,6 @@ from .debug_utils import debug
 from .llm import get_llm
 from .schemas import SuggestedOptions
 
-# Sentinel for the "type your own" option. Never a real field value -- callers must catch it
-# and ask a follow-up free-text question instead.
 OTHER_VALUE = "__other__"
 OTHER_LABEL = "Something else (type your own)"
 
@@ -46,11 +36,6 @@ def suggest_options(
     include_other: bool = True,
     max_options: int = 5,
 ) -> list[dict[str, str]]:
-    """LLM-suggested tappable answers for `question`, with a static fallback.
-    Returns interrupt-payload option dicts (`{"value", "label"}`), ending with
-    an "other" escape hatch by default. Never raises -- any model failure falls
-    back to `fallback` so a clarification question is never blocked on the LLM.
-    """
     labels: list[str] = []
     try:
         structured_llm = get_llm().with_structured_output(SuggestedOptions)
@@ -71,7 +56,6 @@ def suggest_options(
     if not labels:
         labels = list(fallback or [])
 
-    # De-dupe, preserving order -- the model occasionally repeats itself.
     seen: set[str] = set()
     deduped: list[str] = []
     for label in labels:
@@ -87,10 +71,6 @@ def suggest_options(
 
 
 def resolve_option_choice(answer: str, options: list[dict]) -> str:
-    """Map a numbered or typed-out reply onto the option it picked. Falls through to the
-    raw answer unchanged when no options were offered or none match -- free text the menu
-    didn't anticipate must keep working as before options existed.
-    """
     if not options:
         return answer
     normalized = (answer or "").strip().lower().rstrip(".!")

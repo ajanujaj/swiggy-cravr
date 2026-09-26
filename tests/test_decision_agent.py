@@ -13,10 +13,6 @@ def state_with(intent_profile, user_text="Suggest something for dinner", **extra
 
 
 class DecisionAgentNeverAsksTests(unittest.TestCase):
-    """decision_agent_node never calls `interrupt()` -- it always
-    recommends immediately. (intent_discovery_node and cart_agent's
-    add_flow._ask_for_addon_choices are the two nodes that do.)"""
-
     def test_does_not_import_or_use_interrupt(self):
         import cravr.decision.decisionAgent as module
 
@@ -24,9 +20,6 @@ class DecisionAgentNeverAsksTests(unittest.TestCase):
 
 
 class DecisionAgentAlwaysRecommendsTests(unittest.TestCase):
-    """No LLM call left in this node to stub -- it's straight-line code, so
-    these exercise it directly."""
-
     def test_freezes_a_recommendation_brief(self):
         state = state_with({"craving": "biryani", "cuisine": "North Indian"})
 
@@ -38,9 +31,6 @@ class DecisionAgentAlwaysRecommendsTests(unittest.TestCase):
         self.assertIn("filters", result["recommendation_brief"])
 
     def test_recommends_even_with_an_empty_profile(self):
-        """Never asks, whatever's in the profile -- gaps are the
-        recommender's problem to search loosely around, not a reason to
-        interrupt."""
         state = state_with({})
 
         result = decision_agent_node(state)

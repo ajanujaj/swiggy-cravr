@@ -1,8 +1,3 @@
-"""Rendering the cart back to the user: plain-text formatting (Swiggy's
-get_food_cart returns no itemized breakdown of its own) plus the reusable
-`_cart_reply` node-return shape and the "what next" button attachment.
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -37,9 +32,6 @@ def _format_cart(cart: dict[str, Any]) -> str:
         if coupon:
             body += f"\nCoupon applied: {coupon} (-₹{cart.get('coupon_discount', 0)})"
         return body
-    # No structured items -- the real get_food_cart returns plain text with
-    # no itemized breakdown (Swiggy expects a widget to show that), so its
-    # own status message ("Cart is empty.", etc.) is all there is to show.
     return cart.get("message") or "Your cart is empty."
 
 
@@ -54,13 +46,6 @@ def _show_cart(address_id: str, lead_in: str = "") -> dict:
 
 
 def _show_cart_with_next_steps(address_id: str, lead_in: str = "") -> dict:
-    """`_show_cart`, plus the "what next" buttons (add more / proceed /
-    browse other restaurants) whenever the cart actually has something in
-    it -- attached after the fact rather than threading an `options` param
-    through every `_show_cart` caller, so the buttons show up everywhere
-    the cart does (every add, "show my cart", after applying a coupon),
-    per the design: offer them any time the cart is displayed, not just
-    right after the first add."""
     result = _show_cart(address_id, lead_in=lead_in)
     cart_state = result.get("cart_state") or {}
     if cart_state.get("status") in ("text", "success"):

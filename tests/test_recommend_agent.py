@@ -20,28 +20,17 @@ from cravr.recommend.RecommendAgent import (
 
 
 class RecommendationFilterTests(unittest.TestCase):
-    """`summary` must never leak into the MCP tool's arguments (see
-    _build_recommendation_filters docstring) -- that was a real bug where
-    every recommendation call failed argument validation and silently
-    returned no results, regardless of how complete the profile was."""
-
     def test_summary_is_never_forwarded_as_a_filter(self):
         filters = _build_recommendation_filters({"craving": "spicy food"})
         self.assertNotIn("summary", filters)
 
     def test_free_text_craving_is_not_sent_as_a_tag(self):
-        """`tags` is AND-matched against a closed vocabulary in menu.csv;
-        "noodles" is not in it, so forwarding it guarantees zero results."""
         filters = _build_recommendation_filters(
             {"craving": "noodles", "taste_preference": ["spicy", "tangy"]}
         )
         self.assertEqual(filters["tags"], "spicy,tangy")
 
     def test_cuisine_is_never_injected_into_tags(self):
-        """The original bug: cuisine fell through to `tags` via
-        `craving or cuisine`, so every dish had to carry an "Indian" tag.
-        No menu row does -- cuisine is its own column -- so the AND-match
-        collapsed the result set to zero on every call."""
         filters = _build_recommendation_filters(
             {"cuisine": "Indian", "taste_preference": ["spicy"]}
         )
@@ -59,8 +48,6 @@ class RecommendationFilterTests(unittest.TestCase):
         self.assertEqual(filters["tags"], "spicy")
 
     def test_dietary_preference_is_translated_to_the_menu_vocabulary(self):
-        """menu.csv stores 'Veg'/'Non-Veg' and the MCP tool compares with `==`,
-        so the profile's own word 'vegetarian' matched nothing at all."""
         self.assertEqual(
             _build_recommendation_filters({"dietary_preferences": ["vegetarian"]})["dietary_type"],
             "Veg",
@@ -87,8 +74,6 @@ class RecommendationFilterTests(unittest.TestCase):
         self.assertEqual(filters["max_price_inr"], 300)
 
     def test_an_empty_profile_still_asks_for_a_meal(self):
-        """No preferences is not the same as no constraints: someone with an
-        empty profile still wants food, not a coffee or a side of naan."""
         self.assertEqual(_build_recommendation_filters({}), {"course": "main"})
 
 
@@ -97,15 +82,12 @@ class FilterRelaxationTests(unittest.TestCase):
         variants = _filter_variants(
             {"tags": "spicy", "cuisine": "Indian", "dietary_type": "Veg", "max_price_inr": 1000}
         )
-        # A vegetarian must never be shown meat, and a budget is a budget.
         for variant in variants:
             self.assertEqual(variant["dietary_type"], "Veg")
             self.assertEqual(variant["max_price_inr"], 1000)
         self.assertEqual(variants[-1], {"dietary_type": "Veg", "max_price_inr": 1000})
 
     def test_cuisine_is_relaxed_before_the_stated_taste(self):
-        """Taste is usually what the user actually said ("something spicy");
-        cuisine is often our inference, so it should give way first."""
         variants = _filter_variants(
             {"tags": "spicy", "cuisine": "Indian", "dietary_type": "Veg"}
         )
@@ -123,14 +105,10 @@ class FilterRelaxationTests(unittest.TestCase):
         with patch("cravr.recommend.RecommendAgent._call_recommendation_tool", side_effect=fake_call):
             results = fetch_recommendations(build_recommendation_brief({"cuisine": "Indian", "taste_preference": ["spicy"]}, {}))
 
-        # main+cuisine, then main,side+cuisine, then cuisine dropped.
         self.assertEqual([c.get("course") for c in calls], ["main", "main,side", "main"])
         self.assertEqual(results[0]["item_name"], "Pad Thai")
 
     def test_relaxed_results_are_still_ranked_by_the_original_preference(self):
-        """The Filter Coffee bug: once `tags` was relaxed the tool returned
-        the whole menu and rating alone decided, so a 4.6 coffee beat every
-        spicy dish for a user who asked for something spicy."""
         whole_menu = [
             {"item_name": "Filter Coffee", "cuisine": "South Indian", "rating": 4.6,
              "tags": "vegetarian;breakfast;sugar-free-option;sweet"},
@@ -139,7 +117,6 @@ class FilterRelaxationTests(unittest.TestCase):
         ]
 
         def fake_call(filters):
-            # Nothing carries the tag (e.g. a stale menu), forcing relaxation.
             return [] if "tags" in filters or "cuisine" in filters else whole_menu
 
         with patch("cravr.recommend.RecommendAgent._call_recommendation_tool", side_effect=fake_call):
@@ -161,9 +138,6 @@ class FilterRelaxationTests(unittest.TestCase):
 
 
 class CourseTests(unittest.TestCase):
-    """menu.csv's `course` column (main/side/dessert/beverage) exists so a
-    ₹70 Filter Coffee can't be the answer to "I want to eat something spicy"."""
-
     def test_a_meal_request_defaults_to_mains(self):
         filters = _build_recommendation_filters({"taste_preference": ["spicy"]})
         self.assertEqual(filters["course"], "main")
@@ -179,7 +153,6 @@ class CourseTests(unittest.TestCase):
         )
 
     def test_a_sweet_tooth_allows_dessert_without_excluding_mains(self):
-        """"sweet" as a taste is a weaker signal than the word "dessert"."""
         self.assertEqual(
             _build_recommendation_filters({"taste_preference": ["sweet"]})["course"],
             "dessert,main",
@@ -194,7 +167,6 @@ class CourseTests(unittest.TestCase):
         variants = _filter_variants({"tags": "spicy", "cuisine": "Indian", "course": "main"})
         self.assertTrue(all("course" in v for v in variants))
         self.assertEqual({v["course"] for v in variants}, {"main", "main,side"})
-        # Widening the course is tried before sacrificing the stated taste.
         self.assertEqual(variants[1], {"tags": "spicy", "cuisine": "Indian", "course": "main,side"})
 
     def test_a_beverage_request_is_never_widened_into_food(self):
@@ -213,7 +185,6 @@ class CourseTests(unittest.TestCase):
 
 class FeedbackParsingTests(unittest.TestCase):
     def test_noodles_is_not_read_as_a_rejection(self):
-        """Substring matching made any word containing "no" a rejection."""
         self.assertFalse(_looks_like_rejection("I want noodles"))
         self.assertTrue(_looks_like_rejection("no, something else"))
 
@@ -250,8 +221,6 @@ class RecommendationAgentTests(unittest.TestCase):
         self.assertIn("Plain Idli", result["messages"][0].content)
         self.assertTrue(result["recommendation_state"]["awaiting_feedback"])
         self.assertEqual(result["recommendation_state"]["last_recommendations"], recommendations)
-        # A single match offers yes/widen buttons, not a dish-pick list --
-        # there's only one dish, nothing to pick between.
         self.assertEqual(result["recommendation_state"]["options"], ONLY_MATCH_OPTIONS)
 
     def test_confirms_when_user_accepts_recommendation(self):
@@ -287,9 +256,6 @@ class RecommendationAgentTests(unittest.TestCase):
 
 
 class BriefHandoffTests(unittest.TestCase):
-    """recommendation_agent reads the frozen brief and nothing else, so the
-    profile-to-menu-filter translation happens in exactly one place."""
-
     def test_brief_carries_filters_history_and_a_concise_summary(self):
         brief = build_recommendation_brief(
             {"cuisine": "Indian", "taste_preference": ["spicy"],
@@ -322,7 +288,6 @@ class BriefHandoffTests(unittest.TestCase):
 
         state = {
             "messages": [{"role": "user", "content": "anything"}],
-            # Deliberately contradictory: if the node reads these, we'll see it.
             "intent_profile": {"cuisine": "Mexican"},
             "history_profile": {"orders": []},
             "recommendation_brief": {"filters": {"cuisine": "Thai"}, "history": {}, "summary": "thai"},
@@ -389,7 +354,6 @@ class ThreeSuggestionTests(unittest.TestCase):
         self.assertIn("Hyderabadi Veg Biryani", result["messages"][0].content)
 
     def test_a_correction_is_a_selection_not_a_rejection(self):
-        """"no, the second one" must pick, not restart the search."""
         result = self._follow_up(self.MENU[:3], "no, the second one")
         self.assertTrue(result["recommendation_state"]["satisfied"])
         self.assertIn("Schezwan Paneer", result["messages"][0].content)
@@ -404,7 +368,6 @@ class ThreeSuggestionTests(unittest.TestCase):
         self.assertTrue(result["recommendation_state"]["satisfied"])
 
     def test_a_cardinal_inside_a_sentence_is_not_a_pick(self):
-        """"the thai one" must not silently select option 1 -- "one" is filler."""
         self.assertIsNone(_resolve_choice("the thai one", self.MENU[:3]))
         self.assertIsNotNone(_resolve_choice("two", self.MENU[:3]))
         self.assertIsNotNone(_resolve_choice("number two", self.MENU[:3]))
@@ -415,8 +378,6 @@ class ThreeSuggestionTests(unittest.TestCase):
         self.assertTrue(result["recommendation_state"]["awaiting_feedback"])
 
     def test_asking_for_more_serves_the_held_back_dishes(self):
-        """"recommend more" used to re-run the same query and reprint the same
-        three dishes, discarding the alternates already in hand."""
         for reply in ["recommend more.", "more", "any others?", "what else do you have"]:
             with self.subTest(reply=reply):
                 result = self._follow_up(self.MENU[:3], reply, alternates=self.MENU[3:])
@@ -429,12 +390,9 @@ class ThreeSuggestionTests(unittest.TestCase):
         content = result["messages"][0].content
         self.assertIn("That's everything", content)
         self.assertIn("widen", content)
-        # Never silently reprint the same three dishes.
         self.assertNotIn("1. Hyderabadi", content)
 
     def test_an_unrecognised_reply_never_reprints_the_same_list(self):
-        """Whatever the phrasing, an unchanged request must not produce the
-        identical three dishes again."""
         result = self._follow_up(self.MENU[:3], "hmm, surprise me", alternates=self.MENU[3:])
         self.assertIn("Chole Bhature", result["messages"][0].content)
 
@@ -456,10 +414,6 @@ class ThreeSuggestionTests(unittest.TestCase):
 
 
 class PickToCartHandoffTests(unittest.TestCase):
-    """Picking a dish auto-adds it to the cart (via
-    cart.CartAgent.add_dish_to_cart) when an address is known -- no
-    confirmation gate here, since a cart isn't a placed order."""
-
     DISH = {"item_name": "Schezwan Paneer", "restaurant_name": "Dragon Bowl",
             "menu_item_id": "ITEM1", "restaurant_id": "REST1", "cuisine": "Chinese"}
     MENU = [
@@ -506,9 +460,6 @@ class PickToCartHandoffTests(unittest.TestCase):
         self.assertIn("couldn't add it to your cart", result["messages"][0].content)
 
     def test_a_cart_failure_still_confirms_the_pick(self):
-        """add_dish_to_cart's own failure message (missing IDs, MCP error,
-        etc.) is what gets shown -- the pick itself must still register as
-        satisfied, not get stuck re-offering the same list."""
         failure_reply = {"cart_state": {}, "messages": [AIMessage(
             content="Couldn't add that to your cart: timeout", name="cart_agent")]}
         with patch("cravr.recommend.RecommendAgent.add_dish_to_cart", return_value=failure_reply):
@@ -518,13 +469,6 @@ class PickToCartHandoffTests(unittest.TestCase):
 
 
 class RecommendationOptionsTests(unittest.TestCase):
-    """UI/components.py renders `recommendation_state["options"]` as tappable
-    buttons (see UI/graph_bridge.py's process_result), same treatment as a
-    clarification question's options -- these check RecommendAgent builds
-    the right buttons for each branch, kept in sync with the numbered text
-    by construction (`_dish_pick_options`/`ONLY_MATCH_OPTIONS` are the single
-    source of truth for both)."""
-
     MENU = ThreeSuggestionTests.MENU
 
     def _offer(self, menu=None):
@@ -570,8 +514,6 @@ class RecommendationOptionsTests(unittest.TestCase):
         self.assertEqual(result["recommendation_state"]["options"], _dish_pick_options(self.MENU[:3]))
 
     def test_confirmed_pick_has_no_more_options(self):
-        """Once a dish is chosen there's nothing left to pick -- no stale
-        buttons should linger under the confirmation message."""
         result = self._follow_up(self.MENU[:3], "2")
         self.assertTrue(result["recommendation_state"]["satisfied"])
         self.assertNotIn("options", result["recommendation_state"])
@@ -597,10 +539,6 @@ class RecommendationOptionsTests(unittest.TestCase):
 
 
 class FeedbackShortcutTests(unittest.TestCase):
-    """The graph skips intent/history/decision for pure reactions, so "3"
-    is never handed to the extraction model (which could read it as a budget
-    of ₹3 and zero out every later search)."""
-
     OFFERED = [{"item_name": "Hyderabadi Veg Biryani"}, {"item_name": "Schezwan Paneer"},
                {"item_name": "Green Curry with Rice"}]
     STATE = {"awaiting_feedback": True, "satisfied": False, "last_recommendations": OFFERED}
@@ -632,8 +570,6 @@ class FeedbackShortcutTests(unittest.TestCase):
         )
 
     def test_entry_labels_are_wired_to_the_right_nodes(self):
-        """The router returns a reason, not a node name -- so the path map is
-        what actually decides where each reason goes. Check they line up."""
         edges = {(e.source, e.target, getattr(e, "data", None)) for e in app.get_graph().edges}
         self.assertIn(("__start__", "recommendation_agent", FEEDBACK), edges)
         self.assertIn(("__start__", "intent_discovery", NEW_REQUEST), edges)

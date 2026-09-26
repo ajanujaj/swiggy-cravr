@@ -1,5 +1,3 @@
-"""The conversational LangChain node used by Cravr's LangGraph workflow."""
-
 from __future__ import annotations
 
 import os
@@ -9,9 +7,6 @@ from dotenv import load_dotenv
 
 from .debug_utils import debug
 
-# Walks up from this file's directory to find the project's .env, so it
-# resolves correctly regardless of the working directory the CLI, tests, or
-# the chat UI's server process were launched from.
 load_dotenv()
 
 _llm: Any | None = None
@@ -20,8 +15,6 @@ DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 
 def _get_api_key() -> str:
-    # Accept the standard `GROQ_API_KEY` name and this project's existing
-    # `groq_apikey` .env entry, so nothing has to be renamed.
     api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq_apikey")
     if not api_key:
         raise RuntimeError(
@@ -32,7 +25,6 @@ def _get_api_key() -> str:
 
 
 def get_llm() -> Any:
-    """Create the Groq-backed chat model only when the graph runs."""
     global _llm
     if _llm is None:
         try:

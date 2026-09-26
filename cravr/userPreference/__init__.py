@@ -1,5 +1,3 @@
-"""MCP-backed durable user preference and order-history retrieval."""
-
 from .preference import (
     fetch_order_history,
     fetch_user_preferences,

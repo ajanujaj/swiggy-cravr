@@ -1,5 +1,3 @@
-"""get_food_orders -- the user's past order history."""
-
 from __future__ import annotations
 
 from typing import Any
@@ -11,13 +9,6 @@ from .addresses import get_saved_address
 
 
 def get_order_history(address_id: str | None = None) -> dict[str, Any]:
-    """-> {"status", "count", "orders"}, matching preference.py's
-    fetch_order_history contract.
-
-    addressId is required. If the caller doesn't have one yet (usually
-    true -- this runs before context_agent resolves it), resolve it here,
-    deliberately uncached (see _resolve_address_id in RecommendAgent.py).
-    """
     if not address_id:
         address_id = get_saved_address().get("address_id")
     if not address_id:

@@ -1,8 +1,3 @@
-"""Intent Discovery agent: turns a food-ordering request into structured
-intent. Owns the intent-clarification `interrupt()` loop -- extracts, derives, then
-pauses once per still-missing field (category, then a specific dish/cuisine).
-"""
-
 from __future__ import annotations
 
 import re
@@ -37,14 +32,12 @@ from ..options import OTHER_VALUE, resolve_option_choice, suggest_options
 from .prompt import INTENT_DISCOVERY_PROMPT
 
 
-
 def _is_no_preference(answer: str) -> bool:
     normalized = (answer or "").strip().lower().rstrip(".!")
     return normalized in NO_PREFERENCE_ANSWERS
 
 
 def _mentions_dietary_word(text: str, phrases: tuple[str, ...]) -> bool:
-    """Whole-word/phrase match, so "veg" doesn't fire inside "vegetable"."""
     normalized = (text or "").strip().lower()
     if not normalized:
         return False
@@ -52,15 +45,6 @@ def _mentions_dietary_word(text: str, phrases: tuple[str, ...]) -> bool:
 
 
 def _derive_dietary_preference(text: str) -> str | None:
-    """Read an explicit veg/non-veg signal from free text -- a stated
-    preference always wins over a saved default, even a one-off "actually,
-    show me non-veg".
-
-    Scanned as one list ranked longest-phrase-first, not tuple-by-tuple:
-    "non-veg" contains "veg" and "no meat" (VEG) contains "meat" (NON_VEG),
-    so checking either tuple whole first misreads the other's phrase. The
-    longest match always wins regardless of which tuple it's in.
-    """
     candidates = [(phrase, "Non-Veg") for phrase in NON_VEG_ANSWERS]
     candidates += [(phrase, "Veg") for phrase in VEG_ANSWERS]
     candidates.sort(key=lambda pair: len(pair[0]), reverse=True)
@@ -71,11 +55,9 @@ def _derive_dietary_preference(text: str) -> str | None:
 
 
 def extract_tastes(text: str) -> list[str]:
-    """Map free wording onto the menu's five taste tags."""
     remaining = f" {text or ''} "
     found: list[str] = []
 
-    # Consume the negation so "not spicy" can't also register as spicy.
     remaining, negations = MILD_PATTERN.subn(" ", remaining)
     if negations or any(word in remaining for word in MILD_WORDS):
         found.append("mild")
@@ -89,9 +71,6 @@ def extract_tastes(text: str) -> list[str]:
 
 
 def _derive_flavor(profile: dict) -> str | None:
-    """Normalize whatever the user said into one real menu tag. Reads
-    craving *and* cuisine text -- "spicy" often arrives attached to a
-    cuisine ("spicy Indian")."""
     haystack = " ".join(
         str(profile.get(key) or "") for key in ("craving", "cuisine", "meal_intent")
     ).lower()
@@ -110,9 +89,6 @@ def _derive_flavor(profile: dict) -> str | None:
 
 
 def _has_flavour_signal(profile: dict) -> bool:
-    """True when the user has told us anything to steer a menu with. A
-    taste counts -- "something spicy" IS a craving; requiring a named dish
-    here used to loop back and ask for one anyway."""
     if "craving_or_cuisine" in (profile.get("no_preference") or []):
         return True
     return bool(
@@ -121,12 +97,8 @@ def _has_flavour_signal(profile: dict) -> bool:
 
 
 def _derive(profile: dict, now: datetime | None = None) -> dict:
-    """Fill every field the code can work out for itself. Runs after each
-    extraction and each answer, so a fresh craving produces its flavor
-    immediately rather than next turn."""
     derived = dict(profile)
 
-    # The clock always knows this one; it is never worth asking.
     derived["meal_time"] = current_meal_window(now).name
     if not derived.get("meal_intent"):
         derived["meal_intent"] = current_meal_window(now).default_intent
@@ -135,10 +107,6 @@ def _derive(profile: dict, now: datetime | None = None) -> dict:
     if flavor:
         derived["flavor"] = flavor
 
-    # Recomputed every pass unless stated -- a plain "if not hunger_level"
-    # check isn't equivalent: the first derive (before meal_intent is known)
-    # would write the DEFAULT_HUNGER placeholder and then block the real
-    # value once "dinner" is answered a moment later.
     if not derived.get("hunger_level_stated"):
         derived["hunger_level"] = HUNGER_BY_INTENT.get(
             str(derived.get("meal_intent") or "").strip().lower(), DEFAULT_HUNGER
@@ -148,9 +116,6 @@ def _derive(profile: dict, now: datetime | None = None) -> dict:
 
 
 def _missing_fields(profile: dict) -> list[str]:
-    """Which required fields are still unfilled, in the order they're asked.
-    Category comes first, but only when there's no flavour signal at all yet --
-    someone who already named a dish/cuisine skips the funnel entirely."""
     missing: list[str] = []
     no_pref = profile.get("no_preference") or []
     if not _has_flavour_signal(profile) and not profile.get("craving_tag") and "category" not in no_pref:
@@ -160,14 +125,10 @@ def _missing_fields(profile: dict) -> list[str]:
     return missing
 
 
-# Category funnel: asked first when nothing at all is known yet. Loosely mirrors
-# Swiggy's own EATRIGHT/STORE_99 storefront collections (see food_mcp._infer_collection)
-# so a pick here can also narrow the real search, not just phrase the next question.
 _CATEGORY_OPTION_FALLBACK = [
     "Healthy", "Comfort food", "Something sweet", "High protein", "Budget-friendly",
 ]
 
-# Safety net when the LLM can't be reached -- tappable choices instead of a bare prompt.
 _TYPE_OPTION_FALLBACKS_BY_CATEGORY = {
     "comfort-food": ["Butter chicken", "Mac and cheese", "Biryani", "Pizza", "Noodles"],
     "lightweight": ["Salad", "Soup", "Grilled chicken", "Poke bowl", "Sushi"],
@@ -184,7 +145,6 @@ _DEFAULT_CRAVING_OPTION_FALLBACK = [
 def _question_for(
     field: str, now: datetime | None = None, profile: dict | None = None
 ) -> tuple[str, list[dict]]:
-    """The question to ask for a field, plus any options to offer."""
     if field == "category":
         question = "What are you in the mood for?"
         options = suggest_options(
@@ -221,16 +181,12 @@ def _question_for(
 
 
 def _apply_answer(profile: dict, field: str, answer: str, now: datetime | None = None) -> dict:
-    """Write a reply straight into the field it was asked about -- no
-    round-trip through the extraction model, which routinely drops a bare
-    "Indian" or "2" that's unambiguous here."""
     updated = dict(profile)
     answer = (answer or "").strip()
     if not answer:
         return updated
 
     if _is_no_preference(answer):
-        # Record as *resolved*, not a literal "anything" value -- else the loop re-asks forever.
         resolved = list(updated.get("no_preference") or [])
         if field not in resolved:
             resolved.append(field)
@@ -241,9 +197,6 @@ def _apply_answer(profile: dict, field: str, answer: str, now: datetime | None =
         normalized = answer.lower()
         if normalized.isdigit() or len(normalized) < 2:
             return updated
-        # Best-effort onto a known tag (e.g. "Healthy" -> "low-calorie" via its cue
-        # words); an unrecognised label is still kept raw -- it still scopes the next
-        # question, just doesn't also narrow the search filters.
         tag = next(
             (t for t, cues in CRAVING_TAG_CUES.items() if any(cue in normalized for cue in cues)),
             None,
@@ -253,7 +206,6 @@ def _apply_answer(profile: dict, field: str, answer: str, now: datetime | None =
 
     if field == "craving_or_cuisine":
         normalized = answer.lower()
-        # No numbered options here, so a bare "1" is a stray keystroke, never a dish.
         if normalized.isdigit() or len(normalized) < 2:
             return updated
         matched_cuisine = next(
@@ -270,22 +222,8 @@ def _apply_answer(profile: dict, field: str, answer: str, now: datetime | None =
 
 
 def intent_discovery_node(state: CravrState) -> dict:
-    """Extract, derive, then interrupt until the required intent is
-    complete. Safe to loop `interrupt()` here: LangGraph replays
-    already-answered interrupts from stored resume values on every re-run,
-    and `profile` is rebuilt deterministically from those replayed answers
-    via `_apply_answer`, not from the checkpoint -- so every round survives.
-    The extraction call re-runs on each resume too, harmlessly, since
-    `merge_profile` only adds non-empty values.
-
-    cart_agent (see cart/add_flow.py's _ask_for_addon_choices) is the only
-    other node that calls `interrupt()` -- decision_agent_node never does
-    (see `DecisionAgentNeverAsksTests`).
-    """
     now = now_ist()
 
-    # The CLI starts with no user message on purpose (offers a meal choice
-    # first) -- never extract from an empty conversation, some models invent a craving.
     if state.get("messages"):
         try:
             structured_llm = get_llm().with_structured_output(IntentExtraction)
@@ -303,12 +241,8 @@ def intent_discovery_node(state: CravrState) -> dict:
 
     merged = merge_profile(state.get("intent_profile"), extracted)
     if extracted.get("hunger_level"):
-        merged["hunger_level_stated"] = True  # sticky: outlasts the meal_intent default
+        merged["hunger_level_stated"] = True
 
-    # Checked deterministically against the raw message (see
-    # _derive_dietary_preference), not left to extraction. Overwrites rather
-    # than unions -- a fresh "make it non-veg" must replace "Veg" outright,
-    # not sit alongside it.
     dietary_signal = _derive_dietary_preference(latest_user_text(state.get("messages")))
     if dietary_signal:
         merged["dietary_preferences"] = [dietary_signal]
@@ -336,17 +270,12 @@ def intent_discovery_node(state: CravrState) -> dict:
         })
         debug("intent_agent", f"got answer for {field!r}: {raw_answer!r}")
 
-        asked.append(field)  # never re-ask a field, even if the reply couldn't be used
-        # Both sides go into `messages` -- a bare "2" is meaningless without
-        # the question that prompted it; recorded as typed, before option resolution.
+        asked.append(field)
         transcript.append(AIMessage(content=question, name="intent_agent"))
         transcript.append(HumanMessage(content=str(raw_answer)))
 
-        # A digit or the option's label/value resolves as if typed out --
-        # lets one keystroke answer; anything unanticipated passes through as free text.
         answer = resolve_option_choice(str(raw_answer), options)
         if answer == OTHER_VALUE:
-            # "type your own" -- ask again with no options for an unambiguous free-text reply.
             follow_up = "Sure — go ahead and tell me in your own words."
             debug("intent_agent", f"'other' chosen for {field!r}; asking free-text follow-up")
             other_answer = interrupt({

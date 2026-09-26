@@ -1,8 +1,3 @@
-"""The cart agent's graph entry point: classify the user's cart-topic
-message into an action (routing.py's `_classify_cart_action`) and dispatch
-to the right flow.
-"""
-
 from __future__ import annotations
 
 from .. import food_mcp
@@ -76,8 +71,6 @@ def cart_agent_node(state: CravrState) -> dict:
         return _suggest_more_from_restaurant(state, address_id)
 
     if action == "proceed_placeholder":
-        # Sub-phase 2 (place_food_order) isn't built yet -- this is
-        # intentionally just a stub reply for now.
         return _show_cart_with_next_steps(
             address_id,
             lead_in="Checkout isn't wired up yet -- that's next on the list. "

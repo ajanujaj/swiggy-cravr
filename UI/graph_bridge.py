@@ -1,10 +1,3 @@
-"""Bridge between the Chainlit chat session and the compiled Cravr
-LangGraph app -- owns every call into `cravr.graph.app` (start a thread,
-send a message, resume an interrupt) and turns each result into chat
-message(s) via `components.py`. No other UI module calls the graph
-directly.
-"""
-
 from __future__ import annotations
 
 import sys
@@ -40,8 +33,6 @@ async def _report_backend_error(exc: Exception) -> None:
 
 
 async def process_result(result: dict[str, Any] | None) -> None:
-    """Turn one `app.invoke(...)` result into chat message(s), mirroring
-    `cravr/run.py`'s resume/print loop but stopping at the first interrupt."""
     if result is None:
         return
 
@@ -83,11 +74,6 @@ async def process_result(result: dict[str, Any] | None) -> None:
         dishes = rec_state.get("last_recommendations") or None
         options = rec_state.get("options") or None
     elif source == "cart_agent":
-        # The post-add "what next" buttons (add more / proceed / browse
-        # other restaurants) -- cart_agent's own dish-offer replies (e.g.
-        # "add more from this restaurant") instead carry
-        # name="recommendation_agent" so they render through the branch
-        # above, same as a normal recommendation list.
         options = (result.get("cart_state") or {}).get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
@@ -99,9 +85,6 @@ async def process_result(result: dict[str, Any] | None) -> None:
 
 
 async def send(value: str, display_label: str | None = None) -> None:
-    """Send one turn to the graph: either a resume value or a fresh
-    message. `display_label` is unused here -- `chainlit_app.on_pick`
-    already echoes it before calling this."""
     try:
         if state.is_awaiting_interrupt():
             debug("ui", f"resuming interrupt with {value!r}")
@@ -124,9 +107,6 @@ async def start_conversation() -> None:
     try:
         result = await _ainvoke(
             {
-                # No hardcoded user_id -- Swiggy's OAuth token scopes everything to one real
-                # account (address_id is the anchor now). Mock-only fallback nodes still accept
-                # user_id=None; they're unreachable once using_real_food_mcp().
                 "messages": [],
                 "intent_profile": {},
                 "context_profile": {},

@@ -1,11 +1,3 @@
-"""get_food_cart / update_food_cart / apply_food_coupon / fetch_food_coupons
-/ flush_food_cart. Docs describe a consistent {"success", "data",
-"message"} JSON envelope for all five, unlike get_addresses/search_menu
-(plain text) -- still routed through `_call_tool`/`_unwrap` so a stray
-text reply degrades to `_check_success` returning None / an "error" status
-instead of crashing, per the search_menu lesson (docs != reality).
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -16,8 +8,6 @@ from ._shared import _first
 
 
 def _check_success(raw: Any) -> str | None:
-    """None when `raw` isn't the documented {"success": false, "error": {...}}
-    shape; else the error message to surface."""
     if isinstance(raw, dict) and raw.get("success") is False:
         return _first(raw.get("error") or {}, "message", default="Request failed")
     return None
@@ -26,29 +16,11 @@ def _check_success(raw: Any) -> str | None:
 _DISCLAIMER_MARKERS = (
     "cart widget is displayed",
     "\nnote:",
-    "⚠",  # warning-sign emoji prefix on "A rich UI widget may be shown..."
+    "⚠",
 )
 
 
 def _strip_widget_disclaimer(text: str) -> str:
-    """Real cart-tool responses are plain text (confirmed via CRAVR_DEBUG=1
-    logs, same lesson as search_menu -- docs describe JSON, reality doesn't):
-    a user-facing section (status/items, and for a non-empty cart also a
-    pricing breakdown -- Item total/Delivery/Taxes & charges/Coupon/TO PAY,
-    itself blank-line-separated from the item list), followed by a blank
-    line and agent-only meta-instructions about a "cart widget" our chat UI
-    doesn't render ("Cart widget is displayed...", "NOTE: ...", the same "A
-    rich UI widget may be shown..." boilerplate search_menu/get_restaurant_menu
-    append after their JSON).
-
-    A naive "split on the first blank line" truncates the pricing breakdown
-    for a non-empty cart, since that response has THREE blank-line-separated
-    paragraphs (items, pricing, disclaimer) not two -- confirmed directly in
-    a real get_food_cart/update_food_cart response. So instead we search for
-    the earliest occurrence of an actual disclaimer marker and keep
-    everything before it; only if no marker is found do we fall back to the
-    old first-blank-line split, as a defensive last resort.
-    """
     lower = text.lower()
     earliest = None
     for marker in _DISCLAIMER_MARKERS:
@@ -61,14 +33,6 @@ def _strip_widget_disclaimer(text: str) -> str:
 
 
 def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, Any]:
-    """get_food_cart -> {"status", "cart_id", "restaurant", "items",
-    "item_count", "pricing", "coupon_applied", "coupon_discount", "address_id",
-    "message"}. items[]: {"menu_item_id","item_name","quantity","total",
-    "final_price","in_stock"} -- populated only on the documented-JSON path
-    (e.g. the mock server); the real tool returns plain text with no
-    itemized breakdown (see `_strip_widget_disclaimer`), so `message` is
-    what actually has the human-readable status there.
-    """
     arguments: dict[str, Any] = {"addressId": address_id}
     if restaurant_name:
         arguments["restaurantName"] = restaurant_name
@@ -120,7 +84,6 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
         "items": items,
         "item_count": data.get("item_count", len(items)),
         "pricing": pricing,
-        # coupon_discount==0 means "auto-suggested", not actually applied (per docs).
         "coupon_applied": offers.get("coupon_applied") if (offers.get("coupon_discount") or 0) > 0 else None,
         "coupon_discount": offers.get("coupon_discount", 0),
         "address_id": raw.get("addressId", address_id),
@@ -131,10 +94,6 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
 
 
 def _collect_cart_items(node: Any, out: list[dict[str, Any]]) -> None:
-    """Find every cart-item dict (anything with a `menu_item_id` AND a
-    `valid_addons`/`variants`/`addons` list) anywhere in a get_food_cart
-    `structured_content` tree. The docs describe FoodCartItem but not where
-    in the envelope the items live (live: `data.items[]`), so search it all."""
     if isinstance(node, dict):
         if node.get("menu_item_id") is not None and any(
             isinstance(node.get(k), list) for k in ("valid_addons", "validAddons", "variants", "addons")
@@ -148,26 +107,6 @@ def _collect_cart_items(node: Any, out: list[dict[str, Any]]) -> None:
 
 
 def get_cart_item_details(address_id: str) -> dict[str, dict[str, Any]]:
-    """{menu_item_id: {"variants": [...], "addons": [...], "valid_addons":
-    [group, ...]}} for every item CURRENTLY IN the cart, from get_food_cart's
-    `structured_content`. Docs (search_menu / update_food_cart): "Add item
-    with variants first ... then check cart response for valid_addons to see
-    which addons are actually available for your variant selection, then add
-    addons from valid_addons list" and "Keep the group and choice IDs paired
-    exactly as returned".
-
-    Live shape (logger.txt 2026-09-26, Harvest Salad Co): variants[] entries
-    are `{variation_id, group_id, name, group_name, price, external_*}`;
-    valid_addons[] groups are `{group_id, group_name, choices[], minAddons,
-    maxAddons, maxFreeAddons, order}`; choices are `{id, name, price, inStock,
-    isVeg, order, default}` with `id` an INT and `price` in PAISE (4000 ==
-    Rs 40) -- unlike search_menu, which gives string ids and rupees.
-
-    Normalised valid_addons group: {"group_id", "group_name", "min_addons",
-    "max_addons", "choices": [{"id", "name", "price_inr", "group_id",
-    "raw"}]} (`raw` = Swiggy's own choice dict). Returns {} on any failure or
-    when the cart has nothing usable -- never raises.
-    """
     try:
         _, meta = _call_tool("get_food_cart", {"addressId": address_id}, log_request=True, return_meta=True)
     except Exception as exc:  # noqa: BLE001 -- best-effort lookup
@@ -191,7 +130,6 @@ def get_cart_item_details(address_id: str) -> dict[str, dict[str, Any]]:
                 paise = c.get("price", 0) or 0
                 choices.append({
                     "id": str(c["id"]), "name": c.get("name") or "",
-                    # valid_addons prices are paise; keep rupees here for display
                     "price_inr": paise / 100 if isinstance(paise, (int, float)) else 0,
                     "group_id": str(c.get("group_id") or c.get("groupId") or group_id or ""),
                     "raw": c,
@@ -224,35 +162,12 @@ def get_cart_item_details(address_id: str) -> dict[str, dict[str, Any]]:
 
 
 def get_cart_valid_addons(address_id: str) -> dict[str, list[dict[str, Any]]]:
-    """{menu_item_id: [valid_addons group, ...]} -- the valid_addons half of
-    `get_cart_item_details`, kept as its own name for callers that only need
-    that."""
     return {k: d["valid_addons"] for k, d in get_cart_item_details(address_id).items()}
 
 
 def update_cart(
     restaurant_id: str, address_id: str, cart_items: list[dict[str, Any]], restaurant_name: str | None = None
 ) -> dict[str, Any]:
-    """update_food_cart -- add/change items. Docs: renders no cart view
-    itself ("does NOT render any widget or cart UI"), so the documented flow
-    is update_food_cart -> get_food_cart; callers here should follow with
-    `get_cart` to show the result and confirm the add actually took.
-
-    `cart_items` entries need {"menu_item_id": <id>, "quantity": <int>} --
-    NOT bare "id" (an earlier version of this used "id"; a real call with
-    it returned 'Cart updated.\nCart is empty.', i.e. accepted but silently
-    a no-op, because Swiggy didn't recognise the field. Confirmed via
-    Swiggy's own docs, which explicitly tie menu_item_id to this tool:
-    '"menu_item_id": Food menu item identifier used by update_food_cart.').
-
-    Items tagged "has variants" still need a real variant/size choice
-    Cravr has no UI to collect, and CartAgent refuses those before ever
-    calling this. Items tagged "has addons" only are different: CartAgent
-    now attempts those with an explicit `"addons": []` entry (see its
-    attempt_addon_only) rather than refusing outright -- the request/
-    response are always logged here so a real run shows immediately
-    whether that guess actually lands.
-    """
     arguments: dict[str, Any] = {
         "restaurantId": restaurant_id,
         "addressId": address_id,
@@ -267,17 +182,6 @@ def update_cart(
         debug("food_mcp", f"update_food_cart FAILED: {exc}")
         return {"status": "error", "message": f"Unable to update cart: {exc}"}
 
-    # fastmcp's `structured_content` is a SEPARATE channel from the text
-    # `raw` above carries -- Swiggy's own machine-readable verdict on the
-    # write, not just a human narrative. Live evidence it matters (2026-09-
-    # 18, 'Roasted Veggie Pita Pocket'): the text came back 'Cart updated.
-    # \nCart is empty.' (which text-mode below would otherwise report as
-    # plain success), while `structured_content` had `'successful': False,
-    # 'errorCodes': ['INVALID_ADDON'], 'titleMessage': 'Apologies! one or
-    # more items in your cart are no longer available'` the whole time.
-    # Guarded with isinstance checks throughout -- this field is undocumented
-    # (Swiggy's docs don't mention it at all), so nothing about its shape is
-    # trusted beyond "a dict, maybe".
     structured = meta.get("structured_content") if isinstance(meta, dict) else None
     explicit_failure = isinstance(structured, dict) and structured.get("successful") is False
     error_codes = structured.get("errorCodes") if explicit_failure else None
@@ -317,8 +221,6 @@ def update_cart(
 
 
 def apply_coupon(coupon_code: str, address_id: str, cart_id: str | None = None) -> dict[str, Any]:
-    """apply_food_coupon -> {"status", "message"}. Caller should re-fetch
-    via `get_cart` afterwards to see the updated pricing/coupon_discount."""
     arguments: dict[str, Any] = {"couponCode": coupon_code, "addressId": address_id}
     if cart_id:
         arguments["cartId"] = cart_id
@@ -344,14 +246,6 @@ def apply_coupon(coupon_code: str, address_id: str, cart_id: str | None = None) 
 
 
 def fetch_coupons(restaurant_id: str, address_id: str, coupon_code: str | None = None) -> dict[str, Any]:
-    """fetch_food_coupons -> {"status", "coupons", "count", "message"}. Docs:
-    only COD-applicable coupons are returned. Each coupon: {"id", "title",
-    "subtitle", "description", "applicable", "applicability_status", "terms"}
-    -- populated only on the documented-JSON path; if the real tool turns
-    out to be plain text too (unconfirmed as of this writing, unlike the
-    other four cart tools which are all now known to be text), `message`
-    carries the raw status and `coupons` stays empty rather than crashing.
-    """
     arguments: dict[str, Any] = {"restaurantId": restaurant_id, "addressId": address_id}
     if coupon_code:
         arguments["couponCode"] = coupon_code
@@ -403,8 +297,6 @@ def fetch_coupons(restaurant_id: str, address_id: str, coupon_code: str | None =
 
 
 def flush_cart() -> dict[str, Any]:
-    """flush_food_cart -- clears the entire cart. No parameters (auth is
-    session-scoped, per docs)."""
     try:
         raw = _call_tool("flush_food_cart", {}, log_request=True)
     except Exception as exc:

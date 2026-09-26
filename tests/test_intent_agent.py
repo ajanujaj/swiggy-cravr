@@ -39,10 +39,6 @@ class ExplodingLLM:
 
 
 def run_node(state, extraction=None, answers=(), now=TEN_PM):
-    """Run the node with the clock frozen and interrupt() scripted. Also
-    forces cravr.options.suggest_options onto its static fallback lists --
-    without this, option suggestion would try a real (network) LLM call and
-    make option-dependent assertions flaky/environment-dependent."""
     llm = StubLLM(extraction) if extraction is not None else ExplodingLLM()
     clock = MagicMock(wraps=datetime)
     clock.now.return_value = now
@@ -56,14 +52,11 @@ def run_node(state, extraction=None, answers=(), now=TEN_PM):
 
 
 class DerivedFieldTests(unittest.TestCase):
-    """Fields the code can work out are never worth an interrupt."""
-
     def test_meal_time_comes_from_the_clock(self):
         profile = _derive({}, TEN_PM)
         self.assertEqual(profile["meal_time"], "dinner")
 
     def test_meal_intent_is_silently_inferred_too(self):
-        """Never asked -- filled from the clock like meal_time."""
         profile = _derive({}, TEN_PM)
         self.assertEqual(profile["meal_intent"], "dinner")
 
@@ -95,8 +88,6 @@ class DerivedFieldTests(unittest.TestCase):
         self.assertEqual(profile["hunger_level"], "high")
 
     def test_an_earlier_default_does_not_freeze_the_later_real_value(self):
-        """The first derive runs before meal_intent is known and writes the
-        placeholder; answering "dinner" must still upgrade it to high."""
         placeholder = _derive({}, TEN_PM)
         self.assertEqual(placeholder["hunger_level"], "medium")
 
@@ -105,9 +96,6 @@ class DerivedFieldTests(unittest.TestCase):
 
 
 class MissingFieldTests(unittest.TestCase):
-    """Category, then a specific dish/cuisine -- meal_intent is never asked
-    (silently inferred, see DerivedFieldTests)."""
-
     def test_empty_profile_asks_category_then_a_specific_type(self):
         self.assertEqual(_missing_fields({}), ["category", "craving_or_cuisine"])
 
@@ -118,7 +106,6 @@ class MissingFieldTests(unittest.TestCase):
         self.assertEqual(_missing_fields({"cuisine": "Thai"}), [])
 
     def test_flavor_alone_satisfies_the_whole_funnel(self):
-        """'something spicy' is a real request, not an empty one."""
         self.assertEqual(_missing_fields({"flavor": "spicy"}), [])
 
     def test_category_already_picked_skips_straight_to_the_type_question(self):
@@ -128,7 +115,6 @@ class MissingFieldTests(unittest.TestCase):
         self.assertEqual(_missing_fields({"no_preference": ["category"]}), ["craving_or_cuisine"])
 
     def test_no_preference_on_the_type_question_satisfies_everything(self):
-        """'surprise me' resolves the whole funnel, category included."""
         self.assertEqual(_missing_fields({"no_preference": ["craving_or_cuisine"]}), [])
 
     def test_hunger_level_is_never_a_blocker(self):
@@ -147,14 +133,10 @@ class ApplyAnswerTests(unittest.TestCase):
         self.assertEqual(profile["craving_tag"], "low-calorie")
 
     def test_unrecognised_category_label_is_kept_raw(self):
-        """Still scopes the next question even without a known-tag match --
-        just doesn't also narrow the search filters."""
         profile = _apply_answer({}, "category", "Keto", TEN_PM)
         self.assertEqual(profile["craving_tag"], "Keto")
 
     def test_bare_digit_category_answer_is_not_stored(self):
-        """The category question's options aren't numbered positionally in
-        a way this branch resolves on its own -- a stray "1" is dropped."""
         profile = _apply_answer({}, "category", "1", TEN_PM)
         self.assertIsNone(profile.get("craving_tag"))
 
@@ -169,15 +151,12 @@ class ApplyAnswerTests(unittest.TestCase):
         self.assertIsNone(profile.get("cuisine"))
 
     def test_bare_digit_is_not_stored_as_a_craving(self):
-        """This question has no numbered options; "1" is a stray keystroke,
-        and `craving="1"` would go straight into the menu filters."""
         profile = _apply_answer({}, "craving_or_cuisine", "1", TEN_PM)
 
         self.assertIsNone(profile.get("craving"))
         self.assertIsNone(profile.get("cuisine"))
 
     def test_no_preference_resolves_the_field_instead_of_storing_it(self):
-        """'anything' must not become a literal cuisine that matches zero rows."""
         profile = _apply_answer({}, "craving_or_cuisine", "anything", TEN_PM)
 
         self.assertIn("craving_or_cuisine", profile["no_preference"])
@@ -217,7 +196,7 @@ class IntentFillLoopTests(unittest.TestCase):
         self.assertEqual(asked_fields, ["category", "craving_or_cuisine"])
 
         profile = result["intent_profile"]
-        self.assertEqual(profile["craving_tag"], "low-calorie")  # "Healthy" -> low-calorie
+        self.assertEqual(profile["craving_tag"], "low-calorie")
         self.assertEqual(profile["craving"], "Salad")
         self.assertEqual(profile["important_missing_information"], [])
 
@@ -234,8 +213,6 @@ class IntentFillLoopTests(unittest.TestCase):
         )
 
     def test_flavour_already_known_skips_the_whole_funnel(self):
-        """A craving from extraction satisfies category AND the type
-        question at once -- neither is asked."""
         state = {
             "messages": [{"role": "user", "content": "biryani"}],
             "intent_profile": {},
@@ -246,8 +223,6 @@ class IntentFillLoopTests(unittest.TestCase):
         spy.assert_not_called()
 
     def test_answers_are_recorded_with_their_questions(self):
-        """A bare answer in the transcript is meaningless without the
-        question that prompted it."""
         state = {"messages": [{"role": "user", "content": "hi"}], "intent_profile": {}}
 
         result, _spy = run_node(state, IntentExtraction(), answers=["Healthy", "Salad"])
@@ -259,10 +234,8 @@ class IntentFillLoopTests(unittest.TestCase):
         self.assertEqual(contents[3], "Salad")
 
     def test_a_field_is_never_asked_twice(self):
-        """An unusable reply moves the loop on rather than repeating itself."""
         state = {"messages": [{"role": "user", "content": "hi"}], "intent_profile": {}}
 
-        # "" leaves craving_or_cuisine unfilled; the loop must not re-ask it.
         _result, spy = run_node(state, IntentExtraction(), answers=["Healthy", ""])
 
         asked_fields = [call.args[0]["field"] for call in spy.call_args_list]

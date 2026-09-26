@@ -1,9 +1,3 @@
-"""The three "what next" branches out of the cart's option buttons: offer
-more from the same restaurant, or clear the cart and start over elsewhere.
-Both funnel back through `_offer_dishes`, which hands off to
-RecommendAgent's own pick machinery rather than duplicating it.
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -23,29 +17,6 @@ def _offer_dishes(
     lead_in: str, batch: list[dict[str, Any]], filters: dict[str, Any],
     cart_state: dict[str, Any] | None = None,
 ) -> dict:
-    """Hand a dish batch off through the SAME "offer -> pick -> add to
-    cart" machinery RecommendAgent already uses, instead of building a
-    parallel one here: `name="recommendation_agent"` on the reply message
-    is what makes graph_bridge.py render it exactly like a normal
-    recommendation (card view or the consolidated list+buttons, depending
-    on count -- see UI/components.py), and setting `recommendation_state`
-    the same way `_reply(...)` does is what makes next turn's bare-digit
-    reply resolve as a pick via `is_pure_feedback` -> `_resolve_choice` ->
-    `_reply_with_pick` -> `add_dish_to_cart`, with zero new state-tracking
-    code. Deferred import: RecommendAgent imports `add_dish_to_cart` from
-    this module at load time, so importing back at module scope would be
-    circular -- safe here since both modules are fully loaded by the time
-    any node actually runs. `cart_state`, when passed, is included in the
-    return so a caller can overwrite state the graph would otherwise
-    leave untouched -- LangGraph only updates keys a node's return dict
-    actually includes, so a caller with nothing to say about `cart_state`
-    (e.g. "add more") must simply omit it here, while one that changed
-    the cart (e.g. "start over") must say so explicitly or a STALE value
-    survives into the next turn. Live regression: after "start over"
-    flushed the cart, the next pick was refused with "Your cart already
-    has items from Social" -- the restaurant _current_restaurant_id
-    recorded before the flush, never cleared, because this function used
-    to omit `cart_state` unconditionally."""
     from ..recommend.RecommendAgent import ONLY_MATCH_OPTIONS, _build_recommendation_text, _dish_pick_options
 
     body = _build_recommendation_text(batch)
@@ -68,9 +39,6 @@ def _offer_dishes(
 
 
 def _suggest_more_from_restaurant(state: CravrState, address_id: str) -> dict:
-    """Option (a): pull more items from the SAME restaurant, preferring
-    ones that pair with what's already in the cart (see
-    `_suggest_complementary_items`)."""
     restaurant_id = _current_restaurant_id(state)
     if not restaurant_id:
         return _cart_reply("I've lost track of which restaurant your cart is from -- try viewing your cart first.")
@@ -99,8 +67,6 @@ def _suggest_more_from_restaurant(state: CravrState, address_id: str) -> dict:
 
 
 def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
-    """Option (c): clear the cart and re-search the same craving/category,
-    excluding the restaurant just cleared."""
     restaurant_id = _current_restaurant_id(state)
 
     flush_result = food_mcp.flush_cart()
@@ -108,10 +74,6 @@ def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
     if flush_result.get("status") != "success":
         return _cart_reply(f"Couldn't clear the cart: {flush_result.get('message', 'unknown error')}")
 
-    # The cart is genuinely empty now -- clear the restaurant we recorded
-    # for it, or the NEXT add wrongly compares against the one just
-    # flushed (live regression: "Your cart already has items from Social"
-    # right after "start over" successfully cleared it).
     cleared_cart_state = {"restaurant": None}
 
     brief = state.get("recommendation_brief") or {}
@@ -121,7 +83,7 @@ def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
             **cleared_cart_state,
         )
 
-    from ..recommend.RecommendAgent import fetch_recommendations  # deferred -- see _offer_dishes
+    from ..recommend.RecommendAgent import fetch_recommendations
 
     exclude = {str(restaurant_id)} if restaurant_id else set()
     filters = dict(brief.get("filters") or {})
@@ -139,11 +101,7 @@ def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
 
 
 def _clear_cart_and_add_pending(state: CravrState, address_id: str) -> dict:
-    """The "Clear my cart and add this" button (see add_flow's
-    `_cart_conflict_reply`): flush the cart, then add the dish that was
-    waiting -- with the add-ons the user already picked, so they aren't
-    asked again."""
-    from .add_flow import add_dish_to_cart  # deferred -- add_flow imports display/guards, not this module
+    from .add_flow import add_dish_to_cart
 
     cart_state = state.get("cart_state") or {}
     pending = cart_state.get("pending_dish")

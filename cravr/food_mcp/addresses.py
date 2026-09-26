@@ -1,5 +1,3 @@
-"""get_addresses -- the user's saved delivery addresses."""
-
 from __future__ import annotations
 
 import json
@@ -17,15 +15,6 @@ _SUGGESTED_ID_RE = re.compile(r"Suggested/preselected address ID:\s*([^\s.,]+)")
 
 
 def get_saved_address() -> dict[str, Any]:
-    """-> {"location", "delivery_area", "address_id", "status"}, matching
-    ContextAgent.fetch_user_location's contract.
-
-    get_addresses returns a natural-language block, e.g.:
-        1. [Baba] Anuj Jain: 307, third floor, ... (ID: abc123)
-        Suggested/preselected address ID: abc123. Ask the user to confirm...
-    Parsed with regex; uses Swiggy's own suggested ID so this stays ambient
-    (no clarification question needed).
-    """
     try:
         raw = _call_tool("get_addresses", {})
     except Exception as exc:

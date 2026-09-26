@@ -1,11 +1,3 @@
-"""Chainlit chat UI entry point for Cravr -- the `target` file `server.py`
-mounts via `chainlit.utils.mount_chainlit`. Only wires session lifecycle
-events to `graph_bridge`; no conversation logic lives here.
-
-Run standalone for local development:
-    chainlit run UI/chainlit_app.py -w
-"""
-
 from __future__ import annotations
 
 import sys
@@ -42,8 +34,6 @@ async def on_chat_start() -> None:
 
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
-    # A typed reply ("1, 3" / names) to a pick-several question replaces the
-    # toggle buttons -- drop them so they can't be tapped afterwards.
     if state.get_multiselect():
         await components.finish_multiselect()
     await state.clear_live_options()
@@ -52,8 +42,6 @@ async def on_message(message: cl.Message) -> None:
 
 @cl.action_callback("pick")
 async def on_pick(action: cl.Action) -> None:
-    """A clarification chip or a dish-pick button -- echoes the picked
-    label as a user-facing bubble, then sends the value like typed text."""
     await state.clear_live_options()
     value = action.payload.get("value")
     label = action.payload.get("label") or value
@@ -63,13 +51,11 @@ async def on_pick(action: cl.Action) -> None:
 
 @cl.action_callback("multiselect_toggle")
 async def on_multiselect_toggle(action: cl.Action) -> None:
-    """Tick/untick one option of a pick-several question (add-ons)."""
     await components.toggle_multiselect(action.payload.get("value"))
 
 
 @cl.action_callback("multiselect_done")
 async def on_multiselect_done(action: cl.Action) -> None:
-    """Send every ticked option at once, as one comma-joined reply."""
     finished = await components.finish_multiselect()
     if not finished:
         return

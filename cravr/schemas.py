@@ -1,14 +1,3 @@
-"""Pydantic schemas for each agent's LLM output. Passed to
-`.with_structured_output(...)` so LangChain enforces the shape via the
-model's native tool-calling/JSON-schema support -- a model either returns a
-schema-valid object or raises loudly, never silent malformed JSON.
-
-Computed fields (missing_information, important_missing_*,
-clarification_questions) are deliberately not part of these schemas -- the
-model only describes what's in the message; intentAgent derives what's
-missing deterministically (see profile_utils.merge_profile).
-"""
-
 from __future__ import annotations
 
 from typing import Optional

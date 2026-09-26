@@ -1,8 +1,3 @@
-"""Intent discovery: turns the user's message into a structured intent profile.
-Vocabulary constants are re-exported too -- `recommend` reuses them to tell a
-request change ("make it non-veg") apart from a mere reaction ("3"), and
-duplicating the word lists there would let the two drift."""
-
 from .intentAgent import (
     KNOWN_CUISINE_WORDS,
     MAX_INTENT_CLARIFICATION_ROUNDS,

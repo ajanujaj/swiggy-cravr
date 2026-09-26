@@ -1,9 +1,3 @@
-"""Decision agent: freezes the recommendation brief and always recommends.
-Never calls `interrupt()` -- only intent_discovery_node does (see
-`DecisionAgentNeverAsksTests`), so there's exactly one interrupt site in the
-whole graph.
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -27,9 +21,6 @@ def _extract_latest_user_input(messages: Any) -> str:
 
 
 def decision_agent_node(state: CravrState) -> dict:
-    """Always recommends -- no clarifying question of its own. Still the
-    only place that freezes `recommendation_brief`, so recommendation_agent
-    has something to read."""
     intent_profile = _coerce_profile(state.get("intent_profile"))
     context_profile = _coerce_profile(state.get("context_profile"))
     history_profile = _coerce_profile(state.get("history_profile"))

@@ -4,9 +4,6 @@ from pathlib import Path
 import pandas as pd
 from fastmcp import FastMCP
 
-# Mock-data tool server only -- no OAuth/LLM calls. Real Swiggy OAuth lives in
-# mcp_server/oauth.py/server.py, so switching to real MCP access is just
-# deleting this dir and pointing CRAVR_MCP_URL at Swiggy's endpoint.
 app = FastMCP("recommendation-server")
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -14,22 +11,14 @@ recommendations_data = pd.read_csv(DATA_DIR / "menu.csv")
 order_history_data = pd.read_csv(DATA_DIR / "order_history.csv")
 user_data = pd.read_csv(DATA_DIR / "user.csv")
 
-# menu.csv has no restaurant/item ID columns -- synthesize stable ones so mock
-# recommendations carry the same "menu_item_id"/"restaurant_id" fields real
-# Swiggy dish records do (needed by the cart tools below). Row-index-based,
-# so they're stable across calls within one server run but NOT across a CSV
-# edit/reorder -- fine for local mock testing, never used against real money.
 recommendations_data["menu_item_id"] = "ITEM" + (recommendations_data.index + 1).astype(str).str.zfill(4)
 _restaurant_codes, _ = pd.factorize(recommendations_data["restaurant_name"])
 recommendations_data["restaurant_id"] = "REST" + pd.Series(_restaurant_codes + 1, index=recommendations_data.index).astype(str).str.zfill(3)
 
-# In-memory mock cart -- single global cart (this test server has no
-# per-user auth), mirroring real Swiggy's "one active cart, single
-# restaurant" behavior. Reset by flush_food_cart or a server restart.
 _cart_state: dict = {
     "restaurant_id": None,
     "restaurant_name": None,
-    "items": [],  # [{"menu_item_id","name","quantity","final_price","total","in_stock","is_veg"}]
+    "items": [],
     "coupon_code": None,
     "coupon_discount": 0,
 }
@@ -70,23 +59,20 @@ def recommendation(
     Returns:
         dict: Filtered recommendations with restaurant details
     """
-    
+
     filtered_df = recommendations_data.copy()
-    
-    # Apply filters based on provided inputs
+
     if cuisine:
         filtered_df = filtered_df[filtered_df['cuisine'].str.lower().str.contains(cuisine.lower(), na=False)]
-    
+
     if restaurant_name:
         filtered_df = filtered_df[filtered_df['restaurant_name'].str.lower().str.contains(restaurant_name.lower(), na=False)]
-    
+
     if tags:
-        # Comma-separated tags use AND semantics (must carry every tag); a single free-text tag still works.
         for tag in [t.strip() for t in tags.split(",") if t.strip()]:
             filtered_df = filtered_df[filtered_df['tags'].str.lower().str.contains(tag.lower(), na=False)]
 
     if dietary_type:
-        # Exact match, not substring -- .str.contains('veg') would also match 'non-veg'.
         filtered_df = filtered_df[filtered_df['dietary_type'].str.lower() == dietary_type.lower()]
 
     if meal_type:
@@ -94,8 +80,6 @@ def recommendation(
             filtered_df['meal_type'].str.lower().str.contains(meal_type.lower(), na=False)
         ]
 
-    # `course` is OR semantics (unlike tags): "main,side" means either is acceptable (widening, not narrowing).
-    # Guarded on column presence so older menu files without it don't raise KeyError.
     if course and 'course' in filtered_df.columns:
         wanted_courses = {c.strip().lower() for c in course.split(",") if c.strip()}
         if wanted_courses:
@@ -103,15 +87,14 @@ def recommendation(
 
     if max_price_inr is not None:
         filtered_df = filtered_df[filtered_df['price_inr'] <= max_price_inr]
-    
-    # Sort by rating (highest first)
+
     filtered_df = filtered_df.sort_values('rating', ascending=False)
-    
+
     if filtered_df.empty:
         return {"status": "no_results", "message": "No recommendations found for the given criteria"}
-    
+
     recommendations = filtered_df.to_dict('records')
-    
+
     return {
         "status": "success",
         "count": len(recommendations),
@@ -122,10 +105,9 @@ def recommendation(
 def order_history(user_id: str) -> dict:
     """
     Get the order history for a specific user.
-    
+
     Args:
         user_id: Unique identifier for the user"""
-
 
     user_orders = order_history_data[order_history_data['user_id'] == user_id]
 
@@ -163,7 +145,7 @@ def order_history(user_id: str) -> dict:
 def user_preferences(user_id: str) -> dict:
     """
     Get the user preferences for a specific user.
-    
+
     Args:
         user_id: Unique identifier for the user
     """
@@ -205,14 +187,6 @@ def user_location(user_id: str) -> dict:
         "delivery_area": location["default_delivery_area"],
     }
 
-
-# ---------------------------------------------------------------------------
-# Mock Cart tools -- mirror Swiggy's real get_food_cart/update_food_cart/
-# apply_food_coupon/fetch_food_coupons/flush_food_cart tool names and
-# {"success", "data", "message"} response envelope (see cravr/food_mcp.py's
-# cart functions) so the same code path can be exercised safely here before
-# ever touching a real Swiggy account.
-# ---------------------------------------------------------------------------
 
 def _cart_pricing() -> dict:
     item_total = sum(i["final_price"] * i["quantity"] for i in _cart_state["items"])
@@ -366,10 +340,7 @@ def flush_food_cart() -> dict:
     return {"success": True, "data": {}, "message": "Cart cleared"}
 
 
-
 if __name__ == "__main__":
-    # $PORT so Render (or any host assigning its own port) can run this unchanged;
-    # locally $PORT is unset, so this falls back to 8000 (matches CRAVR_MCP_URL's default).
     app.run(
         transport="streamable-http",
         host="0.0.0.0",

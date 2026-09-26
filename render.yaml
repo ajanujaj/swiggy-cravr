@@ -1,10 +1,3 @@
-# Render blueprint for Cravr's two services. Deploy via "New +" -> "Blueprint",
-# or create each web service by hand using the settings below.
-#
-# Render assigns each service's *.onrender.com URL from its name at creation
-# time; if "cravr-app" is taken, Render appends a suffix and your real URL
-# differs from the one assumed here. Update SWIGGY_REDIRECT_URI to match if so,
-# and submit that exact URL (+ /oauth/callback) to Swiggy for whitelisting.
 services:
   - type: web
     name: cravr-app
@@ -13,34 +6,21 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     envVars:
-      # Render hosts run in UTC; meal windows and logs should follow India time.
       - key: TZ
         value: Asia/Kolkata
       - key: GROQ_API_KEY
         sync: false
-      # Set to https://mcp.swiggy.com/food for real recommendations/location/
-      # order history, or cravr-mock-mcp's URL + "/mcp" to use mock data.
       - key: CRAVR_MCP_URL
         sync: false
-      # user_preferences has no Food MCP equivalent, so it always targets
-      # this URL regardless of CRAVR_MCP_URL above. Set to cravr-mock-mcp's
-      # URL + "/mcp".
       - key: CRAVR_MOCK_MCP_URL
         sync: false
-      # Must match what's whitelisted with Swiggy. Defaults to
-      # https://cravr-app.onrender.com/oauth/callback in code.
       - key: SWIGGY_REDIRECT_URI
         sync: false
-      # Defaults to https://mcp.swiggy.com in code -- leave unset unless it changes.
       - key: SWIGGY_MCP_URL
         sync: false
-      # Defaults to "mcp:tools mcp:resources mcp:prompts" in code.
       - key: SWIGGY_SCOPES
         sync: false
 
-  # Mock-data MCP tool server, standing in for Swiggy's real Food MCP.
-  # Once real access exists: stop deploying this and point cravr-app's
-  # CRAVR_MCP_URL at https://mcp.swiggy.com/food instead.
   - type: web
     name: cravr-mock-mcp
     runtime: python

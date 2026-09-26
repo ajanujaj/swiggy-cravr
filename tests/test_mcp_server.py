@@ -6,11 +6,6 @@ from mcp_server import run_mcp
 
 
 class RecommendationTagFilterTests(unittest.TestCase):
-    """Multiple tags (comma-separated) must be matched with AND semantics --
-    e.g. tags='spicy,vegetarian' should only return dishes carrying both,
-    not either. A single tag with no comma must keep behaving exactly like
-    the original substring-contains filter."""
-
     def setUp(self):
         self.original_menu = run_mcp.recommendations_data
         run_mcp.recommendations_data = pd.DataFrame(
@@ -42,9 +37,6 @@ class RecommendationTagFilterTests(unittest.TestCase):
         self.assertEqual(result["status"], "no_results")
 
     def test_veg_filter_excludes_non_veg_dishes(self):
-        """Regression test: dietary_type='Veg' must not also match 'Non-Veg'
-        rows via substring containment (.str.contains('veg') matches both
-        'veg' and 'non-veg')."""
         result = run_mcp.recommendation(dietary_type="Veg")
         dietary_types = {r["dietary_type"] for r in result["recommendations"]}
         self.assertEqual(dietary_types, {"Veg"})
