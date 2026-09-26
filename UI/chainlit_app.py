@@ -22,6 +22,7 @@ import chainlit as cl
 
 from cravr.debug_utils import debug_enabled
 
+import components
 import graph_bridge
 import state
 
@@ -41,6 +42,10 @@ async def on_chat_start() -> None:
 
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
+    # A typed reply ("1, 3" / names) to a pick-several question replaces the
+    # toggle buttons -- drop them so they can't be tapped afterwards.
+    if state.get_multiselect():
+        await components.finish_multiselect()
     await state.clear_live_options()
     await graph_bridge.send(message.content)
 
@@ -53,4 +58,21 @@ async def on_pick(action: cl.Action) -> None:
     value = action.payload.get("value")
     label = action.payload.get("label") or value
     await cl.Message(content=str(label), type="user_message").send()
+    await graph_bridge.send(value, display_label=label)
+
+
+@cl.action_callback("multiselect_toggle")
+async def on_multiselect_toggle(action: cl.Action) -> None:
+    """Tick/untick one option of a pick-several question (add-ons)."""
+    await components.toggle_multiselect(action.payload.get("value"))
+
+
+@cl.action_callback("multiselect_done")
+async def on_multiselect_done(action: cl.Action) -> None:
+    """Send every ticked option at once, as one comma-joined reply."""
+    finished = await components.finish_multiselect()
+    if not finished:
+        return
+    value, label = finished
+    await cl.Message(content=label, type="user_message").send()
     await graph_bridge.send(value, display_label=label)

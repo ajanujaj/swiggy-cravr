@@ -154,3 +154,87 @@ async def send_dish_cards(
 
 async def send_assistant_message(content: str, options: list[dict[str, str]] | None) -> None:
     await send_option_message(content, options)
+
+
+_DONE_VALUE = "__multiselect_done__"
+
+
+def _render_multiselect(question: str, options: list[dict[str, str]], selected: list[str]) -> tuple[str, list[cl.Action]]:
+    """Message text + toggle buttons for a "pick several" question. The text
+    lists every option grouped under its heading with a checkbox (so it reads
+    as a list), the buttons toggle each option, and a final Done button sends
+    the whole selection. `selected` is the values ticked so far."""
+    chosen = set(selected)
+    lines = [question.split("\n", 1)[0], ""]
+    actions: list[cl.Action] = []
+    current_group: str | None = None
+    for opt in options:
+        value = opt.get("value")
+        if value in (OTHER_VALUE, "__no_addon__"):
+            continue
+        group = opt.get("group")
+        if group and group != current_group:
+            current_group = group
+            if len(lines) > 2:
+                lines.append("")
+            lines += [f"**{group}**", ""]
+        mark = "☑" if value in chosen else "☐"
+        lines.append(f"- {mark} {opt.get('label') or value}")
+        actions.append(cl.Action(
+            name="multiselect_toggle",
+            payload={"value": value},
+            label=f"{'✓ ' if value in chosen else ''}{opt.get('label') or value}",
+        ))
+    count = len(chosen)
+    lines += ["", f"_{count} selected -- tap items to toggle, then press Done. You can also type numbers or names._"]
+    actions.append(cl.Action(
+        name="multiselect_done", payload={"value": _DONE_VALUE},
+        label=f"Done ({count})" if count else "Skip -- none of these",
+    ))
+    return "\n".join(lines), actions
+
+
+async def send_multiselect_message(question: str, options: list[dict[str, str]] | None) -> None:
+    """A question where several options can be picked at once (add-ons).
+    Chainlit actions are single-shot buttons, so multi-select is built from
+    toggle buttons that re-render this same message, plus a Done button that
+    resumes the graph with every selected value comma-joined."""
+    options = options or []
+    content, actions = _render_multiselect(question, options, [])
+    message = cl.Message(content=content, actions=actions, author="Cravr")
+    await message.send()
+    state.set_multiselect({"message": message, "question": question, "options": options, "selected": []})
+    state.set_live_option_messages([])
+
+
+async def toggle_multiselect(value: str) -> None:
+    """Tick/untick one option and re-render the message in place."""
+    current = state.get_multiselect()
+    if not current:
+        return
+    selected: list[str] = current["selected"]
+    if value in selected:
+        selected.remove(value)
+    else:
+        selected.append(value)
+    message: cl.Message = current["message"]
+    await message.remove_actions()
+    message.content, message.actions = _render_multiselect(current["question"], current["options"], selected)
+    await message.update()
+
+
+async def finish_multiselect() -> tuple[str, str] | None:
+    """Freeze the message (drop its buttons) and return `(resume_value,
+    display_label)` -- comma-joined ids, or the "none" sentinel if nothing
+    was ticked. None if there is no multi-select on screen."""
+    current = state.get_multiselect()
+    if not current:
+        return None
+    message: cl.Message = current["message"]
+    await message.remove_actions()
+    state.set_multiselect(None)
+    selected: list[str] = current["selected"]
+    if not selected:
+        return "__no_addon__", "None of these"
+    labels = {o.get("value"): o.get("label") or o.get("value") for o in current["options"]}
+    return ",".join(selected), ", ".join(str(labels.get(v, v)) for v in selected)

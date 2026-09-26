@@ -188,6 +188,32 @@ def _parse_detailed_search_menu_items(text: str) -> dict[str, dict[str, Any]]:
     return items
 
 
+def _attach_addon_limits(detailed: dict[str, dict[str, Any]], structured: Any) -> None:
+    """The text shape carries no selection rules, but the SAME response's
+    `structured_content` does (confirmed live: `'addons': [{'groupId':
+    '174519340', 'groupName': 'Salad Add-ons', 'choices': [...],
+    'maxAddons': 8, 'maxFreeAddons': -1}]`; Swiggy's search_menu reference
+    also lists `minAddons`). Copy min/max onto the parsed groups
+    (`min_addons` / `max_addons`) so the add-on picker can enforce them.
+    Purely additive and defensive -- anything missing is left unset."""
+    if not isinstance(structured, dict):
+        return
+    for entry in structured.get("items") or []:
+        if not isinstance(entry, dict):
+            continue
+        parsed = detailed.get(str(entry.get("menu_item_id")))
+        if not parsed:
+            continue
+        limits = {
+            str(g.get("groupId")): g for g in entry.get("addons") or [] if isinstance(g, dict)
+        }
+        for group in parsed.get("addon_groups") or []:
+            raw_group = limits.get(str(group.get("group_id")))
+            if raw_group:
+                group["min_addons"] = raw_group.get("minAddons")
+                group["max_addons"] = raw_group.get("maxAddons")
+
+
 def search_menu_items(
     query: str, address_id: str | None, veg_only: bool = False, offset: int = 0,
     restaurant_id: str | None = None,
@@ -230,7 +256,7 @@ def search_menu_items(
         arguments["restaurantIdOfAddedItem"] = restaurant_id
 
     try:
-        raw = _call_tool("search_menu", arguments)
+        raw, meta = _call_tool("search_menu", arguments, return_meta=True)
     except Exception as exc:
         debug("food_mcp", f"search_menu FAILED: {exc}")
         return {"items": [], "has_more": False, "next_offset": None}
@@ -248,6 +274,7 @@ def search_menu_items(
             # text themselves.
             detailed = _parse_detailed_search_menu_items(raw)
             if detailed:
+                _attach_addon_limits(detailed, meta.get("structured_content") if isinstance(meta, dict) else None)
                 result["detailed_items"] = detailed
         return result
 

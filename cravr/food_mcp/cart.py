@@ -130,6 +130,77 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
     return result
 
 
+def _collect_valid_addons(node: Any, out: dict[str, list[dict[str, Any]]], item_id: str | None = None) -> None:
+    """Walk a get_food_cart `structured_content` tree and gather every
+    `valid_addons` list, keyed by the menu_item_id of the cart item it sits
+    on. Swiggy's docs (update_food_cart reference) put `valid_addons` on each
+    FoodCartItem -- `[{group_id, name, minAddons, maxAddons, choices[]}]` --
+    but don't say where in the envelope the items live, so this searches the
+    whole tree instead of trusting one path."""
+    if isinstance(node, dict):
+        mid = node.get("menu_item_id") or node.get("menuItemId")
+        current = str(mid) if mid is not None else item_id
+        for key in ("valid_addons", "validAddons"):
+            groups = node.get(key)
+            if isinstance(groups, list) and current is not None:
+                out.setdefault(current, []).extend(g for g in groups if isinstance(g, dict))
+        for value in node.values():
+            _collect_valid_addons(value, out, current)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_valid_addons(value, out, item_id)
+
+
+def get_cart_valid_addons(address_id: str) -> dict[str, list[dict[str, Any]]]:
+    """{menu_item_id: [group, ...]} of the add-on groups Swiggy says are
+    actually valid for each item CURRENTLY IN the cart. Docs (search_menu /
+    update_food_cart): "Add item with variants first ... then check cart
+    response for valid_addons to see which addons are actually available
+    for your variant selection, then add addons from valid_addons list" and
+    "Keep the group and choice IDs paired exactly as returned".
+
+    Each group: {"group_id", "group_name", "min_addons", "max_addons",
+    "choices": [{"id", "name", "price_inr", "group_id", "raw"}]} -- `raw` is
+    Swiggy's own choice dict, kept so a caller can echo it back verbatim.
+    Returns {} on any failure or when the response has no valid_addons --
+    callers treat that as "nothing usable", never as an error.
+    """
+    try:
+        _, meta = _call_tool("get_food_cart", {"addressId": address_id}, log_request=True, return_meta=True)
+    except Exception as exc:  # noqa: BLE001 -- best-effort lookup
+        debug("food_mcp", f"get_food_cart (valid_addons lookup) FAILED: {exc}")
+        return {}
+    structured = meta.get("structured_content") if isinstance(meta, dict) else None
+    found: dict[str, list[dict[str, Any]]] = {}
+    _collect_valid_addons(structured, found)
+
+    result: dict[str, list[dict[str, Any]]] = {}
+    for item_id, groups in found.items():
+        normalised = []
+        for g in groups:
+            group_id = g.get("group_id") or g.get("groupId")
+            choices = []
+            for c in g.get("choices") or []:
+                if not isinstance(c, dict) or c.get("id") is None:
+                    continue
+                choices.append({
+                    "id": str(c["id"]), "name": c.get("name") or "",
+                    "price_inr": c.get("price", 0) or 0,
+                    "group_id": str(c.get("group_id") or c.get("groupId") or group_id or ""),
+                    "raw": c,
+                })
+            normalised.append({
+                "group_id": str(group_id) if group_id is not None else None,
+                "group_name": g.get("name") or g.get("groupName") or "add-on",
+                "min_addons": g.get("minAddons"), "max_addons": g.get("maxAddons"),
+                "choices": choices,
+            })
+        result[item_id] = normalised
+    summary = {k: [(g["group_name"], len(g["choices"])) for g in v] for k, v in result.items()}
+    debug("food_mcp", f"get_food_cart valid_addons -> {summary!r}")
+    return result
+
+
 def update_cart(
     restaurant_id: str, address_id: str, cart_items: list[dict[str, Any]], restaurant_name: str | None = None
 ) -> dict[str, Any]:

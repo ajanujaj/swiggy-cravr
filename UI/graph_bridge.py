@@ -57,7 +57,10 @@ async def process_result(result: dict[str, Any] | None) -> None:
 
         debug("ui", f"interrupt from {source!r}: {question!r} options={[o.get('value') for o in options]}")
         state.set_awaiting_interrupt(True)
-        await components.send_option_message(question, options)
+        if isinstance(payload, dict) and payload.get("multi_select"):
+            await components.send_multiselect_message(question, options)
+        else:
+            await components.send_option_message(question, options)
         return
 
     state.set_awaiting_interrupt(False)

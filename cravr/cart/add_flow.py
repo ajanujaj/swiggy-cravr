@@ -72,80 +72,75 @@ def _fetch_addon_groups(
 
 
 def _addon_question_and_options(
-    item_name: str, choices: list[dict[str, Any]], is_followup: bool,
+    item_name: str, choices: list[dict[str, Any]],
 ) -> tuple[str, list[dict[str, str]]]:
-    """The question text + tap options for one round of
-    `_ask_for_all_addons` -- `choices` is whatever's still unanswered
-    going into this round (every choice on round 1, fewer on a followup).
-    Numbering restarts at 1 each round; that's fine because
-    `_match_addon_reply` is always handed exactly THIS round's `choices`,
-    so a position always means "this round's Nth listed item", never a
-    stale one from an earlier round."""
-    if is_followup:
-        lines = [
-            f'Anything else for {item_name}? (numbers, names, or comma-separated), or say "done":',
-            "",
-        ]
-        none_label = "Nothing else"
-    else:
-        lines = [
-            f'{item_name} has these add-ons -- reply with any you want '
-            '(numbers, names, or comma-separated), or say "none":',
-            "",
-        ]
-        none_label = "None of these"
-
+    """The question text + selectable options for the ONE add-on question.
+    Every choice of every group is listed and numbered continuously, so a
+    typed reply ("1, 4, 9" / names) and a UI selection (choice ids) both
+    resolve against the same list in `_match_addon_reply`. Each option
+    carries its `group` so the chat UI can render group headings, and a
+    group with a selection cap says so ("choose up to N")."""
+    lines = [
+        f"{item_name} has these add-ons -- select as many as you like "
+        '(numbers, names, or comma-separated), or say "none":',
+        "",
+    ]
     options: list[dict[str, str]] = []
-    current_group_name: str | None = None
+    current_group_id: Any = object()
     for i, choice in enumerate(choices, start=1):
-        if choice["group_name"] != current_group_name:
-            current_group_name = choice["group_name"]
-            lines.append(f"{current_group_name}:")
+        if choice.get("group_id") != current_group_id:
+            current_group_id = choice.get("group_id")
+            cap = choice.get("max_addons")
+            cap_bit = f" (choose up to {cap})" if isinstance(cap, int) and cap > 0 else ""
+            lines.append(f"{choice['group_name']}{cap_bit}:")
         price_bit = f" (+₹{choice['price_inr']:.0f})" if choice.get("price_inr") else ""
         lines.append(f"  {i}. {choice['name']}{price_bit}")
-        options.append({"value": str(choice["id"]), "label": f"{choice['name']}{price_bit}"})
-    options.append({"value": _NONE_ADDON_VALUE, "label": none_label})
+        options.append({
+            "value": str(choice["id"]),
+            "label": f"{choice['name']}{price_bit}",
+            "group": str(choice["group_name"]),
+        })
+    options.append({"value": _NONE_ADDON_VALUE, "label": "None of these"})
     return "\n".join(lines), options
 
 
+def _enforce_group_limits(
+    selected: list[dict[str, Any]], indexed_choices: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Honour each group's `maxAddons` (search_menu reference: per-group
+    `minAddons` / `maxAddons` / `maxFreeAddons`). Extra picks beyond a
+    group's max are dropped -- first-mentioned wins -- rather than sent to
+    Swiggy to be rejected. A missing/non-positive max means "no cap known"."""
+    caps: dict[Any, int] = {}
+    for c in indexed_choices:
+        cap = c.get("max_addons")
+        if isinstance(cap, int) and cap > 0:
+            caps[c.get("group_id")] = cap
+    kept: list[dict[str, Any]] = []
+    counts: dict[Any, int] = {}
+    for entry in selected:
+        gid = entry.get("group_id")
+        if gid in caps and counts.get(gid, 0) >= caps[gid]:
+            debug("cart_agent", f"addon {entry.get('name')!r} dropped: group {gid} already at max {caps[gid]}")
+            continue
+        counts[gid] = counts.get(gid, 0) + 1
+        kept.append(entry)
+    return kept
+
+
 def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ask about every addon group, starting from ONE consolidated
-    `interrupt()` that lists all of them at once -- not one per group.
+    """Ask about every addon group in ONE multi-select question.
 
-    Live evidence this replaces (logger.txt, "Spaghetti Aglio Olio [Veg]",
-    4 real addon groups): the original group-by-group loop took 3 separate
-    conversation turns to answer 3 groups, AND -- because it capped at a
-    fixed group count -- never even asked about the 4th group ("Choose
-    Your Non Veg Toppings") before sending the add, which still came back
-    'Cart updated.\nCart is empty.' from the real update_food_cart.
-
-    The FIRST version of this "all at once" question (a single
-    interrupt(), no loop) fixed the missing-4th-group problem but broke
-    something else, also confirmed live: a real user's natural move was to
-    TAP one button, same as every other options menu in this app -- and
-    chainlit's Action buttons only ever return ONE value per click, so a
-    single tap could only ever pick from ONE of the groups shown, with the
-    rest implicitly left unanswered ("can use only 1" -- accurate
-    complaint, not a misunderstanding). Free-text multi-select ("1, 3" or
-    comma-separated names) still worked, but nothing about the UI
-    suggested that was necessary over just tapping.
-
-    This version keeps the single big question up front (every group
-    still shown at once, so nothing requires several turns just to be
-    SEEN), but treats one round's reply as "at least this," not "only
-    this": whatever groups the reply didn't resolve go into a shorter
-    FOLLOWUP question (only the still-open groups, with a "done"/"nothing
-    else" way out), repeating until either every group has a real answer
-    or the user says they're done. A single free-text reply naming
-    several groups at once (still fully supported) finishes in one round,
-    same as before; a user who taps is walked through the remaining groups
-    a tap at a time instead of being capped at whichever one group they
-    happened to hit first. Bounded by the number of distinct groups --
-    each round that matches anything resolves at least one whole group
-    (single-choice-or-none per group, same simplification as before; see
-    _match_addon_reply), so `remaining` strictly shrinks every successful
-    round, and an unproductive reply (unmatched text, or "none"/"done")
-    ends the loop immediately rather than re-asking.
+    History: the first version asked group-by-group, the second listed
+    every group but let a button tap answer only ONE group (a tap returns
+    a single value), so users could only ever pick one add-on ("can use
+    only 1"). This version is a real multi-select: the interrupt payload
+    carries `multi_select=True` and the chat UI (UI/components.py
+    `send_multiselect_message`) renders toggle buttons plus a Done button,
+    then resumes with ALL chosen ids comma-joined. Typed replies ("1, 4,
+    9", names) still work through the same `_match_addon_reply` -- and any
+    number of choices, across any groups, can be picked in one reply.
+    Per-group `maxAddons` is enforced afterwards by `_enforce_group_limits`.
 
     Returns FoodCartAddon-shaped entries: [{"id", "name", "group_id",
     "quantity", "price"}].
@@ -156,7 +151,10 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
         for choice in group.get("choices") or []:
             if not (choice.get("id") and choice.get("name")):
                 continue
-            indexed_choices.append({**choice, "group_name": group_name})
+            indexed_choices.append({
+                **choice, "group_name": group_name,
+                "min_addons": group.get("min_addons"), "max_addons": group.get("max_addons"),
+            })
             if len(indexed_choices) >= _MAX_TOTAL_ADDON_CHOICES:
                 break
         if len(indexed_choices) >= _MAX_TOTAL_ADDON_CHOICES:
@@ -164,42 +162,18 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
     if not indexed_choices:
         return []
 
-    selected: list[dict[str, Any]] = []
-    picked_ids: set[str] = set()
-    remaining = indexed_choices
-    group_count = len({c.get("group_id") for c in indexed_choices})
-    round_number = 0
+    question, options = _addon_question_and_options(item_name, indexed_choices)
+    raw_answer = interrupt({
+        "question": question,
+        "options": options,
+        "agent": "cart_agent",
+        "field": "addon_groups",
+        "multi_select": True,
+    })
+    debug("cart_agent", f"addon selection raw_answer={raw_answer!r}")
+    matches = _match_addon_reply(str(raw_answer), indexed_choices)
+    return _enforce_group_limits(matches, indexed_choices)
 
-    # Belt-and-suspenders bound -- the break-on-no-match below already
-    # guarantees termination, this just caps it defensively at the number
-    # of groups (each successful round removes at least one whole group).
-    while remaining and round_number < max(group_count, 1):
-        round_number += 1
-        question, options = _addon_question_and_options(item_name, remaining, round_number > 1)
-        raw_answer = interrupt({
-            "question": question,
-            "options": options,
-            "agent": "cart_agent",
-            "field": f"addon_groups:round{round_number}",
-        })
-        debug("cart_agent", f"addon selection round {round_number} raw_answer={raw_answer!r}")
-
-        reply_matches = _match_addon_reply(str(raw_answer), remaining)
-        if not reply_matches:
-            # A genuine "none"/"done", or free text that matched nothing
-            # in THIS round's list -- either way, stop asking rather than
-            # loop on an unproductive reply.
-            break
-
-        newly_answered_group_ids: set[Any] = set()
-        for choice in reply_matches:
-            if choice["id"] not in picked_ids:
-                picked_ids.add(choice["id"])
-                selected.append(choice)
-            newly_answered_group_ids.add(choice.get("group_id"))
-        remaining = [c for c in remaining if c.get("group_id") not in newly_answered_group_ids]
-
-    return selected
 
 def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Resolve one free-text (or tapped) reply against every choice
@@ -257,6 +231,73 @@ def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -
             "price": choice.get("price_inr", 0),
         })
     return matched
+
+
+def _map_to_valid_addons(
+    selected: list[dict[str, Any]], valid_groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Re-express the user's picks using Swiggy's own `valid_addons` entries
+    (keeps each choice paired with the group it was returned under). Picks
+    Swiggy doesn't list as valid for this cart item are dropped; each
+    group's `max_addons` is honoured."""
+    by_choice: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for group in valid_groups:
+        for choice in group.get("choices") or []:
+            by_choice.setdefault(str(choice["id"]), (group, choice))
+    mapped: list[dict[str, Any]] = []
+    counts: dict[Any, int] = {}
+    for pick in selected:
+        hit = by_choice.get(str(pick.get("id")))
+        if not hit:
+            continue
+        group, choice = hit
+        cap = group.get("max_addons")
+        if isinstance(cap, int) and cap > 0 and counts.get(group["group_id"], 0) >= cap:
+            continue
+        counts[group["group_id"]] = counts.get(group["group_id"], 0) + 1
+        entry = dict(choice.get("raw") or {})
+        entry.setdefault("id", choice["id"])
+        entry.setdefault("name", choice["name"])
+        entry.setdefault("price", choice["price_inr"])
+        entry["group_id"] = choice.get("group_id") or group["group_id"]
+        entry["quantity"] = 1
+        mapped.append(entry)
+    return mapped
+
+
+def _retry_addons_via_valid_addons(
+    build_payload, restaurant_id: str, address_id: str, restaurant_name: str | None,
+    menu_item_id: str, selected: list[dict[str, Any]], failed_result: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Swiggy's documented add-on flow, used after a one-shot add with
+    add-ons was rejected (INVALID_ADDON): (1) add the item alone, (2) read
+    `valid_addons` for it off the cart, (3) resend with add-ons taken from
+    that list. Returns `(result, note)`. If step 1 fails, the original
+    failure is returned untouched. If steps 2/3 can't get the add-ons in, the
+    plain item stays in the cart (result = step 1's success) and `note` says
+    honestly that the add-ons were not added -- better than losing the dish."""
+    base = food_mcp.update_cart(restaurant_id, address_id, build_payload([]), restaurant_name=restaurant_name)
+    debug("cart_agent", f"addon retry step 1 (item alone) -> {base!r}")
+    if base.get("status") != "success":
+        return failed_result, ""
+
+    valid = food_mcp.get_cart_valid_addons(address_id).get(str(menu_item_id)) or []
+    mapped = _map_to_valid_addons(selected, valid)
+    debug("cart_agent", f"addon retry step 2: {len(selected)} picked, {len(mapped)} valid per cart -> {mapped!r}")
+    if not mapped:
+        return base, (
+            "Swiggy didn't list those add-ons as valid for this dish, so I added it without them."
+        )
+
+    retry = food_mcp.update_cart(restaurant_id, address_id, build_payload(mapped), restaurant_name=restaurant_name)
+    debug("cart_agent", f"addon retry step 3 (with valid_addons) -> {retry!r}")
+    if retry.get("status") == "success":
+        return retry, ""
+    codes = ", ".join(retry.get("error_codes") or []) or "rejected"
+    return base, (
+        f"Swiggy rejected the add-ons ({codes}), so I added the dish without them -- "
+        "you can add them in the Swiggy app."
+    )
 
 
 def add_dish_to_cart(
@@ -408,15 +449,19 @@ def add_dish_to_cart(
     merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
     target_quantity = merged.get(str(menu_item_id), 0) + quantity
     merged[str(menu_item_id)] = target_quantity
-    cart_items_payload = []
-    for mid, qty in merged.items():
-        entry: dict[str, Any] = {"menu_item_id": mid, "quantity": qty}
-        if attempt_addon_only and mid == str(menu_item_id):
-            # Real user selections when _ask_for_addon_choices got any,
-            # else the explicit-empty-selection fallback -- see the
-            # attempt_addon_only comment above.
-            entry["addons"] = selected_addons
-        cart_items_payload.append(entry)
+    def _build_payload(target_addons: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items = []
+        for mid, qty in merged.items():
+            entry: dict[str, Any] = {"menu_item_id": mid, "quantity": qty}
+            if attempt_addon_only and mid == str(menu_item_id):
+                # Real user selections when the addon question got any,
+                # else the explicit-empty-selection fallback -- see the
+                # attempt_addon_only comment above.
+                entry["addons"] = target_addons
+            items.append(entry)
+        return items
+
+    cart_items_payload = _build_payload(selected_addons)
     debug("cart_agent", f"sending merged cartItems={cart_items_payload!r}")
 
     result = food_mcp.update_cart(
@@ -425,6 +470,27 @@ def add_dish_to_cart(
         restaurant_name=dish.get("restaurant_name"),
     )
     debug("cart_agent", f"update_cart -> {result!r}")
+
+    # Live evidence (logger.txt 2026-09-26, 'Greek Falafel Salad', addon
+    # 'Sun Dried Tomatoes Topping'): sending the picked add-ons in the same
+    # call that adds the item came back INVALID_ADDON ("Restaurant may have
+    # removed the item(s) from their menu") with the cart left empty --
+    # even though every id/group pair was exactly what search_menu returned.
+    # Swiggy's docs describe a two-step flow instead: add the item first,
+    # read `valid_addons` off the cart, then add add-ons FROM that list with
+    # the group/choice ids paired exactly as returned. So on that specific
+    # rejection, fall back to the documented flow before giving up.
+    addon_note = ""
+    if (
+        result.get("status") != "success" and attempt_addon_only and selected_addons
+        and "INVALID_ADDON" in (result.get("error_codes") or [])
+    ):
+        result, addon_note = _retry_addons_via_valid_addons(
+            _build_payload, restaurant_id, address_id, dish.get("restaurant_name"),
+            str(menu_item_id), selected_addons, result,
+        )
+        if addon_note:
+            lead_in = f"{lead_in} {addon_note}".strip()
     if result.get("status") != "success":
         if attempt_addon_only:
             # `error_codes` only shows up when Swiggy's own structured_content

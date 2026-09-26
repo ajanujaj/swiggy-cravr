@@ -1184,12 +1184,10 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
         target_entry, _ = self._run("no thanks")
         self.assertEqual(target_entry.get("addons"), [])
 
-    def test_tapping_one_choice_gets_asked_again_about_the_rest(self):
-        """The exact live complaint this fixes ('Now I got all at once,
-        but can use only 1, WTF'): tapping ONE button used to silently
-        finalize the whole add with only that one group answered. Now a
-        tap resolves just that group, and the remaining groups get a
-        shorter followup question instead of being dropped."""
+    def _invoke_once(self, resume_value, update_side_effect=None, valid_addons=None):
+        """Start the flow, assert it pauses ONCE with a multi-select
+        question, resume with `resume_value`, and return (first_interrupt,
+        result, mock_update)."""
         config = {"configurable": {"thread_id": str(uuid.uuid4())}}
         state = {
             "messages": [HumanMessage(content="add it to cart")],
@@ -1199,40 +1197,89 @@ class MultiGroupAddonSelectionTests(unittest.TestCase):
         }
         with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
              patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.get_cart_valid_addons",
+                   return_value=valid_addons or {}), \
              patch("cravr.cart.CartAgent.food_mcp.search_menu_items", return_value=self._DETAILED_PROBE):
-            mock_get_cart.side_effect = [
-                {"status": "empty", "message": "Cart is empty."},
-                {"status": "text", "message": self._LANDED_MESSAGE},
-                {"status": "text", "message": self._LANDED_MESSAGE},
-            ]
-            mock_update.return_value = {"status": "success", "message": "Cart updated."}
-
+            mock_get_cart.return_value = {"status": "text", "message": self._LANDED_MESSAGE}
+            mock_get_cart.side_effect = None
+            first_get = [{"status": "empty", "message": "Cart is empty."}]
+            mock_get_cart.side_effect = first_get + [
+                {"status": "text", "message": self._LANDED_MESSAGE}] * 6
+            if update_side_effect is not None:
+                mock_update.side_effect = update_side_effect
+            else:
+                mock_update.return_value = {"status": "success", "message": "Cart updated."}
             first = cravr_app.invoke(state, config=config)
             self.assertTrue(first.get("__interrupt__"))
+            pending = first["__interrupt__"][0].value
+            result = cravr_app.invoke(Command(resume=resume_value), config=config)
+        return pending, result, mock_update
 
-            # Tap Mushroom's real id, exactly what a real button click sends.
-            second = cravr_app.invoke(Command(resume="25698096"), config=config)
-            self.assertTrue(
-                second.get("__interrupt__"),
-                "a single tap must not silently finalize the whole add -- "
-                "the other 3 groups still need asking about",
-            )
-            followup_question = second["__interrupt__"][0].value["question"]
-            self.assertIn("Anything else", followup_question)
-            # The already-answered group drops out of the followup; the
-            # other three are still there to answer.
-            self.assertNotIn("Choose Your Veg Toppings", followup_question)
-            for group_name in (
-                "Choose Your Gourmet Topping", "Choose Your Cheese", "Choose Your Non Veg Toppings",
-            ):
-                self.assertIn(group_name, followup_question)
+    def test_the_addon_question_is_one_multi_select_interrupt(self):
+        pending, result, mock_update = self._invoke_once("25698072,25698096,25698108,25698200")
+        self.assertTrue(pending.get("multi_select"))
+        self.assertEqual(
+            {o["group"] for o in pending["options"] if o.get("group")},
+            {"Choose Your Gourmet Topping", "Choose Your Veg Toppings",
+             "Choose Your Cheese", "Choose Your Non Veg Toppings"},
+        )
+        # ONE resume finishes the flow -- no per-group follow-up questions.
+        self.assertFalse(result.get("__interrupt__"))
+        sent = next(e for e in mock_update.call_args[0][2] if e["menu_item_id"] == "32257515")
+        self.assertEqual(
+            [a["name"] for a in sent["addons"]],
+            ["Sundried Tomato", "Mushroom", "Extra Mozzarella Cheese", "Chicken Sausage"],
+        )
 
-            third = cravr_app.invoke(Command(resume="__no_addon__"), config=config)
-            self.assertFalse(third.get("__interrupt__"), "should be done after saying 'nothing else'")
+    def test_several_picks_in_the_same_group_are_all_kept(self):
+        # Regression for "can select only one": two choices from ONE group.
+        probe = {"items": {}, "has_more": False, "next_offset": None, "detailed_items": {
+            "32257515": {"item_name": "Salad", "price_inr": 399, "variant_groups": [],
+                         "addon_groups": [{"group_id": "g1", "group_name": "Salad Add-ons",
+                                           "max_addons": 8, "choices": [
+                {"id": "1", "name": "Feta Cheese", "price_inr": 69, "group_id": "g1"},
+                {"id": "2", "name": "Black Olives", "price_inr": 49, "group_id": "g1"},
+                {"id": "3", "name": "Lavash", "price_inr": 49, "group_id": "g1"}]}]}}}
+        with patch.object(type(self), "_DETAILED_PROBE", probe):
+            _, result, mock_update = self._invoke_once("1,3")
+        sent = next(e for e in mock_update.call_args[0][2] if e["menu_item_id"] == "32257515")
+        self.assertEqual([a["name"] for a in sent["addons"]], ["Feta Cheese", "Lavash"])
 
-        sent_items = mock_update.call_args[0][2]
-        target_entry = next(e for e in sent_items if e["menu_item_id"] == "32257515")
-        self.assertEqual([a["name"] for a in target_entry.get("addons", [])], ["Mushroom"])
+    def test_group_max_addons_is_enforced(self):
+        from cravr.cart.add_flow import _enforce_group_limits
+        choices = [{"id": "1", "group_id": "g", "max_addons": 1},
+                   {"id": "2", "group_id": "g", "max_addons": 1}]
+        picked = [{"id": "1", "group_id": "g", "name": "a"}, {"id": "2", "group_id": "g", "name": "b"}]
+        self.assertEqual([p["id"] for p in _enforce_group_limits(picked, choices)], ["1"])
+
+    def test_invalid_addon_falls_back_to_item_first_then_valid_addons(self):
+        rejection = {"status": "error", "message": "Apologies!", "error_codes": ["INVALID_ADDON"]}
+        ok = {"status": "success", "message": "Cart updated."}
+        valid = {"32257515": [{
+            "group_id": "37840188", "group_name": "Choose Your Veg Toppings",
+            "min_addons": None, "max_addons": 3,
+            "choices": [{"id": "25698096", "name": "Mushroom", "price_inr": 75,
+                         "group_id": "37840188",
+                         "raw": {"id": "25698096", "name": "Mushroom", "price": 75, "group_id": "37840188"}}],
+        }]}
+        _, result, mock_update = self._invoke_once(
+            "25698096", update_side_effect=[rejection, ok, ok], valid_addons=valid)
+        self.assertEqual(mock_update.call_count, 3)
+        step1 = next(e for e in mock_update.call_args_list[1][0][2] if e["menu_item_id"] == "32257515")
+        step3 = next(e for e in mock_update.call_args_list[2][0][2] if e["menu_item_id"] == "32257515")
+        self.assertEqual(step1["addons"], [])
+        self.assertEqual([a["id"] for a in step3["addons"]], ["25698096"])
+        self.assertNotIn("couldn't be added", result["messages"][-1].content)
+
+    def test_invalid_addon_with_no_valid_addons_keeps_the_plain_dish(self):
+        rejection = {"status": "error", "message": "Apologies!", "error_codes": ["INVALID_ADDON"]}
+        ok = {"status": "success", "message": "Cart updated."}
+        _, result, mock_update = self._invoke_once(
+            "25698096", update_side_effect=[rejection, ok], valid_addons={})
+        self.assertEqual(mock_update.call_count, 2)
+        content = result["messages"][-1].content
+        self.assertIn("without them", content)
+        self.assertNotIn("couldn't be added", content)
 
 
 class MatchAddonReplyTests(unittest.TestCase):

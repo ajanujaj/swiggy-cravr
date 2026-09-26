@@ -13,6 +13,7 @@ import chainlit as cl
 _THREAD_CONFIG_KEY = "cravr_config"
 _AWAITING_INTERRUPT_KEY = "cravr_awaiting_interrupt"
 _LIVE_OPTION_MESSAGES_KEY = "cravr_live_option_messages"
+_MULTISELECT_KEY = "cravr_multiselect"
 
 
 def init_state() -> None:
@@ -21,6 +22,7 @@ def init_state() -> None:
     cl.user_session.set(_THREAD_CONFIG_KEY, {"configurable": {"thread_id": str(uuid.uuid4())}})
     cl.user_session.set(_AWAITING_INTERRUPT_KEY, False)
     cl.user_session.set(_LIVE_OPTION_MESSAGES_KEY, [])
+    cl.user_session.set(_MULTISELECT_KEY, None)
 
 
 def get_config() -> dict[str, Any]:
@@ -54,3 +56,14 @@ async def clear_live_options() -> None:
         except Exception:  # noqa: BLE001 -- best-effort cleanup
             pass
     set_live_option_messages([])
+
+
+def get_multiselect() -> dict[str, Any] | None:
+    """The add-on style "pick several" question currently on screen, as
+    `{"message": cl.Message, "question": str, "options": [...], "selected":
+    [values in tap order]}` -- or None when there isn't one."""
+    return cl.user_session.get(_MULTISELECT_KEY)
+
+
+def set_multiselect(value: dict[str, Any] | None) -> None:
+    cl.user_session.set(_MULTISELECT_KEY, value)

@@ -153,6 +153,7 @@ from .cart import (
     fetch_coupons,
     flush_cart,
     get_cart,
+    get_cart_valid_addons,
     update_cart,
 )
 
@@ -169,6 +170,7 @@ __all__ = [
     "search_dishes",
     "get_order_history",
     "get_cart",
+    "get_cart_valid_addons",
     "update_cart",
     "apply_coupon",
     "fetch_coupons",
