@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from ..clock import now_ist
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.types import interrupt
 
@@ -280,7 +282,7 @@ def intent_discovery_node(state: CravrState) -> dict:
     other node that calls `interrupt()` -- decision_agent_node never does
     (see `DecisionAgentNeverAsksTests`).
     """
-    now = datetime.now()
+    now = now_ist()
 
     # The CLI starts with no user message on purpose (offers a meal choice
     # first) -- never extract from an empty conversation, some models invent a craving.

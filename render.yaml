@@ -13,6 +13,9 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     envVars:
+      # Render hosts run in UTC; meal windows and logs should follow India time.
+      - key: TZ
+        value: Asia/Kolkata
       - key: GROQ_API_KEY
         sync: false
       # Set to https://mcp.swiggy.com/food for real recommendations/location/

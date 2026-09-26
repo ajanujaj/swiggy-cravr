@@ -1,11 +1,12 @@
 from __future__ import annotations
 from datetime import datetime
+from ..clock import now_ist
 from .meal_utils import MealWindow, MEAL_WINDOWS
 
 
 def current_meal_window(now: datetime | None = None) -> MealWindow:
     """Return the window the given moment falls in (defaults to right now)."""
-    moment = (now or datetime.now()).time()
+    moment = (now or now_ist()).time()
 
     for window in MEAL_WINDOWS:
         if window.spans_midnight():
@@ -31,7 +32,7 @@ def meal_intent_question(now: datetime | None = None) -> str:
     Naming the hour is what makes a three-way choice feel considered rather
     than arbitrary -- "It's 10:04 PM" explains why breakfast isn't on offer.
     """
-    moment = now or datetime.now()
+    moment = now or now_ist()
     window = current_meal_window(moment)
     labels = [label for _value, label in window.options]
     clock = moment.strftime("%I:%M %p").lstrip("0")
