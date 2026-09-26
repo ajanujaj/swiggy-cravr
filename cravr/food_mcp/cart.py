@@ -130,75 +130,104 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
     return result
 
 
-def _collect_valid_addons(node: Any, out: dict[str, list[dict[str, Any]]], item_id: str | None = None) -> None:
-    """Walk a get_food_cart `structured_content` tree and gather every
-    `valid_addons` list, keyed by the menu_item_id of the cart item it sits
-    on. Swiggy's docs (update_food_cart reference) put `valid_addons` on each
-    FoodCartItem -- `[{group_id, name, minAddons, maxAddons, choices[]}]` --
-    but don't say where in the envelope the items live, so this searches the
-    whole tree instead of trusting one path."""
+def _collect_cart_items(node: Any, out: list[dict[str, Any]]) -> None:
+    """Find every cart-item dict (anything with a `menu_item_id` AND a
+    `valid_addons`/`variants`/`addons` list) anywhere in a get_food_cart
+    `structured_content` tree. The docs describe FoodCartItem but not where
+    in the envelope the items live (live: `data.items[]`), so search it all."""
     if isinstance(node, dict):
-        mid = node.get("menu_item_id") or node.get("menuItemId")
-        current = str(mid) if mid is not None else item_id
-        for key in ("valid_addons", "validAddons"):
-            groups = node.get(key)
-            if isinstance(groups, list) and current is not None:
-                out.setdefault(current, []).extend(g for g in groups if isinstance(g, dict))
+        if node.get("menu_item_id") is not None and any(
+            isinstance(node.get(k), list) for k in ("valid_addons", "validAddons", "variants", "addons")
+        ):
+            out.append(node)
         for value in node.values():
-            _collect_valid_addons(value, out, current)
+            _collect_cart_items(value, out)
     elif isinstance(node, list):
         for value in node:
-            _collect_valid_addons(value, out, item_id)
+            _collect_cart_items(value, out)
 
 
-def get_cart_valid_addons(address_id: str) -> dict[str, list[dict[str, Any]]]:
-    """{menu_item_id: [group, ...]} of the add-on groups Swiggy says are
-    actually valid for each item CURRENTLY IN the cart. Docs (search_menu /
-    update_food_cart): "Add item with variants first ... then check cart
-    response for valid_addons to see which addons are actually available
-    for your variant selection, then add addons from valid_addons list" and
-    "Keep the group and choice IDs paired exactly as returned".
+def get_cart_item_details(address_id: str) -> dict[str, dict[str, Any]]:
+    """{menu_item_id: {"variants": [...], "addons": [...], "valid_addons":
+    [group, ...]}} for every item CURRENTLY IN the cart, from get_food_cart's
+    `structured_content`. Docs (search_menu / update_food_cart): "Add item
+    with variants first ... then check cart response for valid_addons to see
+    which addons are actually available for your variant selection, then add
+    addons from valid_addons list" and "Keep the group and choice IDs paired
+    exactly as returned".
 
-    Each group: {"group_id", "group_name", "min_addons", "max_addons",
-    "choices": [{"id", "name", "price_inr", "group_id", "raw"}]} -- `raw` is
-    Swiggy's own choice dict, kept so a caller can echo it back verbatim.
-    Returns {} on any failure or when the response has no valid_addons --
-    callers treat that as "nothing usable", never as an error.
+    Live shape (logger.txt 2026-09-26, Harvest Salad Co): variants[] entries
+    are `{variation_id, group_id, name, group_name, price, external_*}`;
+    valid_addons[] groups are `{group_id, group_name, choices[], minAddons,
+    maxAddons, maxFreeAddons, order}`; choices are `{id, name, price, inStock,
+    isVeg, order, default}` with `id` an INT and `price` in PAISE (4000 ==
+    Rs 40) -- unlike search_menu, which gives string ids and rupees.
+
+    Normalised valid_addons group: {"group_id", "group_name", "min_addons",
+    "max_addons", "choices": [{"id", "name", "price_inr", "group_id",
+    "raw"}]} (`raw` = Swiggy's own choice dict). Returns {} on any failure or
+    when the cart has nothing usable -- never raises.
     """
     try:
         _, meta = _call_tool("get_food_cart", {"addressId": address_id}, log_request=True, return_meta=True)
     except Exception as exc:  # noqa: BLE001 -- best-effort lookup
-        debug("food_mcp", f"get_food_cart (valid_addons lookup) FAILED: {exc}")
+        debug("food_mcp", f"get_food_cart (item details lookup) FAILED: {exc}")
         return {}
     structured = meta.get("structured_content") if isinstance(meta, dict) else None
-    found: dict[str, list[dict[str, Any]]] = {}
-    _collect_valid_addons(structured, found)
+    items: list[dict[str, Any]] = []
+    _collect_cart_items(structured, items)
 
-    result: dict[str, list[dict[str, Any]]] = {}
-    for item_id, groups in found.items():
-        normalised = []
-        for g in groups:
+    result: dict[str, dict[str, Any]] = {}
+    for item in items:
+        groups = []
+        for g in (item.get("valid_addons") or item.get("validAddons") or []):
+            if not isinstance(g, dict):
+                continue
             group_id = g.get("group_id") or g.get("groupId")
             choices = []
             for c in g.get("choices") or []:
                 if not isinstance(c, dict) or c.get("id") is None:
                     continue
+                paise = c.get("price", 0) or 0
                 choices.append({
                     "id": str(c["id"]), "name": c.get("name") or "",
-                    "price_inr": c.get("price", 0) or 0,
+                    # valid_addons prices are paise; keep rupees here for display
+                    "price_inr": paise / 100 if isinstance(paise, (int, float)) else 0,
                     "group_id": str(c.get("group_id") or c.get("groupId") or group_id or ""),
                     "raw": c,
                 })
-            normalised.append({
+            groups.append({
                 "group_id": str(group_id) if group_id is not None else None,
-                "group_name": g.get("name") or g.get("groupName") or "add-on",
+                "group_name": g.get("group_name") or g.get("name") or g.get("groupName") or "add-on",
                 "min_addons": g.get("minAddons"), "max_addons": g.get("maxAddons"),
                 "choices": choices,
             })
-        result[item_id] = normalised
-    summary = {k: [(g["group_name"], len(g["choices"])) for g in v] for k, v in result.items()}
-    debug("food_mcp", f"get_food_cart valid_addons -> {summary!r}")
+        result[str(item["menu_item_id"])] = {
+            "variants": [v for v in item.get("variants") or [] if isinstance(v, dict)],
+            "addons": [a for a in item.get("addons") or [] if isinstance(a, dict)],
+            "valid_addons": groups,
+        }
+    summary = {
+        k: {
+            "variants": [(v.get("name"), v.get("variation_id"), v.get("group_id")) for v in d["variants"]],
+            "in_cart_addons": [(a.get("name"), a.get("id")) for a in d["addons"]],
+            "valid_groups": [
+                (g["group_id"], g["group_name"], f"min={g['min_addons']}", f"max={g['max_addons']}",
+                 f"{len(g['choices'])} choices")
+                for g in d["valid_addons"]
+            ],
+        }
+        for k, d in result.items()
+    }
+    debug("food_mcp", f"get_food_cart item details -> {summary!r}")
     return result
+
+
+def get_cart_valid_addons(address_id: str) -> dict[str, list[dict[str, Any]]]:
+    """{menu_item_id: [valid_addons group, ...]} -- the valid_addons half of
+    `get_cart_item_details`, kept as its own name for callers that only need
+    that."""
+    return {k: d["valid_addons"] for k, d in get_cart_item_details(address_id).items()}
 
 
 def update_cart(

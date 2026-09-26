@@ -55,24 +55,77 @@ def _fetch_addon_groups(
     usable" and fall back to the old empty-addons attempt, not block the
     add on it: this fetch is a best-effort upgrade over that fallback, not
     a new required step.
+
+    Logs (tag `addon-diag`) exactly what Swiggy said about this item's
+    customisation -- every group with its min/max ("REQUIRED" when min >= 1),
+    and whether the item also has variants -- so a later INVALID_ADDON can be
+    traced to a cause from logger.txt alone.
     """
     try:
         probe = food_mcp.search_menu_items(item_name, address_id, restaurant_id=str(restaurant_id))
     except Exception as exc:  # noqa: BLE001 -- must never break the add path
-        debug("cart_agent", f"addon-group fetch FAILED for {item_name!r}: {exc}")
+        debug("cart_agent", f"addon-diag lookup FAILED for {item_name!r}: {exc}")
         return []
     detailed = probe.get("detailed_items") if isinstance(probe, dict) else None
     if not isinstance(detailed, dict):
+        debug("cart_agent", f"addon-diag lookup for {item_name!r}: no detailed_items in response "
+              f"(items={len((probe or {}).get('items') or [])})")
         return []
     match = detailed.get(str(menu_item_id))
     if not isinstance(match, dict):
+        debug("cart_agent", f"addon-diag lookup for {item_name!r}: id {menu_item_id!r} not among "
+              f"detailed ids {list(detailed)!r}")
         return []
     groups = match.get("addon_groups")
-    return groups if isinstance(groups, list) else []
+    groups = groups if isinstance(groups, list) else []
+    debug(
+        "cart_agent",
+        f"addon-diag item {item_name!r} id={menu_item_id} restaurant={restaurant_id} "
+        f"has_variants={match.get('has_variants')!r} variant_groups="
+        f"{[(v.get('group_id'), v.get('group_name'), [c.get('name') for c in v.get('choices') or []]) for v in match.get('variant_groups') or []]!r}",
+    )
+    for g in groups:
+        required = isinstance(g.get("min_addons"), int) and g["min_addons"] >= 1
+        debug(
+            "cart_agent",
+            f"addon-diag   group id={g.get('group_id')} name={g.get('group_name')!r} "
+            f"min={g.get('min_addons')!r} max={g.get('max_addons')!r} choices={len(g.get('choices') or [])}"
+            f"{'  <-- REQUIRED' if required else ''}",
+        )
+    return groups
+
+
+def _required_groups(indexed_choices: list[dict[str, Any]]) -> dict[Any, dict[str, Any]]:
+    """{group_id: {"name", "min", "max"}} for every group Swiggy marks
+    mandatory (`minAddons` >= 1). Live (logger.txt 2026-09-26, 'Gourmet Veg
+    Caesar Salad'): 'Dressing & Accompaniments' and 'Accompaniments' both
+    had minAddons=1, and update_food_cart answered INVALID_ADDON to a pick
+    that skipped them -- and even to the item added alone, because a
+    mandatory group can't be left unanswered."""
+    required: dict[Any, dict[str, Any]] = {}
+    for c in indexed_choices:
+        lo = c.get("min_addons")
+        if isinstance(lo, int) and lo >= 1:
+            required[c.get("group_id")] = {"name": c["group_name"], "min": lo, "max": c.get("max_addons")}
+    return required
+
+
+def _unmet_required_groups(
+    selected: list[dict[str, Any]], indexed_choices: list[dict[str, Any]],
+) -> dict[Any, dict[str, Any]]:
+    """Required groups (see `_required_groups`) with fewer picks than their
+    `minAddons`."""
+    counts: dict[Any, int] = {}
+    for entry in selected:
+        counts[entry.get("group_id")] = counts.get(entry.get("group_id"), 0) + 1
+    return {
+        gid: info for gid, info in _required_groups(indexed_choices).items()
+        if counts.get(gid, 0) < info["min"]
+    }
 
 
 def _addon_question_and_options(
-    item_name: str, choices: list[dict[str, Any]],
+    item_name: str, choices: list[dict[str, Any]], required_only: bool = False,
 ) -> tuple[str, list[dict[str, str]]]:
     """The question text + selectable options for the ONE add-on question.
     Every choice of every group is listed and numbered continuously, so a
@@ -80,18 +133,30 @@ def _addon_question_and_options(
     resolve against the same list in `_match_addon_reply`. Each option
     carries its `group` so the chat UI can render group headings, and a
     group with a selection cap says so ("choose up to N")."""
-    lines = [
-        f"{item_name} has these add-ons -- select as many as you like "
-        '(numbers, names, or comma-separated), or say "none":',
-        "",
-    ]
+    if required_only:
+        lines = [
+            f"{item_name} needs you to choose from these before it can be added "
+            "(numbers, names, or comma-separated):",
+            "",
+        ]
+    else:
+        lines = [
+            f"{item_name} has these add-ons -- select as many as you like "
+            '(numbers, names, or comma-separated), or say "none". '
+            "Groups marked REQUIRED must have a choice:",
+            "",
+        ]
     options: list[dict[str, str]] = []
     current_group_id: Any = object()
     for i, choice in enumerate(choices, start=1):
         if choice.get("group_id") != current_group_id:
             current_group_id = choice.get("group_id")
             cap = choice.get("max_addons")
-            cap_bit = f" (choose up to {cap})" if isinstance(cap, int) and cap > 0 else ""
+            lo = choice.get("min_addons")
+            if isinstance(lo, int) and lo >= 1:
+                cap_bit = f" (REQUIRED -- choose {lo}" + (f" to {cap}" if isinstance(cap, int) and cap > lo else "") + ")"
+            else:
+                cap_bit = f" (choose up to {cap})" if isinstance(cap, int) and cap > 0 else ""
             lines.append(f"{choice['group_name']}{cap_bit}:")
         price_bit = f" (+₹{choice['price_inr']:.0f})" if choice.get("price_inr") else ""
         lines.append(f"  {i}. {choice['name']}{price_bit}")
@@ -99,8 +164,10 @@ def _addon_question_and_options(
             "value": str(choice["id"]),
             "label": f"{choice['name']}{price_bit}",
             "group": str(choice["group_name"]),
+            "required": "1" if isinstance(choice.get("min_addons"), int) and choice["min_addons"] >= 1 else "",
         })
-    options.append({"value": _NONE_ADDON_VALUE, "label": "None of these"})
+    if not required_only:
+        options.append({"value": _NONE_ADDON_VALUE, "label": "None of these"})
     return "\n".join(lines), options
 
 
@@ -146,6 +213,12 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
     "quantity", "price"}].
     """
     indexed_choices: list[dict[str, Any]] = []
+    # Mandatory groups first: the _MAX_TOTAL_ADDON_CHOICES sanity cap below
+    # must never be what cuts off a group Swiggy insists on.
+    addon_groups = sorted(
+        addon_groups,
+        key=lambda g: 0 if isinstance(g.get("min_addons"), int) and g["min_addons"] >= 1 else 1,
+    )
     for group in addon_groups:
         group_name = group.get("group_name") or "add-on"
         for choice in group.get("choices") or []:
@@ -170,9 +243,42 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
         "field": "addon_groups",
         "multi_select": True,
     })
-    debug("cart_agent", f"addon selection raw_answer={raw_answer!r}")
+    debug("cart_agent", f"addon-diag selection raw_answer={raw_answer!r}")
     matches = _match_addon_reply(str(raw_answer), indexed_choices)
-    return _enforce_group_limits(matches, indexed_choices)
+    selected = _enforce_group_limits(matches, indexed_choices)
+
+    # Mandatory groups (minAddons >= 1) can't be skipped: Swiggy rejects the
+    # whole add with INVALID_ADDON otherwise. Ask again about JUST those, up
+    # to twice, instead of sending a request known to fail.
+    for attempt in range(1, 3):
+        unmet = _unmet_required_groups(selected, indexed_choices)
+        if not unmet:
+            break
+        debug("cart_agent", f"addon-diag REQUIRED group(s) unanswered (round {attempt}): "
+              f"{[(gid, info['name'], 'min=' + str(info['min'])) for gid, info in unmet.items()]!r}")
+        pending = [c for c in indexed_choices if c.get("group_id") in unmet]
+        question, options = _addon_question_and_options(item_name, pending, required_only=True)
+        raw_answer = interrupt({
+            "question": question, "options": options, "agent": "cart_agent",
+            "field": f"addon_groups:required{attempt}", "multi_select": True,
+        })
+        debug("cart_agent", f"addon-diag required-group answer raw_answer={raw_answer!r}")
+        more = _match_addon_reply(str(raw_answer), pending)
+        selected = _enforce_group_limits(selected + [m for m in more if m["id"] not in {x["id"] for x in selected}],
+                                         indexed_choices)
+    else:
+        unmet = _unmet_required_groups(selected, indexed_choices)
+        if unmet:
+            debug("cart_agent", f"addon-diag REQUIRED group(s) STILL unanswered -- add will likely be "
+                  f"rejected: {[info['name'] for info in unmet.values()]!r}")
+
+    # Per-group summary of what is about to be sent.
+    for gid in dict.fromkeys(c.get("group_id") for c in indexed_choices):
+        picked = [e["name"] for e in selected if e.get("group_id") == gid]
+        sample = next(c for c in indexed_choices if c.get("group_id") == gid)
+        debug("cart_agent", f"addon-diag pick group={gid} {sample['group_name']!r} "
+              f"min={sample.get('min_addons')!r} max={sample.get('max_addons')!r} picked={picked!r}")
+    return selected
 
 
 def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -236,10 +342,10 @@ def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -
 def _map_to_valid_addons(
     selected: list[dict[str, Any]], valid_groups: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Re-express the user's picks using Swiggy's own `valid_addons` entries
-    (keeps each choice paired with the group it was returned under). Picks
-    Swiggy doesn't list as valid for this cart item are dropped; each
-    group's `max_addons` is honoured."""
+    """Pair each pick with Swiggy's own `valid_addons` entry for it: returns
+    `[{"id", "name", "group_id", "price_inr", "raw"}]` where `raw` is the
+    exact choice dict from the cart. Picks Swiggy doesn't list as valid for
+    this cart item are dropped; each group's `max_addons` is honoured."""
     by_choice: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for group in valid_groups:
         for choice in group.get("choices") or []:
@@ -249,20 +355,49 @@ def _map_to_valid_addons(
     for pick in selected:
         hit = by_choice.get(str(pick.get("id")))
         if not hit:
+            debug("cart_agent", f"addon-diag pick {pick.get('name')!r} (id {pick.get('id')}) is NOT in the "
+                  "cart's valid_addons for this item")
             continue
         group, choice = hit
         cap = group.get("max_addons")
         if isinstance(cap, int) and cap > 0 and counts.get(group["group_id"], 0) >= cap:
             continue
         counts[group["group_id"]] = counts.get(group["group_id"], 0) + 1
-        entry = dict(choice.get("raw") or {})
-        entry.setdefault("id", choice["id"])
-        entry.setdefault("name", choice["name"])
-        entry.setdefault("price", choice["price_inr"])
-        entry["group_id"] = choice.get("group_id") or group["group_id"]
-        entry["quantity"] = 1
-        mapped.append(entry)
+        mapped.append({
+            "id": choice["id"], "name": choice["name"],
+            "group_id": choice.get("group_id") or group["group_id"],
+            "price_inr": choice["price_inr"], "raw": choice.get("raw") or {},
+        })
     return mapped
+
+
+def _addon_shapes(mapped: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Candidate request shapes for the `addons` array, most-likely first.
+    Swiggy's docs never spell the request shape out -- they say cart addons
+    "extend the variant structure" (`id, name, group_id, variation_id, price`
+    + `quantity`), and a cart variant is keyed `variation_id` -- and every
+    shape used so far (`id` only) has been answered INVALID_ADDON, so each
+    is tried in turn and the winner is logged. All numeric ids are sent as
+    ints (that's what the cart's own `valid_addons` uses); `price` is left
+    out where the cart holds it in paise, to avoid a rupee/paise mismatch."""
+    def gid(m):  # ints, like the cart's own valid_addons
+        return int(m["group_id"]) if str(m["group_id"]).isdigit() else m["group_id"]
+
+    def cid(m):
+        return int(m["id"]) if str(m["id"]).isdigit() else m["id"]
+
+    return [
+        ("A: variation_id+group_id+quantity",
+         [{"variation_id": cid(m), "group_id": gid(m), "quantity": 1} for m in mapped]),
+        ("B: id+group_id+quantity",
+         [{"id": cid(m), "group_id": gid(m), "quantity": 1} for m in mapped]),
+        ("C: variation_id+id+group_id+name+price(paise)+quantity",
+         [{"variation_id": cid(m), "id": cid(m), "group_id": gid(m), "name": m["name"],
+           "price": m["raw"].get("price", int(round(m["price_inr"] * 100))), "quantity": 1}
+          for m in mapped]),
+        ("D: cart's own valid_addons choice verbatim + group_id + quantity",
+         [{**m["raw"], "group_id": gid(m), "quantity": 1} for m in mapped]),
+    ]
 
 
 def _retry_addons_via_valid_addons(
@@ -272,28 +407,43 @@ def _retry_addons_via_valid_addons(
     """Swiggy's documented add-on flow, used after a one-shot add with
     add-ons was rejected (INVALID_ADDON): (1) add the item alone, (2) read
     `valid_addons` for it off the cart, (3) resend with add-ons taken from
-    that list. Returns `(result, note)`. If step 1 fails, the original
-    failure is returned untouched. If steps 2/3 can't get the add-ons in, the
-    plain item stays in the cart (result = step 1's success) and `note` says
-    honestly that the add-ons were not added -- better than losing the dish."""
+    that list -- trying each candidate request shape in `_addon_shapes` until
+    one is accepted. Every step is logged (`addon-diag`). Returns
+    `(result, note)`. If step 1 fails, the original failure is returned
+    untouched. If steps 2/3 can't get the add-ons in, the plain item stays in
+    the cart (result = step 1's success) and `note` says honestly that the
+    add-ons were not added -- better than losing the dish."""
     base = food_mcp.update_cart(restaurant_id, address_id, build_payload([]), restaurant_name=restaurant_name)
-    debug("cart_agent", f"addon retry step 1 (item alone) -> {base!r}")
+    debug("cart_agent", f"addon-diag retry step 1 (item alone) -> status={base.get('status')!r} "
+          f"error_codes={base.get('error_codes')!r}")
     if base.get("status") != "success":
+        debug("cart_agent", "addon-diag the item is rejected EVEN WITHOUT add-ons -- points at a mandatory "
+              "(minAddons>=1) group, a variant that must be chosen, or an unavailable item/restaurant, not at "
+              "the picked add-ons")
         return failed_result, ""
 
-    valid = food_mcp.get_cart_valid_addons(address_id).get(str(menu_item_id)) or []
+    detail = food_mcp.get_cart_item_details(address_id).get(str(menu_item_id)) or {}
+    valid = detail.get("valid_addons") or []
     mapped = _map_to_valid_addons(selected, valid)
-    debug("cart_agent", f"addon retry step 2: {len(selected)} picked, {len(mapped)} valid per cart -> {mapped!r}")
+    debug("cart_agent", f"addon-diag retry step 2: {len(selected)} picked, {len(mapped)} valid per cart; "
+          f"cart variants={[(v.get('name'), v.get('variation_id')) for v in detail.get('variants') or []]!r}")
     if not mapped:
         return base, (
             "Swiggy didn't list those add-ons as valid for this dish, so I added it without them."
         )
 
-    retry = food_mcp.update_cart(restaurant_id, address_id, build_payload(mapped), restaurant_name=restaurant_name)
-    debug("cart_agent", f"addon retry step 3 (with valid_addons) -> {retry!r}")
-    if retry.get("status") == "success":
-        return retry, ""
-    codes = ", ".join(retry.get("error_codes") or []) or "rejected"
+    last_codes = None
+    for label, addons in _addon_shapes(mapped):
+        debug("cart_agent", f"addon-diag retry step 3 trying shape {label}: {addons!r}")
+        retry = food_mcp.update_cart(restaurant_id, address_id, build_payload(addons), restaurant_name=restaurant_name)
+        if retry.get("status") == "success":
+            debug("cart_agent", f"addon-diag SUCCESS -- Swiggy accepted shape {label}")
+            return retry, ""
+        last_codes = retry.get("error_codes")
+        debug("cart_agent", f"addon-diag shape {label} rejected: error_codes={last_codes!r} "
+              f"message={retry.get('message')!r}")
+    debug("cart_agent", "addon-diag NO request shape was accepted -- see the attempts above")
+    codes = ", ".join(last_codes or []) or "rejected"
     return base, (
         f"Swiggy rejected the add-ons ({codes}), so I added the dish without them -- "
         "you can add them in the Swiggy app."
@@ -463,6 +613,15 @@ def add_dish_to_cart(
 
     cart_items_payload = _build_payload(selected_addons)
     debug("cart_agent", f"sending merged cartItems={cart_items_payload!r}")
+    if attempt_addon_only:
+        import json as _json
+        debug(
+            "cart_agent",
+            "addon-diag first attempt: wire JSON=" + _json.dumps(cart_items_payload, default=str)
+            + " | id types=" + repr(sorted({type(a.get("id")).__name__ for e in cart_items_payload
+                                             for a in e.get("addons", [])}))
+            + " | price units=rupees (search_menu), the cart's valid_addons uses paise",
+        )
 
     result = food_mcp.update_cart(
         restaurant_id, address_id,

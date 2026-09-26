@@ -177,7 +177,8 @@ def _render_multiselect(question: str, options: list[dict[str, str]], selected: 
             current_group = group
             if len(lines) > 2:
                 lines.append("")
-            lines += [f"**{group}**", ""]
+            required = " — *required*" if opt.get("required") else ""
+            lines += [f"**{group}**{required}", ""]
         mark = "☑" if value in chosen else "☐"
         lines.append(f"- {mark} {opt.get('label') or value}")
         actions.append(cl.Action(

@@ -113,7 +113,10 @@ _DETAILED_ITEM_HEADER_RE = re.compile(
 # size/base choice (variants -- changes what the item IS, no safe default)
 # from an optional upsell (addons -- see CartAgent's attempt_addon_only).
 _DETAILED_ADDON_GROUP_RE = re.compile(
-    r"^[ \t]*(?P<kind>Addons|Variants) \((?P<group_name>[^)]+)\):[ \t]*\[(?P<body>.*)\][ \t]*$",
+    # group_name is non-greedy up to the first "): [" so names that themselves
+    # contain brackets -- live: " Add Protein And Veggie Boosts (Veg & Non-veg)",
+    # "Make It A Meal (Sides & Drinks)" -- still match instead of being dropped.
+    r"^[ \t]*(?P<kind>Addons|Variants) \((?P<group_name>.*?)\):[ \t]*\[(?P<body>.*)\][ \t]*$",
     re.MULTILINE,
 )
 _DETAILED_ADDON_CHOICE_RE = re.compile(
@@ -204,6 +207,8 @@ def _attach_addon_limits(detailed: dict[str, dict[str, Any]], structured: Any) -
         parsed = detailed.get(str(entry.get("menu_item_id")))
         if not parsed:
             continue
+        parsed["has_variants"] = bool(entry.get("hasVariants"))
+        parsed["has_addons"] = bool(entry.get("hasAddons"))
         limits = {
             str(g.get("groupId")): g for g in entry.get("addons") or [] if isinstance(g, dict)
         }
