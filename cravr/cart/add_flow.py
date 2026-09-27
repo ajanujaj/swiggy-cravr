@@ -1,3 +1,10 @@
+"""The single call site for "how a dish gets added to the cart" -- used by
+both CartAgent's own "add" action and RecommendAgent's pick-to-cart
+handoff, so the two can't drift apart. See guards.py for why some items
+get refused outright and why others get an "attempt, then verify" path
+instead.
+"""
+
 from __future__ import annotations
 
 import re
@@ -12,41 +19,82 @@ from .guards import _customization_refusal, _requires_customization
 from .parsing import _parse_existing_cart_items
 from .routing import _CONFLICT_OPTIONS
 
+# Sentinel for "none of these" on an addon question -- same
+# fixed-value-independent-of-label convention as options.OTHER_VALUE and
+# routing.CART_ADD_MORE_VALUE.
 _NONE_ADDON_VALUE = "__no_addon__"
 
+# Sanity ceiling only -- NOT a UX cap. Showing every group/choice at once
+# is the whole point of _ask_for_all_addons (see its docstring); this just
+# stops a pathological response (a parser bug, a menu with hundreds of
+# choices) from producing an unusably huge interrupt payload.
 _MAX_TOTAL_ADDON_CHOICES = 40
 
+# Whole-reply phrases that mean "no add-ons at all" -- checked against the
+# ENTIRE reply before any per-token matching, so "none" or "no thanks"
+# never gets misread as a (nonexistent) choice named "none".
 _NONE_REPLY_PHRASES = {
     "none", "no", "nothing", "no thanks", "no thank you", "skip",
     "nope", "no addons", "no addon", "not now", "none of these",
 }
 
 
-def _fetch_addon_groups(
+def _fetch_customization(
     item_name: str, menu_item_id: str, address_id: str, restaurant_id: str,
-) -> list[dict[str, Any]]:
+) -> dict[str, list[dict[str, Any]]]:
+    """Real addon groups/choices for one dish, via the targeted search_menu
+    lookup Swiggy's own docs point at ("use search_menu with the item name
+    and restaurantId to get full customization details"). CONFIRMED live
+    (logger.txt, "Falafel Hummus Pita Pocket", restaurant 300897) to return
+    real group/choice ids in a third text shape food_mcp.search_menu_items
+    parses separately and surfaces under `detailed_items` (see
+    food_mcp.search._parse_detailed_search_menu_items).
+
+    Returns `{"addon_groups": [...], "variant_groups": [...]}` -- both []
+    whenever the lookup doesn't yield a usable match for this exact item id
+    (no result, an unfamiliar response shape, a transient failure) --
+    never raises. Callers must treat both-empty as "nothing usable" and
+    fall back to the old empty-addons attempt, not block the add on it:
+    this fetch is a best-effort upgrade over that fallback, not a new
+    required step.
+
+    variant_groups (e.g. a pizza's "Size": 6/8 slices) are real, distinct
+    menu items in disguise -- Swiggy scopes each variant's OWN add-on
+    groups separately (a size-specific "Booster [8 Slices]" group is
+    invalid once the cart holds the 6-slice variant), so a caller that
+    finds variant_groups here must ask which variant BEFORE offering any
+    addon_groups, not alongside them. See _add_item_with_variant.
+
+    Logs (tag `addon-diag`) exactly what Swiggy said about this item's
+    customisation -- every group with its min/max ("REQUIRED" when min >= 1),
+    and whether the item also has variants -- so a later INVALID_ADDON can be
+    traced to a cause from logger.txt alone.
+    """
+    empty: dict[str, list[dict[str, Any]]] = {"addon_groups": [], "variant_groups": []}
     try:
         probe = food_mcp.search_menu_items(item_name, address_id, restaurant_id=str(restaurant_id))
     except Exception as exc:  # noqa: BLE001 -- must never break the add path
         debug("cart_agent", f"addon-diag lookup FAILED for {item_name!r}: {exc}")
-        return []
+        return empty
     detailed = probe.get("detailed_items") if isinstance(probe, dict) else None
     if not isinstance(detailed, dict):
         debug("cart_agent", f"addon-diag lookup for {item_name!r}: no detailed_items in response "
               f"(items={len((probe or {}).get('items') or [])})")
-        return []
+        return empty
     match = detailed.get(str(menu_item_id))
     if not isinstance(match, dict):
         debug("cart_agent", f"addon-diag lookup for {item_name!r}: id {menu_item_id!r} not among "
               f"detailed ids {list(detailed)!r}")
-        return []
+        return empty
     groups = match.get("addon_groups")
     groups = groups if isinstance(groups, list) else []
+    variant_groups = match.get("variant_groups")
+    variant_groups = variant_groups if isinstance(variant_groups, list) else []
     debug(
         "cart_agent",
         f"addon-diag item {item_name!r} id={menu_item_id} restaurant={restaurant_id} "
         f"has_variants={match.get('has_variants')!r} variant_groups="
-        f"{[(v.get('group_id'), v.get('group_name'), [c.get('name') for c in v.get('choices') or []]) for v in match.get('variant_groups') or []]!r}",
+        f"{[(v.get('group_id'), v.get('group_name'), [c.get('name') for c in v.get('choices') or []]) for v in variant_groups]!r}",
     )
     for g in groups:
         required = isinstance(g.get("min_addons"), int) and g["min_addons"] >= 1
@@ -56,10 +104,16 @@ def _fetch_addon_groups(
             f"min={g.get('min_addons')!r} max={g.get('max_addons')!r} choices={len(g.get('choices') or [])}"
             f"{'  <-- REQUIRED' if required else ''}",
         )
-    return groups
+    return {"addon_groups": groups, "variant_groups": variant_groups}
 
 
 def _required_groups(indexed_choices: list[dict[str, Any]]) -> dict[Any, dict[str, Any]]:
+    """{group_id: {"name", "min", "max"}} for every group Swiggy marks
+    mandatory (`minAddons` >= 1). Live (logger.txt 2026-09-26, 'Gourmet Veg
+    Caesar Salad'): 'Dressing & Accompaniments' and 'Accompaniments' both
+    had minAddons=1, and update_food_cart answered INVALID_ADDON to a pick
+    that skipped them -- and even to the item added alone, because a
+    mandatory group can't be left unanswered."""
     required: dict[Any, dict[str, Any]] = {}
     for c in indexed_choices:
         lo = c.get("min_addons")
@@ -71,6 +125,8 @@ def _required_groups(indexed_choices: list[dict[str, Any]]) -> dict[Any, dict[st
 def _unmet_required_groups(
     selected: list[dict[str, Any]], indexed_choices: list[dict[str, Any]],
 ) -> dict[Any, dict[str, Any]]:
+    """Required groups (see `_required_groups`) with fewer picks than their
+    `minAddons`."""
     counts: dict[Any, int] = {}
     for entry in selected:
         counts[entry.get("group_id")] = counts.get(entry.get("group_id"), 0) + 1
@@ -83,6 +139,12 @@ def _unmet_required_groups(
 def _addon_question_and_options(
     item_name: str, choices: list[dict[str, Any]], required_only: bool = False,
 ) -> tuple[str, list[dict[str, str]]]:
+    """The question text + selectable options for the ONE add-on question.
+    Every choice of every group is listed and numbered continuously, so a
+    typed reply ("1, 4, 9" / names) and a UI selection (choice ids) both
+    resolve against the same list in `_match_addon_reply`. Each option
+    carries its `group` so the chat UI can render group headings, and a
+    group with a selection cap says so ("choose up to N")."""
     if required_only:
         lines = [
             f"{item_name} needs you to choose from these before it can be added "
@@ -124,6 +186,10 @@ def _addon_question_and_options(
 def _enforce_group_limits(
     selected: list[dict[str, Any]], indexed_choices: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Honour each group's `maxAddons` (search_menu reference: per-group
+    `minAddons` / `maxAddons` / `maxFreeAddons`). Extra picks beyond a
+    group's max are dropped -- first-mentioned wins -- rather than sent to
+    Swiggy to be rejected. A missing/non-positive max means "no cap known"."""
     caps: dict[Any, int] = {}
     for c in indexed_choices:
         cap = c.get("max_addons")
@@ -141,8 +207,33 @@ def _enforce_group_limits(
     return kept
 
 
-def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _ask_for_all_addons(
+    item_name: str, addon_groups: list[dict[str, Any]], field_prefix: str = "addon_groups",
+) -> list[dict[str, Any]]:
+    """Ask about every addon group in ONE multi-select question.
+
+    `field_prefix` is only the interrupt payload's `field` tag ("addon_groups"
+    for a real add-on question, "variant_groups" when _add_item_with_variant
+    reuses this same machinery to ask a required size/base-item choice) --
+    it changes nothing about the matching/rendering logic below.
+
+    History: the first version asked group-by-group, the second listed
+    every group but let a button tap answer only ONE group (a tap returns
+    a single value), so users could only ever pick one add-on ("can use
+    only 1"). This version is a real multi-select: the interrupt payload
+    carries `multi_select=True` and the chat UI (UI/components.py
+    `send_multiselect_message`) renders toggle buttons plus a Done button,
+    then resumes with ALL chosen ids comma-joined. Typed replies ("1, 4,
+    9", names) still work through the same `_match_addon_reply` -- and any
+    number of choices, across any groups, can be picked in one reply.
+    Per-group `maxAddons` is enforced afterwards by `_enforce_group_limits`.
+
+    Returns FoodCartAddon-shaped entries: [{"id", "name", "group_id",
+    "quantity", "price"}].
+    """
     indexed_choices: list[dict[str, Any]] = []
+    # Mandatory groups first: the _MAX_TOTAL_ADDON_CHOICES sanity cap below
+    # must never be what cuts off a group Swiggy insists on.
     addon_groups = sorted(
         addon_groups,
         key=lambda g: 0 if isinstance(g.get("min_addons"), int) and g["min_addons"] >= 1 else 1,
@@ -163,18 +254,22 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
     if not indexed_choices:
         return []
 
-    question, options = _addon_question_and_options(item_name, indexed_choices)
+    required_only = field_prefix != "addon_groups"
+    question, options = _addon_question_and_options(item_name, indexed_choices, required_only=required_only)
     raw_answer = interrupt({
         "question": question,
         "options": options,
         "agent": "cart_agent",
-        "field": "addon_groups",
+        "field": field_prefix,
         "multi_select": True,
     })
     debug("cart_agent", f"addon-diag selection raw_answer={raw_answer!r}")
     matches = _match_addon_reply(str(raw_answer), indexed_choices)
     selected = _enforce_group_limits(matches, indexed_choices)
 
+    # Mandatory groups (minAddons >= 1) can't be skipped: Swiggy rejects the
+    # whole add with INVALID_ADDON otherwise. Ask again about JUST those, up
+    # to twice, instead of sending a request known to fail.
     for attempt in range(1, 3):
         unmet = _unmet_required_groups(selected, indexed_choices)
         if not unmet:
@@ -185,7 +280,7 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
         question, options = _addon_question_and_options(item_name, pending, required_only=True)
         raw_answer = interrupt({
             "question": question, "options": options, "agent": "cart_agent",
-            "field": f"addon_groups:required{attempt}", "multi_select": True,
+            "field": f"{field_prefix}:required{attempt}", "multi_select": True,
         })
         debug("cart_agent", f"addon-diag required-group answer raw_answer={raw_answer!r}")
         more = _match_addon_reply(str(raw_answer), pending)
@@ -197,6 +292,7 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
             debug("cart_agent", f"addon-diag REQUIRED group(s) STILL unanswered -- add will likely be "
                   f"rejected: {[info['name'] for info in unmet.values()]!r}")
 
+    # Per-group summary of what is about to be sent.
     for gid in dict.fromkeys(c.get("group_id") for c in indexed_choices):
         picked = [e["name"] for e in selected if e.get("group_id") == gid]
         sample = next(c for c in indexed_choices if c.get("group_id") == gid)
@@ -206,6 +302,21 @@ def _ask_for_all_addons(item_name: str, addon_groups: list[dict[str, Any]]) -> l
 
 
 def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Resolve one free-text (or tapped) reply against every choice
+    `_ask_for_all_addons` listed, split on commas/"and"/"&" so one reply
+    can name several choices across different groups at once.
+
+    Per token, most-certain match first: an exact choice id (a button tap
+    always sends one, verbatim) -- then a 1-based position in the numbered
+    list the question showed -- then a case-insensitive exact name match --
+    then a loose substring match (so "mozzarella" still finds "Extra
+    Mozzarella Cheese"). A token matching nothing is dropped rather than
+    guessed at -- never forwarded to Swiggy as if it were a real id. A
+    whole reply that's a bare "none"/"no"/"skip" (see _NONE_REPLY_PHRASES)
+    short-circuits to [] before any per-token matching, so it can't be
+    misread as a search for a choice literally named "none". Dedupes by
+    id, keeping first-mention order.
+    """
     text = (raw_answer or "").strip()
     if not text:
         return []
@@ -249,6 +360,17 @@ def _match_addon_reply(raw_answer: str, indexed_choices: list[dict[str, Any]]) -
 
 
 def _wire_addon(addon: dict[str, Any]) -> dict[str, Any]:
+    """One add-on as `update_food_cart` wants it on the wire.
+
+    CONFIRMED from Swiggy's real tool schema (tools/list, dumped by
+    local_dev/probe.py): each `addons[]` entry is `{choice_id | choiceId,
+    group_id | groupId, name?, price?}`. There is NO `id` and NO
+    `variation_id` on an add-on -- those belong to variants. Every earlier
+    attempt sent `id`, which Swiggy could not read as a choice and answered
+    INVALID_ADDON ("Restaurant may have removed the item(s)"), for every
+    restaurant and every retry shape. `price` is optional and omitted here:
+    search_menu gives rupees, the cart's valid_addons gives paise, and the
+    server prices the choice itself."""
     def as_num(v):
         return int(v) if str(v).isdigit() else v
 
@@ -264,6 +386,10 @@ def _wire_addon(addon: dict[str, Any]) -> dict[str, Any]:
 def _map_to_valid_addons(
     selected: list[dict[str, Any]], valid_groups: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Pair each pick with Swiggy's own `valid_addons` entry for it: returns
+    `[{"id", "name", "group_id", "price_inr", "raw"}]` where `raw` is the
+    exact choice dict from the cart. Picks Swiggy doesn't list as valid for
+    this cart item are dropped; each group's `max_addons` is honoured."""
     by_choice: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for group in valid_groups:
         for choice in group.get("choices") or []:
@@ -290,7 +416,14 @@ def _map_to_valid_addons(
 
 
 def _addon_shapes(mapped: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
-    def gid(m):
+    """Candidate request shapes for the `addons` array, most-likely first.
+    The first two ("S", "S2") follow Swiggy's real tool schema (`choice_id` /
+    `choiceId` + `group_id` / `groupId`); the rest are the older guesses
+    (`id` / `variation_id`, all answered INVALID_ADDON live) kept only as a
+    last-resort ladder, each tried in turn and the winner logged. All numeric ids are sent as
+    ints (that's what the cart's own `valid_addons` uses); `price` is left
+    out where the cart holds it in paise, to avoid a rupee/paise mismatch."""
+    def gid(m):  # ints, like the cart's own valid_addons
         return int(m["group_id"]) if str(m["group_id"]).isdigit() else m["group_id"]
 
     def cid(m):
@@ -314,10 +447,177 @@ def _addon_shapes(mapped: list[dict[str, Any]]) -> list[tuple[str, list[dict[str
     ]
 
 
+def _variant_shapes(variant_picks: list[dict[str, Any]]) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    """Candidate request shapes for sending a chosen variant (size/base-item
+    choice), most-likely first -- there's no confirmed-live example to copy
+    (unlike _addon_shapes' choice_id/group_id, which local_dev/probe.py's
+    tools/list dump confirmed), so this tries the schema's own dedicated
+    new-format field first, then the legacy one in both key-casings.
+    `variant_picks` are _ask_for_all_addons-shaped entries (one per variant
+    GROUP, e.g. one for "Size", another for "Crust" if both exist). Returns
+    [(label, wire_field_name, payload), ...] -- wire_field_name is either
+    "variantsV2" or "variants" (the tool schema: an item uses EITHER, never
+    both)."""
+    def gid(v):
+        return int(v["group_id"]) if str(v["group_id"]).isdigit() else v["group_id"]
+
+    def vid(v):
+        return int(v["id"]) if str(v["id"]).isdigit() else v["id"]
+
+    return [
+        ("V1: variantsV2 group_id+variation_id (schema's dedicated new format)",
+         "variantsV2", [{"group_id": gid(v), "variation_id": vid(v)} for v in variant_picks]),
+        ("V2: variants variation_id+group_id+name (legacy snake_case)",
+         "variants", [{"variation_id": vid(v), "group_id": gid(v), "name": v["name"]} for v in variant_picks]),
+        ("V3: variants camelCase variationId+groupId",
+         "variants", [{"variationId": vid(v), "groupId": gid(v)} for v in variant_picks]),
+    ]
+
+
+def _add_item_with_variant(
+    restaurant_id: str, address_id: str, restaurant_name: str | None,
+    item_name: str, menu_item_id: str, quantity: int, variant_groups: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, list[dict[str, Any]]]:
+    """Swiggy's documented flow for an item that has variants (a real
+    size/base-item choice, e.g. a pizza's "Size": 6/8 slices): (1) ask which
+    variant, (2) add the item with JUST that variant (no add-ons yet), (3)
+    read `valid_addons` off the cart for this exact item -- Swiggy itself
+    already filters that list to what's valid for the variant just chosen --
+    (4) THEN ask about add-ons, using only that filtered list, never the
+    static per-item add-on groups from search_menu (those cover EVERY
+    variant's groups at once, with no way to tell which belongs to which).
+
+    Live evidence this matters (logger.txt 2026-09-27, 'Classic Margherita
+    Pizza', Size 6/8 slices, no variant ever asked/sent): a user answered one
+    combined question covering all groups and picked add-ons from BOTH the
+    6-slice and 8-slice group sets. update_food_cart accepted the write
+    (echoed all 4 add-ons back, statusCode 0), but the very next get_food_cart
+    came back 'Cart is empty' with errorCodes=['INVALID_ADDON'] -- Swiggy
+    invalidated the cart once it reconciled the item against a variant on its
+    own, since half the add-ons picked didn't belong to it.
+
+    Returns (result, addons_actually_sent, note, existing_items). If no
+    variant is picked, or every variant wire shape is rejected, `result`
+    reports that failure and `addons_actually_sent` is []. If the variant
+    lands but Swiggy's own valid_addons for it comes up empty (or a
+    resulting add-on attempt is rejected), the item still keeps its variant
+    -- only the add-ons are dropped, same "keep the dish, drop what wasn't
+    accepted" policy as _retry_addons_via_valid_addons. `existing_items` is
+    what was in the cart BEFORE this add (see add_dish_to_cart's own copy of
+    this fetch for why it's returned rather than re-fetched by the caller:
+    replaying an interrupt()-based flow re-runs every real Swiggy call
+    between two interrupt() points, so this function does its OWN cart
+    fetch instead of sharing the caller's -- see its comment).
+
+    Self-contained on purpose: unlike the plain addon-only path, this
+    function's OWN interrupt() calls (variant choice, then, after a live
+    Swiggy round-trip, add-ons) must not depend on -- or be depended on by
+    -- state the CALLER computes only once its own interrupt()s are done,
+    or the replay/interrupt ordering breaks. So it fetches/merges/builds its
+    own cart payload exactly like add_dish_to_cart's main body does, rather
+    than sharing that closure."""
+    variant_choices = [{**g, "min_addons": 1, "max_addons": 1} for g in variant_groups]
+    selected_variants = _ask_for_all_addons(item_name, variant_choices, field_prefix="variant_groups")
+    if not selected_variants:
+        debug("cart_agent", f"addon-diag no variant selected for {item_name!r} -- can't add")
+        return {"status": "error", "message": "No size/variant was chosen.", "error_codes": []}, [], "", []
+
+    existing_cart = food_mcp.get_cart(address_id)
+    existing_items = (
+        _parse_existing_cart_items(existing_cart.get("message") or "")
+        if existing_cart.get("status") in ("text", "success", "empty")
+        else []
+    )
+    debug("cart_agent", f"variant flow -- existing cart before add: status={existing_cart.get('status')!r} "
+          f"parsed_items={existing_items!r}")
+    merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
+    merged[str(menu_item_id)] = merged.get(str(menu_item_id), 0) + quantity
+
+    def build_payload(
+        target_addons: list[dict[str, Any]], variant_entry: tuple[str, list[dict[str, Any]]] | None = None,
+    ) -> list[dict[str, Any]]:
+        items = []
+        for mid, qty in merged.items():
+            entry: dict[str, Any] = {"menu_item_id": mid, "quantity": qty}
+            if mid == str(menu_item_id):
+                entry["addons"] = target_addons
+                if variant_entry:
+                    # ("variantsV2" or "variants", [wire variant dicts]) --
+                    # see _variant_shapes. An item uses EITHER field, never both.
+                    entry[variant_entry[0]] = variant_entry[1]
+            items.append(entry)
+        return items
+
+    result: dict[str, Any] | None = None
+    last_codes = None
+    for label, field, payload in _variant_shapes(selected_variants):
+        debug("cart_agent", f"addon-diag variant retry trying shape {label}: {payload!r}")
+        result = food_mcp.update_cart(
+            restaurant_id, address_id, build_payload([], variant_entry=(field, payload)),
+            restaurant_name=restaurant_name,
+        )
+        if result.get("status") == "success":
+            debug("cart_agent", f"addon-diag variant SUCCESS -- Swiggy accepted shape {label} (field={field!r})")
+            break
+        last_codes = result.get("error_codes")
+        debug("cart_agent", f"addon-diag variant shape {label} rejected: error_codes={last_codes!r} "
+              f"message={result.get('message')!r}")
+        if "INVALID_ITEM_IDS_IN_REQUEST" in (last_codes or []):
+            # A cart-identity problem (leftover items from another
+            # restaurant) -- no variant wire shape will fix that, so don't
+            # waste 2 more rejected attempts; add_dish_to_cart's own
+            # INVALID_ITEM_IDS_IN_REQUEST check (right after this returns)
+            # will catch it from this same `result`.
+            debug("cart_agent", "addon-diag variant retry: cart-identity conflict, not a shape problem -- stopping")
+            break
+
+    if not result or result.get("status") != "success":
+        debug("cart_agent", "addon-diag NO variant request shape was accepted -- see the attempts above")
+        return (result or {"status": "error", "message": "variant rejected", "error_codes": last_codes}), \
+            [], "", existing_items
+
+    detail = food_mcp.get_cart_item_details(address_id).get(str(menu_item_id)) or {}
+    valid = detail.get("valid_addons") or []
+    debug("cart_agent", f"addon-diag variant landed -- valid_addons for THIS variant: "
+          f"{[(g.get('group_id'), g.get('group_name'), len(g.get('choices') or [])) for g in valid]!r}")
+    if not valid:
+        return result, [], "", existing_items
+
+    selected_addons = _ask_for_all_addons(item_name, valid)
+    if not selected_addons:
+        return result, [], "", existing_items
+
+    # `field`/`payload` still hold the WINNING shape from the loop above
+    # (the `break` on success leaves the loop variables at that iteration).
+    with_addons = food_mcp.update_cart(
+        restaurant_id, address_id,
+        build_payload([_wire_addon(a) for a in selected_addons], variant_entry=(field, payload)),
+        restaurant_name=restaurant_name,
+    )
+    if with_addons.get("status") == "success":
+        debug("cart_agent", "addon-diag variant+addons SUCCESS")
+        return with_addons, selected_addons, "", existing_items
+    debug("cart_agent", f"addon-diag variant landed but add-ons rejected: "
+          f"{with_addons.get('error_codes')!r} -- keeping the item with its variant, without the add-ons")
+    return result, [], (
+        "I added it with your size/variant choice, but Swiggy didn't accept the add-ons on top of it, "
+        "so I left those off -- you can add them in the Swiggy app."
+    ), existing_items
+
+
 def _retry_addons_via_valid_addons(
     build_payload, restaurant_id: str, address_id: str, restaurant_name: str | None,
     menu_item_id: str, selected: list[dict[str, Any]], failed_result: dict[str, Any],
 ) -> tuple[dict[str, Any], str]:
+    """Swiggy's documented add-on flow, used after a one-shot add with
+    add-ons was rejected (INVALID_ADDON): (1) add the item alone, (2) read
+    `valid_addons` for it off the cart, (3) resend with add-ons taken from
+    that list -- trying each candidate request shape in `_addon_shapes` until
+    one is accepted. Every step is logged (`addon-diag`). Returns
+    `(result, note)`. If step 1 fails, the original failure is returned
+    untouched. If steps 2/3 can't get the add-ons in, the plain item stays in
+    the cart (result = step 1's success) and `note` says honestly that the
+    add-ons were not added -- better than losing the dish."""
     base = food_mcp.update_cart(restaurant_id, address_id, build_payload([]), restaurant_name=restaurant_name)
     debug("cart_agent", f"addon-diag retry step 1 (item alone) -> status={base.get('status')!r} "
           f"error_codes={base.get('error_codes')!r}")
@@ -359,6 +659,16 @@ def _cart_conflict_reply(
     dish: dict[str, Any], quantity: int, existing_name: str | None,
     addons: list[dict[str, Any]] | None,
 ) -> dict:
+    """The cart holds something from a different restaurant. Swiggy carts are
+    single-restaurant, so say so plainly and offer to clear-and-add -- the
+    dish and any add-ons already picked are parked in `cart_state` for the
+    button (see flows._clear_cart_and_add_pending).
+
+    Live evidence (logger.txt 2026-09-26, two occurrences): a plain dish left
+    in the real cart by an earlier chat, then a dish from another restaurant
+    merged into the same update_food_cart -> `INVALID_ITEM_IDS_IN_REQUEST`.
+    That used to surface as "Swiggy rejected the add-on(s) you picked", which
+    was wrong -- the add-ons were never the problem."""
     where = f" from {existing_name}" if existing_name else " from another restaurant"
     content = (
         f"Your Swiggy cart already has items{where}, and a cart can only hold one restaurant at a time, "
@@ -378,6 +688,11 @@ def add_dish_to_cart(
     known_restaurant_id: str | None = None, known_restaurant_name: str | None = None,
     preselected_addons: list[dict[str, Any]] | None = None,
 ) -> dict:
+    """Add one dish via update_cart, then show the result via get_cart.
+    Single call site for "how a dish gets added" -- used by both this
+    node's own "add" action and RecommendAgent's pick-to-cart handoff, so
+    the two can't drift apart. `lead_in` prefixes whatever message comes
+    back (success or failure)."""
     menu_item_id = dish.get("menu_item_id")
     restaurant_id = dish.get("restaurant_id")
     debug(
@@ -389,79 +704,204 @@ def add_dish_to_cart(
         content = "I don't have enough details on that dish to add it to your cart -- try searching again."
         return _cart_reply(f"{lead_in} {content}".strip())
 
+    # Live evidence (3 separate real CRAVR_DEBUG occurrences, 2 restaurants:
+    # Jamie Oliver Kitchen's "Mediterranean Veg Pizza [11 inches]", Mister
+    # Edamame's "Manchow Soup" and "Sichuan Hot & Sour Soup" -- all tagged
+    # "has addons"/"has variants" in search_menu/get_restaurant_menu's own
+    # `tags` text): merging a has-addons/has-variants item into a
+    # non-empty cart made the real update_food_cart respond
+    # 'Cart updated.\nCart is empty.' -- the WHOLE update rejected, not
+    # just that item -- and Cravr then falsely told the user it worked.
+    # Cravr has no UI to collect the required variant/add-on choice, so
+    # refuse before sending rather than attempt-and-lie. (Only checked for
+    # the item being ADDED here -- an item already sitting in the real
+    # cart already went through Swiggy's own validation once and doesn't
+    # need re-checking.)
+    # Live evidence (Domino's Pizza item added while the cart already held
+    # a Mister Edamame item, addon-free on both sides): merging an item
+    # from a DIFFERENT restaurant into a non-empty cart made the real
+    # update_food_cart respond 'Cart updated.\nCart is empty.' -- and this
+    # time it didn't just fail to add the new item, it wiped the
+    # PRE-EXISTING item too (get_food_cart afterward showed status='empty'
+    # item_count=0). Swiggy carts are single-restaurant; refuse before
+    # sending rather than risk destroying what's already there.
     if (
         known_restaurant_id
         and str(known_restaurant_id) != str(restaurant_id)
     ):
         return _cart_conflict_reply(dish, quantity, known_restaurant_name, preselected_addons)
 
+    # Set below when this item is addon-only (no variant/size choice) --
+    # threads through to the merged cart_items_payload build and gets a
+    # dedicated post-add verification, instead of an unconditional refusal.
     attempt_addon_only = False
+    # The addon entries actually sent for the item being added -- real
+    # user choices when _fetch_customization found usable addon_groups and
+    # _ask_for_addon_choices got answers for them, otherwise [] (the
+    # original explicit-empty-selection guess, kept as the fallback for
+    # whenever the targeted lookup comes up empty).
     selected_addons: list[dict[str, Any]] = []
+
+    # True once the item's own add step has already been sent (the variant
+    # path below sends it itself, 1-2 update_cart calls) -- skips the
+    # generic single-shot send/retry section, which assumes it hasn't.
+    variant_handled = False
 
     if _requires_customization(dish.get("tags") or ""):
         tags_haystack = (dish.get("tags") or "").lower()
 
-        if "has variants" in tags_haystack:
-            return _cart_reply(_customization_refusal(dish.get("item_name")))
-
+        # Addon-only item (e.g. live-confirmed "Korean Honey Gochujang
+        # Chicken Wings", tagged has-addons with one optional-looking
+        # "Add on Sauce" group, no variants): every addon group actually
+        # seen live so far (sauces, dressings, drinks, desserts, sides) reads
+        # as an optional upsell, not a mandatory choice, and the repeated
+        # real failure pattern (update_food_cart silently replying 'Cart
+        # updated.\nCart is empty.') is consistent with Swiggy's validation
+        # wanting an explicit answer for these groups, not with every group
+        # actually being required.
+        #
+        # First try for the user's REAL preference: a targeted search_menu
+        # lookup (_fetch_customization) returns real group/choice ids when it
+        # matches this item, and _ask_for_all_addons asks about each one via
+        # interrupt() -- so "extra cheese" actually means extra cheese, not
+        # a silently-dropped preference. If that lookup comes up empty
+        # (unfamiliar response shape, no match, a transient failure),
+        # `selected_addons` stays [] and the item is still attempted with
+        # an explicit empty selection, same as before this existed -- the
+        # merge-and-send flow below always re-fetches the cart afterward to
+        # verify either way; if verification shows the item didn't actually
+        # land, the same honest refusal is returned rather than a broken/
+        # misleading cart display.
         if preselected_addons is not None:
+            # Re-adding after "Clear my cart and add this": the user already answered.
             selected_addons = preselected_addons
             debug("cart_agent", f"re-using previously picked addons for {dish.get('item_name')!r}: {selected_addons!r}")
         else:
-            addon_groups = _fetch_addon_groups(
+            customization = _fetch_customization(
                 str(dish.get("item_name") or ""), str(dish.get("menu_item_id") or ""),
                 address_id, str(restaurant_id),
             )
+            addon_groups = customization["addon_groups"]
+            variant_groups = customization["variant_groups"]
             debug(
                 "cart_agent",
-                f"addon groups for {dish.get('item_name')!r}: "
-                f"{[g.get('group_name') for g in addon_groups]!r}",
+                f"customization for {dish.get('item_name')!r}: "
+                f"addon_groups={[g.get('group_name') for g in addon_groups]!r} "
+                f"variant_groups={[g.get('group_name') for g in variant_groups]!r}",
             )
-            if addon_groups:
+
+            if not variant_groups and not addon_groups and "has variants" in tags_haystack:
+                # The live lookup found nothing usable (unfamiliar response
+                # shape, no match, a transient failure) but the recommendation
+                # step still flagged a variant/size choice -- there's no safe
+                # default to guess for a variant (it changes what the item
+                # actually IS), so refuse rather than attempt-and-lie. Same
+                # safety net this used to be, before the live lookup existed.
+                # Deliberately drop `lead_in`, not prefix it -- callers build
+                # it assuming a successful add (RecommendAgent._reply_with_pick:
+                # "Great -- X it is."), and prefixing that onto a refusal
+                # produced a self-contradicting reply confirmed live: "Great
+                # -- The Veggie Melt Pizza from Captain Grub (Rs675.0) it is.
+                # The Veggie Melt Pizza needs a variant/add-on choice I can't
+                # set for you yet..." -- say plainly it wasn't added instead.
+                return _cart_reply(_customization_refusal(dish.get("item_name")))
+
+            if variant_groups:
+                # Real size/base-item choice (e.g. a pizza's "Size": 6/8
+                # slices) -- ask which variant, add it ALONE, then ask
+                # add-ons from THAT variant's own valid_addons (never the
+                # static per-item groups, which cover every variant's groups
+                # at once with no way to tell which belongs to which). See
+                # _add_item_with_variant's docstring for the live failure
+                # this replaces (logger.txt 2026-09-27, Classic Margherita
+                # Pizza: addons picked from two different sizes' groups,
+                # accepted then invalidated a beat later).
+                variant_result, selected_addons, variant_note, existing_items = _add_item_with_variant(
+                    restaurant_id, address_id, dish.get("restaurant_name"),
+                    str(dish.get("item_name") or ""), str(menu_item_id), quantity, variant_groups,
+                )
+                if variant_note:
+                    lead_in = f"{lead_in} {variant_note}".strip()
+                result = variant_result
+                variant_handled = True
+            elif addon_groups:
                 selected_addons = _ask_for_all_addons(str(dish.get("item_name") or ""), addon_groups)
                 debug("cart_agent", f"user-selected addons for {dish.get('item_name')!r}: {selected_addons!r}")
         attempt_addon_only = True
 
-    existing_cart = food_mcp.get_cart(address_id)
-    existing_items = (
-        _parse_existing_cart_items(existing_cart.get("message") or "")
-        if existing_cart.get("status") in ("text", "success", "empty")
-        else []
-    )
-    debug("cart_agent", f"existing cart before add: status={existing_cart.get('status')!r} "
-          f"parsed_items={existing_items!r}")
-
-    merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
-    target_quantity = merged.get(str(menu_item_id), 0) + quantity
-    merged[str(menu_item_id)] = target_quantity
-    def _build_payload(target_addons: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        items = []
-        for mid, qty in merged.items():
-            entry: dict[str, Any] = {"menu_item_id": mid, "quantity": qty}
-            if attempt_addon_only and mid == str(menu_item_id):
-                entry["addons"] = target_addons
-            items.append(entry)
-        return items
-
-    cart_items_payload = _build_payload([_wire_addon(a) for a in selected_addons])
-    debug("cart_agent", f"sending merged cartItems={cart_items_payload!r}")
-    if attempt_addon_only:
-        import json as _json
-        debug(
-            "cart_agent",
-            "addon-diag first attempt: wire JSON=" + _json.dumps(cart_items_payload, default=str)
-            + " | id types=" + repr(sorted({type(a.get("choice_id")).__name__ for e in cart_items_payload
-                                             for a in e.get("addons", [])}))
-            + " | price units=rupees (search_menu), the cart's valid_addons uses paise",
+    # Swiggy's update_food_cart is documented as additive ("Add items to
+    # cart"), but a live run showed the opposite: two consecutive calls
+    # (same restaurant/address, one new item each) each came back reporting
+    # only the item just sent -- "Items (1): ... " both times, with item
+    # total unchanged (~₹400, a single item's price) -- meaning the first
+    # item was dropped rather than accumulated. There's no cartId param to
+    # target an existing cart (confirmed against the docs: cart identity is
+    # resolved server-side from restaurantId/addressId, not a client-held
+    # id), so the safest fix from our side is to never rely on server-side
+    # accumulation: always fetch what's already in the cart, merge the new
+    # item into it (bumping quantity if it's already there), and send the
+    # FULL desired cart contents every time. Skipped when the variant path
+    # already handled its own send(s) above -- it does this same fetch
+    # itself, right before ITS OWN send, for exactly the same reason (an
+    # interrupt()-based flow must not run a real Swiggy call BEFORE an
+    # interrupt() it still has yet to hit, or that call re-runs on every
+    # replay -- see _add_item_with_variant's own copy of this).
+    if not variant_handled:
+        existing_cart = food_mcp.get_cart(address_id)
+        existing_items = (
+            _parse_existing_cart_items(existing_cart.get("message") or "")
+            if existing_cart.get("status") in ("text", "success", "empty")
+            else []
         )
+        debug("cart_agent", f"existing cart before add: status={existing_cart.get('status')!r} "
+              f"parsed_items={existing_items!r}")
 
-    result = food_mcp.update_cart(
-        restaurant_id, address_id,
-        cart_items_payload,
-        restaurant_name=dish.get("restaurant_name"),
-    )
-    debug("cart_agent", f"update_cart -> {result!r}")
+        merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
+        target_quantity = merged.get(str(menu_item_id), 0) + quantity
+        merged[str(menu_item_id)] = target_quantity
+        def _build_payload(target_addons: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            items = []
+            for mid, qty in merged.items():
+                entry: dict[str, Any] = {"menu_item_id": mid, "quantity": qty}
+                if attempt_addon_only and mid == str(menu_item_id):
+                    # Real user selections when the addon question got any,
+                    # else the explicit-empty-selection fallback -- see the
+                    # attempt_addon_only comment above.
+                    entry["addons"] = target_addons  # already in wire form (see _wire_addon)
+                items.append(entry)
+            return items
+    else:
+        # The variant path already sent its own update(s) using its own
+        # cart fetch/merge (see _add_item_with_variant) -- `existing_items`
+        # above is what it returned (the cart as it was BEFORE this add), so
+        # the same "did the expected quantity actually land" math applies.
+        target_quantity = next(
+            (i.get("quantity", 1) for i in existing_items if str(i.get("menu_item_id")) == str(menu_item_id)), 0,
+        ) + quantity
 
+    if not variant_handled:
+        cart_items_payload = _build_payload([_wire_addon(a) for a in selected_addons])
+        debug("cart_agent", f"sending merged cartItems={cart_items_payload!r}")
+        if attempt_addon_only:
+            import json as _json
+            debug(
+                "cart_agent",
+                "addon-diag first attempt: wire JSON=" + _json.dumps(cart_items_payload, default=str)
+                + " | id types=" + repr(sorted({type(a.get("choice_id")).__name__ for e in cart_items_payload
+                                                 for a in e.get("addons", [])}))
+                + " | price units=rupees (search_menu), the cart's valid_addons uses paise",
+            )
+
+        result = food_mcp.update_cart(
+            restaurant_id, address_id,
+            cart_items_payload,
+            restaurant_name=dish.get("restaurant_name"),
+        )
+        debug("cart_agent", f"update_cart -> {result!r}")
+
+    # Something from ANOTHER restaurant is already in the real Swiggy cart
+    # (typically left over from an earlier chat, so the in-memory guard above
+    # couldn't know) -- see _cart_conflict_reply.
     if (
         result.get("status") != "success"
         and "INVALID_ITEM_IDS_IN_REQUEST" in (result.get("error_codes") or [])
@@ -471,9 +911,21 @@ def add_dish_to_cart(
               "offering clear-and-add")
         return _cart_conflict_reply(dish, quantity, known_restaurant_name, selected_addons if attempt_addon_only else None)
 
+    # Live evidence (logger.txt 2026-09-26, 'Greek Falafel Salad', addon
+    # 'Sun Dried Tomatoes Topping'): sending the picked add-ons in the same
+    # call that adds the item came back INVALID_ADDON ("Restaurant may have
+    # removed the item(s) from their menu") with the cart left empty --
+    # even though every id/group pair was exactly what search_menu returned.
+    # Swiggy's docs describe a two-step flow instead: add the item first,
+    # read `valid_addons` off the cart, then add add-ons FROM that list with
+    # the group/choice ids paired exactly as returned. So on that specific
+    # rejection, fall back to the documented flow before giving up. Not for
+    # the variant path -- it already follows this exact flow itself (see
+    # _add_item_with_variant), so a failure there isn't a same-call
+    # item+addons rejection this retry knows how to recover from.
     addon_note = ""
     if (
-        result.get("status") != "success" and attempt_addon_only and selected_addons
+        not variant_handled and result.get("status") != "success" and attempt_addon_only and selected_addons
         and "INVALID_ADDON" in (result.get("error_codes") or [])
     ):
         result, addon_note = _retry_addons_via_valid_addons(
@@ -484,8 +936,16 @@ def add_dish_to_cart(
             lead_in = f"{lead_in} {addon_note}".strip()
     if result.get("status") != "success":
         if attempt_addon_only:
+            # `error_codes` only shows up when Swiggy's own structured_content
+            # said `successful: False` (see food_mcp.cart.update_cart) -- a
+            # real, specific rejection, not the old "reported success but the
+            # item silently never landed" mystery. Say what Swiggy actually
+            # said instead of the generic "can't set that yet" refusal,
+            # which is actively misleading here: Cravr DID try, and DID send
+            # the add-ons the user picked -- Swiggy turned them down.
             error_codes = result.get("error_codes")
             if error_codes and "INVALID_ADDON" not in error_codes:
+                # Not an add-on problem -- don't blame the add-ons.
                 debug("cart_agent", f"addon-only attempt: non-addon rejection {error_codes!r}")
                 content = (
                     f"Couldn't add {dish.get('item_name') or 'that item'} to your cart "
@@ -506,6 +966,13 @@ def add_dish_to_cart(
         return _cart_reply(f"{lead_in} {content}".strip())
 
     if attempt_addon_only:
+        # update_cart reporting "success" doesn't mean the item actually
+        # landed -- the whole reason this path exists is that has-addons
+        # items previously came back 'Cart updated.\nCart is empty.' while
+        # still reporting success. Re-fetch and confirm the item is really
+        # there (at the expected quantity) before trusting this attempt;
+        # if not, fall back to the same honest refusal rather than show the
+        # user a cart that silently dropped their item.
         verify_cart = food_mcp.get_cart(address_id)
         verify_items = (
             _parse_existing_cart_items(verify_cart.get("message") or "")
@@ -524,6 +991,18 @@ def add_dish_to_cart(
             return _cart_reply(_customization_refusal(dish.get("item_name")))
         debug("cart_agent", "addon-only attempt VERIFIED -- explicit empty addons selection worked live")
 
+    # update_cart succeeding doesn't guarantee the item actually landed --
+    # a real response was 'Cart updated.\nCart is empty.' -- so its own
+    # message is relayed rather than an independent "Added X" claim, UNLESS
+    # it's just going to repeat what get_cart is about to show next (avoid
+    # duplicate lines); get_cart right after is the real source of truth.
+    # Two shapes look like a redundant full dump: "Cart is empty." (empty
+    # cart) and an "Items (N): ... TO PAY: ..." itemized+pricing dump
+    # (non-empty cart) -- a real observed update_cart response was 'Cart
+    # updated.\nRestaurant: X\nItems (1):\n  - Dish — ₹260 (ID: 123)\n\n
+    # Item total: ₹400\n...\nTO PAY: ₹398', which get_cart repeats verbatim
+    # right after. Only relay update_cart's own message when it's neither --
+    # e.g. a genuinely different short status line.
     update_message = result.get("message")
     looks_like_full_dump = bool(update_message) and (
         "cart is empty" in update_message.lower()
@@ -535,6 +1014,11 @@ def add_dish_to_cart(
     else:
         prefix = lead_in
     outcome = _show_cart_with_next_steps(address_id, lead_in=prefix)
+    # get_cart's real (text-mode) response never fills in `restaurant`
+    # (food_mcp.get_cart hardcodes it to None off that path), so the
+    # cross-restaurant guard above would never have anything to compare
+    # against on the NEXT add unless we record it ourselves here, on our
+    # own successful add.
     cart_state = outcome.get("cart_state") or {}
     if cart_state.get("status") in ("text", "success"):
         outcome["cart_state"] = {
