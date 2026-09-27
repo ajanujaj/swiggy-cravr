@@ -59,13 +59,21 @@ reaction_on_message_received = false
     allowed_executables = [ "npx", "uvx" ]
 
 [UI]
-name = "Assistant"
+name = "Cravr"
+
+description = "Not sure what to eat? Cravr finds it on Swiggy."
+
+default_theme = "light"
+
+layout = "wide"
 
 confirm_new_chat = true
 
-cot = "full"
+cot = "hidden"
 
 alert_style = "classic"
+
+custom_css = "/public/cravr.css"
 
 logo_file_url = ""
 

@@ -35,30 +35,26 @@ async def on_chat_start() -> None:
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     if state.get_multiselect():
-        await components.finish_multiselect()
+        state.set_multiselect(None)
     await state.clear_live_options()
     await graph_bridge.send(message.content)
 
 
 @cl.action_callback("pick")
 async def on_pick(action: cl.Action) -> None:
-    await state.clear_live_options()
     value = action.payload.get("value")
     label = action.payload.get("label") or value
+    await state.clear_live_options(selected=value)
     await cl.Message(content=str(label), type="user_message").send()
     await graph_bridge.send(value, display_label=label)
 
 
-@cl.action_callback("multiselect_toggle")
-async def on_multiselect_toggle(action: cl.Action) -> None:
-    await components.toggle_multiselect(action.payload.get("value"))
-
-
-@cl.action_callback("multiselect_done")
-async def on_multiselect_done(action: cl.Action) -> None:
-    finished = await components.finish_multiselect()
-    if not finished:
+@cl.action_callback("multiselect_submit")
+async def on_multiselect_submit(action: cl.Action) -> None:
+    if not state.get_multiselect():
         return
-    value, label = finished
+    values = [str(v) for v in action.payload.get("values") or []]
+    await state.clear_live_options(selected=values)
+    value, label = components.multiselect_answer(values)
     await cl.Message(content=label, type="user_message").send()
     await graph_bridge.send(value, display_label=label)
