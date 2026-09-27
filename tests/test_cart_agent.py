@@ -128,7 +128,7 @@ class CartAgentNodeTests(unittest.TestCase):
             "REST003", "addr1", [{"menu_item_id": "ITEM0011", "quantity": 1}], restaurant_name="Dakshin Delights",
         )
         self.assertIn("Masala Dosa", result["messages"][0].content)
-        self.assertIn("Total to pay: ₹210", result["messages"][0].content)
+        self.assertIn("**Total to pay:** ₹210", result["messages"][0].content)
 
     def test_add_relays_update_carts_own_message_when_it_has_signal(self):
         """A real update_cart message that isn't just "cart is empty" noise
@@ -1845,7 +1845,7 @@ class CheckoutFlowTests(unittest.TestCase):
         payload = first["__interrupt__"][0].value
         self.assertEqual(payload["field"], "payment_method")
         self.assertIn("Masala Dosa", payload["question"])
-        self.assertIn("Total to pay: ₹557", payload["question"])
+        self.assertIn("**Total to pay:** ₹557", payload["question"])
         self.assertIn("Home", payload["question"])
         labels = {o["label"] for o in payload["options"]}
         self.assertEqual(labels, {"Cash on Delivery", "UPI (scan to pay)", "Cancel — don't place the order"})
@@ -1869,8 +1869,8 @@ class CheckoutFlowTests(unittest.TestCase):
         }
         first, _config = self._start(cart=cart_with_pizza, item_details=item_details)
         question = first["__interrupt__"][0].value["question"]
-        self.assertIn("Classic Margherita Pizza x1 — ₹695 (8 Slices)", question)
-        self.assertIn("+ Extra Cheese", question)
+        self.assertIn("- Classic Margherita Pizza x1 — ₹695 (8 Slices)", question)
+        self.assertIn("  - Extra Cheese", question)
 
     def test_cancel_leaves_the_cart_untouched_and_never_places_an_order(self):
         _first, config = self._start()
@@ -2080,8 +2080,12 @@ class CartViewShowsAddonsTests(unittest.TestCase):
              patch("cravr.cart.CartAgent.food_mcp.get_cart_item_details", return_value=item_details):
             result = cart_agent_node(_state("show my cart"))
         content = result["messages"][0].content
-        self.assertIn("Veg Ramen Bowl x1 — ₹689", content)
-        self.assertIn("+ Veg Steam Momos (2), Coke (300 Ml Can), Sprite (300 Ml Can)", content)
+        self.assertIn("- Veg Ramen Bowl x1 — ₹689", content)
+        # Each add-on on its OWN line -- never comma-joined onto one line,
+        # which is what made a real cart view read as a wall of text.
+        self.assertIn("  - Veg Steam Momos (2)", content)
+        self.assertIn("  - Coke (300 Ml Can)", content)
+        self.assertIn("  - Sprite (300 Ml Can)", content)
 
     def test_show_cart_skips_the_item_details_lookup_when_the_cart_is_empty(self):
         with patch("cravr.cart.CartAgent.food_mcp.get_cart",

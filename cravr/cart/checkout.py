@@ -57,19 +57,25 @@ _FAKE_ORDER_ID = "TEST-ORDER-0001"
 def _order_summary(cart: dict[str, Any], address: dict[str, Any], item_details: dict[str, Any] | None = None) -> str:
     """Item lines plus, when known (via get_cart_item_details), each item's
     chosen variant and add-ons -- shown right under its line -- so the user
-    confirms exactly what they picked, not just names and prices."""
+    confirms exactly what they picked, not just names and prices. Built as
+    separate markdown sections (order / total / delivery address) joined by
+    blank lines -- packing everything onto one or two lines with no blank
+    lines between them is exactly what made a real checkout summary render
+    as one run-on paragraph (a list needs a blank line to end, or whatever
+    follows gets swallowed into the last bullet); see _item_lines for why
+    bullets, never numbers, are used for the items themselves."""
     items = cart.get("items") or []
     if items:
-        body = "Here's what you're about to order:\n" + "\n".join(_item_lines(items, item_details))
+        sections = ["**Your order:**\n\n" + "\n".join(_item_lines(items, item_details))]
     else:
-        body = cart.get("message") or ""
+        sections = [cart.get("message") or ""]
     pricing = cart.get("pricing") or {}
     to_pay = pricing.get("to_pay")
     if to_pay is not None:
-        body += f"\nTotal to pay: ₹{to_pay}"
+        sections.append(f"**Total to pay:** ₹{to_pay}")
     if address.get("status") == "success":
-        body += f"\nDelivering to: {address.get('location')} — {address.get('delivery_area')}"
-    return body
+        sections.append(f"**Delivering to:** {address.get('location')} — {address.get('delivery_area')}")
+    return "\n\n".join(sections)
 
 
 def _payment_method_options(payment_options: dict[str, Any]) -> list[dict[str, str]]:
