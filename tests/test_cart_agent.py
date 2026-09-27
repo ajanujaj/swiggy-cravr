@@ -492,6 +492,45 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         self.assertNotIn("needs a variant/add-on choice", content)
         self.assertEqual(result["cart_state"]["restaurant"], {"id": "300123", "name": "Some Korean Place"})
 
+    def test_add_dish_to_cart_accepts_an_addon_only_item_when_verify_get_cart_is_json_mode_not_text(self):
+        """Live regression (2026-09-27, 'Classic Margherita Pizza', Caro
+        Napoli Pizza, restaurantId 964454): once get_cart started reading
+        Swiggy's structured_content directly (food_mcp/cart.py), the
+        verify-it-landed get_cart call after a successful update_cart
+        started coming back status='success' with a real `items` list but
+        `message=None` (json mode) instead of the old text-only
+        'Items (1): ...' string -- here because Swiggy also warned that one
+        of the chosen add-ons (Fanta) had just gone out of stock
+        (statusCode=8 'Sorry! few items are now out of stock', item
+        in_stock=0), which is a non-fatal warning, not a failed add. The
+        verify step must read that `items` list (via
+        parsing._existing_cart_items), not just `message` -- otherwise a
+        perfectly successful add gets refused as 'never landed' just
+        because Swiggy's response happened to carry structured data."""
+        dish = {
+            "item_name": "Classic Margherita Pizza", "menu_item_id": "152977469",
+            "restaurant_id": "964454", "restaurant_name": "Caro Napoli Pizza", "tags": "has addons",
+        }
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart") as mock_get_cart, \
+             patch("cravr.cart.CartAgent.food_mcp.update_cart") as mock_update, \
+             patch("cravr.cart.CartAgent.food_mcp.search_menu_items"):
+            landed_json_mode = {
+                "status": "success", "message": None,
+                "items": [{"menu_item_id": 152977469, "item_name": "Classic Margherita Pizza",
+                           "quantity": 1, "total": 1380, "final_price": 1380, "in_stock": 0}],
+                "item_count": 1, "pricing": {"to_pay": 1547},
+            }
+            mock_get_cart.side_effect = [
+                {"status": "empty", "message": "Cart is empty."},  # before the merge
+                landed_json_mode,  # verify after the attempt -- json-mode, no `message` text at all
+                landed_json_mode,  # _show_cart_with_next_steps' own get_cart call
+            ]
+            mock_update.return_value = {"status": "success", "message": "Cart updated."}
+            result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="")
+
+        content = result["messages"][0].content
+        self.assertNotIn("needs a variant/add-on choice", content)
+
     def test_add_dish_to_cart_refuses_items_with_variant_choices_too(self):
         dish = {"item_name": "Fiery Avocado Roll", "menu_item_id": "157423529",
                 "restaurant_id": "996967", "restaurant_name": "Mister Edamame",
@@ -2050,3 +2089,40 @@ class CartViewShowsAddonsTests(unittest.TestCase):
              patch("cravr.cart.CartAgent.food_mcp.get_cart_item_details") as mock_details:
             cart_agent_node(_state("show my cart"))
         mock_details.assert_not_called()
+
+
+class ExistingCartItemsHelperTests(unittest.TestCase):
+    """cravr.cart.parsing._existing_cart_items -- the single place add_flow.py
+    and flows.py get "what's already in the cart" from, used to merge in a
+    new item before update_cart and to verify an add-on-only add actually
+    landed afterward. Must prefer get_cart's own structured `items` list
+    (reliable since get_cart reads structured_content directly) over
+    text-parsing `message`, which is None whenever get_cart already parsed
+    real items -- the old unconditional text-parse silently saw an empty
+    cart in that case (live regression, 2026-09-27: dropped the merge, and
+    separately made a landed add-on look like it never landed)."""
+
+    def test_prefers_the_structured_items_list(self):
+        from cravr.cart.parsing import _existing_cart_items
+        cart = {"status": "success", "message": None, "items": [
+            {"menu_item_id": 152977469, "item_name": "Classic Margherita Pizza", "quantity": 1},
+        ]}
+        self.assertEqual(_existing_cart_items(cart), [{"menu_item_id": 152977469, "quantity": 1}])
+
+    def test_ignores_items_missing_a_menu_item_id(self):
+        """Test fixtures (and possibly a malformed live response) can carry
+        item dicts with no id at all -- must not merge a
+        {"menu_item_id": None, ...} entry into a real update_cart payload."""
+        from cravr.cart.parsing import _existing_cart_items
+        cart = {"status": "success", "items": [{"item_name": "Mystery", "quantity": 1}]}
+        self.assertEqual(_existing_cart_items(cart), [])
+
+    def test_falls_back_to_text_parsing_only_in_genuine_text_mode(self):
+        from cravr.cart.parsing import _existing_cart_items
+        cart = {"status": "text", "items": [], "message": "Items (1):\n  - Dosa — ₹180 (ID: I1)"}
+        self.assertEqual(_existing_cart_items(cart), [{"menu_item_id": "I1", "quantity": 1}])
+
+    def test_empty_cart_returns_no_items_without_touching_message(self):
+        from cravr.cart.parsing import _existing_cart_items
+        cart = {"status": "empty", "items": [], "message": "Cart is empty."}
+        self.assertEqual(_existing_cart_items(cart), [])

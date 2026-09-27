@@ -16,7 +16,7 @@ from .. import food_mcp
 from ..debug_utils import debug
 from .display import _cart_reply, _show_cart_with_next_steps
 from .guards import _customization_refusal, _requires_customization
-from .parsing import _parse_existing_cart_items
+from .parsing import _existing_cart_items
 from .routing import _CONFLICT_OPTIONS
 
 # Sentinel for "none of these" on an addon question -- same
@@ -564,11 +564,7 @@ def _add_item_with_variant(
         return {"status": "error", "message": "No size/variant was chosen.", "error_codes": []}, [], "", []
 
     existing_cart = food_mcp.get_cart(address_id)
-    existing_items = (
-        _parse_existing_cart_items(existing_cart.get("message") or "")
-        if existing_cart.get("status") in ("text", "success", "empty")
-        else []
-    )
+    existing_items = _existing_cart_items(existing_cart)
     debug("cart_agent", f"variant flow -- existing cart before add: status={existing_cart.get('status')!r} "
           f"parsed_items={existing_items!r}")
     merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
@@ -892,11 +888,7 @@ def add_dish_to_cart(
     # replay -- see _add_item_with_variant's own copy of this).
     if not variant_handled:
         existing_cart = food_mcp.get_cart(address_id)
-        existing_items = (
-            _parse_existing_cart_items(existing_cart.get("message") or "")
-            if existing_cart.get("status") in ("text", "success", "empty")
-            else []
-        )
+        existing_items = _existing_cart_items(existing_cart)
         debug("cart_agent", f"existing cart before add: status={existing_cart.get('status')!r} "
               f"parsed_items={existing_items!r}")
 
@@ -1018,11 +1010,7 @@ def add_dish_to_cart(
         # if not, fall back to the same honest refusal rather than show the
         # user a cart that silently dropped their item.
         verify_cart = food_mcp.get_cart(address_id)
-        verify_items = (
-            _parse_existing_cart_items(verify_cart.get("message") or "")
-            if verify_cart.get("status") in ("text", "success", "empty")
-            else []
-        )
+        verify_items = _existing_cart_items(verify_cart)
         landed = next(
             (i for i in verify_items if str(i.get("menu_item_id")) == str(menu_item_id)), None,
         )

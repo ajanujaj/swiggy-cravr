@@ -9,7 +9,7 @@ from ..debug_utils import debug
 from ..state import CravrState
 from .display import _cart_reply
 from .guards import _suggest_complementary_items
-from .parsing import _parse_existing_cart_items
+from .parsing import _existing_cart_items
 from .restaurant_context import _current_restaurant_id, _current_restaurant_name
 
 
@@ -44,7 +44,7 @@ def _suggest_more_from_restaurant(state: CravrState, address_id: str) -> dict:
         return _cart_reply("I've lost track of which restaurant your cart is from -- try viewing your cart first.")
 
     cart = food_mcp.get_cart(address_id)
-    existing_items = _parse_existing_cart_items(cart.get("message") or "")
+    existing_items = _existing_cart_items(cart)
     existing_ids = {str(item["menu_item_id"]) for item in existing_items}
     cart_item_id = existing_items[0]["menu_item_id"] if existing_items else None
 
