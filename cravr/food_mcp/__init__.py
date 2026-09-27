@@ -66,6 +66,12 @@ from .cart import (
     get_cart_valid_addons,
     update_cart,
 )
+from .payments import (
+    check_payment_status,
+    confirm_order,
+    get_payment_options,
+    place_order,
+)
 
 __all__ = [
     "call_tool_sync",
@@ -81,6 +87,10 @@ __all__ = [
     "apply_coupon",
     "fetch_coupons",
     "flush_cart",
+    "get_payment_options",
+    "place_order",
+    "check_payment_status",
+    "confirm_order",
     "_normalize_item",
     "_parse_menu_items",
     "_infer_collection",

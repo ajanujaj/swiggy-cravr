@@ -5,6 +5,7 @@ from ..debug_utils import debug
 from ..profile_utils import latest_user_text
 from ..state import CravrState
 from .add_flow import add_dish_to_cart
+from .checkout import cancel_upi_payment, resume_upi_payment, run_checkout
 from .display import _cart_reply, _show_cart_with_next_steps
 from .flows import _clear_cart_and_add_pending, _start_over_new_restaurant, _suggest_more_from_restaurant
 from .restaurant_context import _current_restaurant_id, _current_restaurant_name
@@ -70,12 +71,14 @@ def cart_agent_node(state: CravrState) -> dict:
     if action == "suggest_more":
         return _suggest_more_from_restaurant(state, address_id)
 
-    if action == "proceed_placeholder":
-        return _show_cart_with_next_steps(
-            address_id,
-            lead_in="Checkout isn't wired up yet -- that's next on the list. "
-                    "For now you can keep adding items or browse other restaurants.",
-        )
+    if action == "checkout":
+        return run_checkout(address_id)
+
+    if action == "upi_paid":
+        return resume_upi_payment(state.get("cart_state") or {}, address_id)
+
+    if action == "upi_not_paid":
+        return cancel_upi_payment(state.get("cart_state") or {})
 
     if action == "start_over":
         return _start_over_new_restaurant(state, address_id)

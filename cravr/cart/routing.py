@@ -32,9 +32,11 @@ CART_PROCEED_VALUE = "__cart_proceed__"
 CART_START_OVER_VALUE = "__cart_start_over__"
 CART_CLEAR_AND_ADD_VALUE = "__cart_clear_and_add__"
 CART_KEEP_VALUE = "__cart_keep__"
+CART_UPI_PAID_VALUE = "__cart_upi_paid__"
+CART_UPI_NOT_PAID_VALUE = "__cart_upi_not_paid__"
 _NEXT_STEP_SENTINELS = {
     CART_ADD_MORE_VALUE, CART_PROCEED_VALUE, CART_START_OVER_VALUE,
-    CART_CLEAR_AND_ADD_VALUE, CART_KEEP_VALUE,
+    CART_CLEAR_AND_ADD_VALUE, CART_KEEP_VALUE, CART_UPI_PAID_VALUE, CART_UPI_NOT_PAID_VALUE,
 }
 
 _CONFLICT_OPTIONS = [
@@ -46,6 +48,18 @@ _NEXT_STEP_OPTIONS = [
     {"value": CART_ADD_MORE_VALUE, "label": "Add more from this restaurant"},
     {"value": CART_PROCEED_VALUE, "label": "Proceed"},
     {"value": CART_START_OVER_VALUE, "label": "Browse other restaurants"},
+]
+
+# Offered by checkout.py's own reply once a UPI order is PENDING_PAYMENT --
+# a plain next-step-button choice (fresh graph invoke), never an
+# interrupt()/resume: place_food_order is a real, non-idempotent write, and
+# LangGraph replays a node's earlier code on every resume of a LATER
+# interrupt in the same invocation (see checkout.py's module docstring), so
+# an interrupt() placed after place_order would risk placing the order a
+# second time. Routing it as a fresh invocation instead sidesteps that.
+_UPI_CONFIRM_OPTIONS = [
+    {"value": CART_UPI_PAID_VALUE, "label": "I've paid"},
+    {"value": CART_UPI_NOT_PAID_VALUE, "label": "Cancel — I haven't paid"},
 ]
 
 
@@ -61,13 +75,17 @@ def _classify_cart_action(text: str) -> tuple[str, Any]:
     if t == CART_ADD_MORE_VALUE:
         return "suggest_more", None
     if t == CART_PROCEED_VALUE:
-        return "proceed_placeholder", None
+        return "checkout", None
     if t == CART_START_OVER_VALUE:
         return "start_over", None
     if t == CART_CLEAR_AND_ADD_VALUE:
         return "clear_and_add", None
     if t == CART_KEEP_VALUE:
         return "keep_cart", None
+    if t == CART_UPI_PAID_VALUE:
+        return "upi_paid", None
+    if t == CART_UPI_NOT_PAID_VALUE:
+        return "upi_not_paid", None
     if _CLEAR_RE.search(t):
         return "clear", None
     coupon_match = _COUPON_APPLY_RE.search(t)

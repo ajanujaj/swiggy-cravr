@@ -608,7 +608,7 @@ class CartNextStepTests(unittest.TestCase):
     def test_sentinels_route_to_cart_and_classify_distinctly(self):
         for value, expected_action in (
             (CartAgent.CART_ADD_MORE_VALUE, "suggest_more"),
-            (CartAgent.CART_PROCEED_VALUE, "proceed_placeholder"),
+            (CartAgent.CART_PROCEED_VALUE, "checkout"),
             (CartAgent.CART_START_OVER_VALUE, "start_over"),
         ):
             self.assertTrue(is_cart_request(value), value)
@@ -631,11 +631,11 @@ class CartNextStepTests(unittest.TestCase):
             result = cart_agent_node(_state("show my cart"))
         self.assertNotIn("options", result["cart_state"])
 
-    def test_proceed_is_a_stub_that_still_shows_the_cart_and_buttons(self):
-        with patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=self.NON_EMPTY_CART):
-            result = cart_agent_node(_state(CartAgent.CART_PROCEED_VALUE, cart_state=self.NON_EMPTY_CART))
-        self.assertIn("isn't wired up yet", result["messages"][0].content)
-        self.assertEqual(result["cart_state"].get("options"), CartAgent._NEXT_STEP_OPTIONS)
+    def test_proceed_with_an_empty_cart_does_not_start_checkout(self):
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "empty", "message": "Cart is empty."}):
+            result = cart_agent_node(_state(CartAgent.CART_PROCEED_VALUE))
+        self.assertIn("empty", result["messages"][0].content.lower())
 
     def test_add_more_suggests_complementary_items_and_excludes_the_cart_item(self):
         full_menu = (
@@ -1704,3 +1704,153 @@ class VariantWireShapeTests(unittest.TestCase):
         fields = [field for _label, field, _payload in _variant_shapes(
             [{"id": "1", "name": "Small", "group_id": "9"}])]
         self.assertEqual(fields, ["variantsV2", "variants", "variants"])
+
+
+class CheckoutFlowTests(unittest.TestCase):
+    """The "Proceed" checkout flow (cravr/cart/checkout.py): order summary
+    + delivery address -> pick Cash/UPI (or cancel) -> place_food_order ->
+    (UPI only) poll check_payment_status -> confirm_order. Swiggy has no
+    dummy/sandbox payment mode, so place_food_order always creates a REAL
+    order -- CRAVR_TEST_MODE short-circuits right before any of the four
+    payment tools get called (see test_test_mode_never_touches_the_real_
+    payment_tools)."""
+
+    NON_EMPTY_CART = {
+        "status": "success",
+        "items": [{"item_name": "Masala Dosa", "quantity": 2, "total": 500, "final_price": 250}],
+        "pricing": {"to_pay": 557},
+    }
+    ADDRESS = {"status": "success", "location": "Home", "delivery_area": "S-27/3, DLF Phase 3", "address_id": "addr1"}
+    BOTH_METHODS_AVAILABLE = {"status": "success", "cod_available": True, "upi_available": True, "payment_amount": 557}
+    NEITHER_METHOD_AVAILABLE = {"status": "success", "cod_available": False, "upi_available": False}
+
+    COD_SUCCESS = {
+        "status": "success", "order_id": "ORD-COD-1", "swiggy_status": "CONFIRMED",
+        "total_amount": 557, "estimated_delivery": "35-40 mins", "message": "Order placed.",
+    }
+    UPI_PENDING = {
+        "status": "pending_payment", "order_id": "ORD-UPI-1", "paas_id": "PAAS-1",
+        "lat": 12.93, "lng": 77.61, "cart_id": "CART-1",
+        "bridge_url": "https://pay.example/xyz", "polling_interval_ms": 1, "max_poll_time_ms": 1000,
+    }
+    PAYMENT_SUCCESS_TERMINAL = {
+        "status": "success", "terminal": True, "is_terminal_success": True,
+        "is_terminal_failure": False, "order_status": "CONFIRMED",
+    }
+    PAYMENT_FAILED_TERMINAL = {
+        "status": "failed", "terminal": True, "is_terminal_success": False, "is_terminal_failure": True,
+    }
+    CONFIRM_SUCCESS = {"status": "success", "order_id": "ORD-UPI-1", "order_status": "CONFIRMED", "message": "ok"}
+
+    def _start(self, cart=None, address=None, payment_options=None):
+        """Invokes the real graph up to (and including) the payment-method
+        interrupt -- run_checkout always asks before doing anything real,
+        so every non-trivial test needs the full interrupt/resume dance,
+        same as VariantThenAddonFlowTests above."""
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        state = _state(CartAgent.CART_PROCEED_VALUE, cart_state=self.NON_EMPTY_CART)
+        patches = [
+            patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=cart or self.NON_EMPTY_CART),
+            patch("cravr.cart.CartAgent.food_mcp.get_saved_address", return_value=address or self.ADDRESS),
+            patch("cravr.cart.CartAgent.food_mcp.get_payment_options",
+                  return_value=payment_options or self.BOTH_METHODS_AVAILABLE),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        first = cravr_app.invoke(state, config=config)
+        return first, config
+
+    def test_empty_cart_never_reaches_the_payment_question(self):
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "empty", "message": "Cart is empty."}), \
+             patch("cravr.cart.CartAgent.food_mcp.get_payment_options") as mock_options:
+            result = cart_agent_node(_state(CartAgent.CART_PROCEED_VALUE))
+        self.assertFalse(result.get("__interrupt__"))
+        self.assertIn("empty", result["messages"][0].content.lower())
+        mock_options.assert_not_called()
+
+    def test_neither_payment_method_available_refuses_checkout_up_front(self):
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=self.NON_EMPTY_CART), \
+             patch("cravr.cart.CartAgent.food_mcp.get_saved_address", return_value=self.ADDRESS), \
+             patch("cravr.cart.CartAgent.food_mcp.get_payment_options", return_value=self.NEITHER_METHOD_AVAILABLE), \
+             patch("cravr.cart.CartAgent.food_mcp.place_order") as mock_place:
+            result = cart_agent_node(_state(CartAgent.CART_PROCEED_VALUE))
+        self.assertFalse(result.get("__interrupt__"))
+        self.assertIn("isn't available", result["messages"][0].content)
+        mock_place.assert_not_called()
+
+    def test_asks_payment_method_with_order_summary_and_address(self):
+        first, _config = self._start()
+        self.assertTrue(first.get("__interrupt__"))
+        payload = first["__interrupt__"][0].value
+        self.assertEqual(payload["field"], "payment_method")
+        self.assertIn("Masala Dosa", payload["question"])
+        self.assertIn("Total to pay: ₹557", payload["question"])
+        self.assertIn("Home", payload["question"])
+        labels = {o["label"] for o in payload["options"]}
+        self.assertEqual(labels, {"Cash on Delivery", "UPI (scan to pay)", "Cancel — don't place the order"})
+
+    def test_cancel_leaves_the_cart_untouched_and_never_places_an_order(self):
+        _first, config = self._start()
+        with patch("cravr.cart.CartAgent.food_mcp.place_order") as mock_place:
+            final = cravr_app.invoke(Command(resume="__cancel_checkout__"), config=config)
+        mock_place.assert_not_called()
+        self.assertIn("didn't place the order", final["messages"][-1].content)
+
+    def test_cod_places_a_real_order_immediately_with_no_polling(self):
+        _first, config = self._start()
+        with patch("cravr.cart.CartAgent.food_mcp.place_order", return_value=self.COD_SUCCESS) as mock_place, \
+             patch("cravr.cart.CartAgent.food_mcp.check_payment_status") as mock_status, \
+             patch("cravr.cart.CartAgent.food_mcp.confirm_order") as mock_confirm:
+            final = cravr_app.invoke(Command(resume="cod"), config=config)
+        mock_place.assert_called_once_with("addr1", "Cash", generate_upi_qr=False)
+        mock_status.assert_not_called()
+        mock_confirm.assert_not_called()
+        content = final["messages"][-1].content
+        self.assertIn("Order placed! (Cash on Delivery)", content)
+        self.assertIn("ORD-COD-1", content)
+        self.assertIn("35-40 mins", content)
+
+    def test_upi_polls_once_then_confirms_on_a_terminal_success(self):
+        _first, config = self._start()
+        with patch("cravr.cart.CartAgent.food_mcp.place_order", return_value=self.UPI_PENDING) as mock_place, \
+             patch("cravr.cart.CartAgent.food_mcp.check_payment_status",
+                   return_value=self.PAYMENT_SUCCESS_TERMINAL) as mock_status, \
+             patch("cravr.cart.CartAgent.food_mcp.confirm_order", return_value=self.CONFIRM_SUCCESS) as mock_confirm:
+            final = cravr_app.invoke(Command(resume="upi"), config=config)
+        mock_place.assert_called_once_with("addr1", "UPI", generate_upi_qr=True)
+        mock_status.assert_called_once_with(
+            "PAAS-1", order_id="ORD-UPI-1", address_id="addr1", lat=12.93, lng=77.61, cart_id="CART-1",
+        )
+        mock_confirm.assert_called_once_with("ORD-UPI-1", "addr1", 12.93, 77.61, cart_id="CART-1")
+        content = final["messages"][-1].content
+        self.assertIn("Order placed! (UPI)", content)
+        self.assertIn("ORD-UPI-1", content)
+
+    def test_upi_terminal_failure_never_confirms_and_says_so(self):
+        _first, config = self._start()
+        with patch("cravr.cart.CartAgent.food_mcp.place_order", return_value=self.UPI_PENDING), \
+             patch("cravr.cart.CartAgent.food_mcp.check_payment_status",
+                   return_value=self.PAYMENT_FAILED_TERMINAL), \
+             patch("cravr.cart.CartAgent.food_mcp.confirm_order") as mock_confirm:
+            final = cravr_app.invoke(Command(resume="upi"), config=config)
+        mock_confirm.assert_not_called()
+        self.assertIn("didn't go through", final["messages"][-1].content)
+
+    def test_test_mode_never_touches_the_real_payment_tools(self):
+        """CRAVR_TEST_MODE=1 (debug_utils.test_mode_enabled): place_order,
+        check_payment_status and confirm_order must NEVER be called -- this
+        is the safety net for developing/testing checkout without placing a
+        real Swiggy order (their docs confirm there's no dummy-payment
+        mode)."""
+        _first, config = self._start()
+        with patch("cravr.cart.checkout.test_mode_enabled", return_value=True), \
+             patch("cravr.cart.CartAgent.food_mcp.place_order") as mock_place, \
+             patch("cravr.cart.CartAgent.food_mcp.check_payment_status") as mock_status, \
+             patch("cravr.cart.CartAgent.food_mcp.confirm_order") as mock_confirm:
+            final = cravr_app.invoke(Command(resume="cod"), config=config)
+        mock_place.assert_not_called()
+        mock_status.assert_not_called()
+        mock_confirm.assert_not_called()
+        self.assertIn("TEST MODE", final["messages"][-1].content)

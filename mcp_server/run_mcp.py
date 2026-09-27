@@ -340,6 +340,127 @@ def flush_food_cart() -> dict:
     return {"success": True, "data": {}, "message": "Cart cleared"}
 
 
+# --- Checkout (place_food_order / get_payment_options / check_payment_status
+# / confirm_order) --------------------------------------------------------
+# A local, fake stand-in for the real Swiggy checkout tools, so the full
+# cravr/cart/checkout.py flow (payment-method question, UPI polling,
+# confirm) can be exercised end to end against this mock server -- useful
+# on top of (not instead of) CRAVR_TEST_MODE, which skips calling these
+# tools altogether: this path actually exercises checkout.py's and
+# food_mcp/payments.py's real parsing logic, just against fake data instead
+# of a real Swiggy order. No real money or real deliveries are ever
+# involved here, unlike the real Swiggy MCP.
+_MOCK_LAT, _MOCK_LNG = 12.9716, 77.5946
+_pending_order: dict = {}
+
+
+@app.tool()
+def get_payment_options(addressId: str = None) -> dict:
+    """Mock get_payment_options -- always offers both Cash and a UPI QR
+    method, mirroring the documented PaymentOptionsView shape closely
+    enough for food_mcp.payments.get_payment_options to parse."""
+    return {
+        "success": True,
+        "data": {
+            "cod": {"available": True, "id": "cod"},
+            "allMethods": [
+                {"id": "mock_upi_qr", "displayName": "Scan to pay (mock)", "groupName": "UPI QR",
+                 "kind": "qr", "enabled": True},
+            ],
+            "paymentAmount": _cart_pricing()["to_pay"],
+            "placeOrderToolName": "place_food_order",
+        },
+    }
+
+
+@app.tool()
+def place_food_order(
+    addressId: str, paymentMethod: str = None, intentApp: str = None,
+    generateUPIQR: bool = None, noteToRestaurant: str = None,
+) -> dict:
+    """Mock place_food_order. Cash is placed immediately (cart cleared, like
+    the real tool converting the cart into an order); UPI comes back
+    PENDING_PAYMENT with a fake paasId that check_payment_status below
+    resolves to success on its SECOND call, so the polling loop in
+    cravr/cart/checkout.py actually gets exercised (not just its
+    already-terminal fast path)."""
+    if not _cart_state["items"]:
+        return {"success": False, "error": {"message": "Cart is empty -- nothing to order"}}
+
+    order_id = f"MOCK-ORDER-{abs(hash((addressId, paymentMethod))) % 100000}"
+    pricing = _cart_pricing()
+
+    if (paymentMethod or "Cash").strip().lower() != "upi":
+        items = list(_cart_state["items"])
+        restaurant_name = _cart_state["restaurant_name"]
+        _cart_state["items"] = []
+        _cart_state["coupon_code"] = None
+        _cart_state["coupon_discount"] = 0
+        return {
+            "success": True,
+            "data": {
+                "orderId": order_id, "status": "CONFIRMED", "normalizedStatus": "success",
+                "items": items, "restaurantName": restaurant_name, "restaurantAddress": "Mock Street, Mock City",
+                "totalAmount": pricing["to_pay"], "estimatedDelivery": "35-40 mins",
+                "deliveryAddress": "Mock delivery address",
+            },
+        }
+
+    paas_id = f"MOCK-PAAS-{order_id}"
+    _pending_order.clear()
+    _pending_order.update({"order_id": order_id, "paas_id": paas_id, "poll_count": 0, "confirmed": False})
+    return {
+        "success": True,
+        "data": {
+            "orderId": order_id, "paasId": paas_id, "transactionId": paas_id,
+            "status": "PENDING_PAYMENT", "normalizedStatus": "pending",
+            "upiIntentUrl": "upi://mock-pay", "bridgeUrl": "https://mock.local/pay/" + paas_id,
+            "isQrFlow": bool(generateUPIQR), "pollingIntervalInMs": 2000, "maxTimeToPollForInMs": 20000,
+            "lat": _MOCK_LAT, "lng": _MOCK_LNG, "addressId": addressId, "cartId": "MOCK-CART-1",
+        },
+    }
+
+
+@app.tool()
+def check_payment_status(
+    paasId: str, orderId: str = None, addressId: str = None,
+    lat: float = None, lng: float = None, cartId: str = None, finalize: bool = None,
+) -> dict:
+    """Mock check_payment_status -- "pending" on the first poll, "success"
+    from the second poll onward, so a caller that only polls once still
+    sees a real (if quick) pending->success transition."""
+    if paasId != _pending_order.get("paas_id"):
+        return {"success": True, "data": {"status": "", "terminal": True, "isTerminalSuccess": False,
+                                           "isTerminalFailure": True}}
+    _pending_order["poll_count"] += 1
+    if _pending_order["poll_count"] < 2:
+        return {"success": True, "data": {"status": "pending", "terminal": False, "isTerminalSuccess": False,
+                                           "isTerminalFailure": False}}
+    return {
+        "success": True,
+        "data": {
+            "status": "success", "terminal": True, "isTerminalSuccess": True, "isTerminalFailure": False,
+            "confirmed": False, "orderStatus": "PENDING_CONFIRMATION",
+        },
+    }
+
+
+@app.tool()
+def confirm_order(orderId: str, addressId: str, lat: float = None, lng: float = None, cartId: str = None) -> dict:
+    """Mock confirm_order -- clears the cart (the order is "placed") and
+    marks the pending mock order confirmed. Idempotent, like the real tool."""
+    if orderId == _pending_order.get("order_id"):
+        _pending_order["confirmed"] = True
+    _cart_state["items"] = []
+    _cart_state["coupon_code"] = None
+    _cart_state["coupon_discount"] = 0
+    return {
+        "success": True,
+        "data": {"orderId": orderId, "orderStatus": "CONFIRMED", "result": "success"},
+        "message": "Order confirmed",
+    }
+
+
 if __name__ == "__main__":
     app.run(
         transport="streamable-http",
