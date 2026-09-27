@@ -1590,14 +1590,23 @@ class VariantThenAddonFlowTests(unittest.TestCase):
             },
         },
     }
-    # Swiggy's OWN filtered view once the 6-slice variant is in the cart --
-    # deliberately excludes the 8-slice "Booster" group entirely.
+    # Swiggy's REAL (unfiltered) valid_addons once the 6-slice variant lands
+    # in the cart -- live evidence (logger.txt 2026-09-27) shows Swiggy does
+    # NOT scope this down to the chosen variant: it lists every sibling
+    # size's groups at once, so the 8-slice-only "Booster" group is present
+    # right alongside the 6-slice "Napoli Veg" group. The app itself must
+    # filter this (see _addon_groups_matching_variant), or a pick spanning
+    # both groups gets accepted then invalidates the whole cart.
     _VALID_ADDONS_FOR_6_SLICE = {
         "152977469": {"variants": [], "addons": [], "valid_addons": [
             {"group_id": "254031236", "group_name": "Napoli Veg [6 slices]",
              "min_addons": 0, "max_addons": 2,
              "choices": [{"id": "141009291", "name": "Extra Cheese", "price_inr": 95.0,
                           "group_id": "254031236", "raw": {}}]},
+            {"group_id": "285951665", "group_name": "Booster [8 Slices]",
+             "min_addons": 0, "max_addons": 11,
+             "choices": [{"id": "141009301", "name": "Hot Honey", "price_inr": 35.0,
+                          "group_id": "285951665", "raw": {}}]},
         ]},
     }
 

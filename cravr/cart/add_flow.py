@@ -474,6 +474,47 @@ def _variant_shapes(variant_picks: list[dict[str, Any]]) -> list[tuple[str, str,
     ]
 
 
+def _addon_groups_matching_variant(
+    addon_groups: list[dict[str, Any]], variant_groups: list[dict[str, Any]],
+    chosen: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Swiggy's own valid_addons (from get_cart_item_details, right after
+    the variant-only add lands) does NOT get filtered down to the variant
+    just chosen -- it lists every add-on group for EVERY sibling variant at
+    once. Live evidence (logger.txt 2026-09-27): after picking '8 Slices'
+    for 'Classic Margherita Pizza', valid_addons still carried BOTH
+    'Napoli Veg [6 slices]' and 'Napoli Veg [8 slices]', and BOTH
+    'Booster[6 Slices]' and 'Booster [8 Slices]'. Answering with picks from
+    both sibling sets got the whole cart invalidated (INVALID_ADDON) on the
+    very next read, same failure mode as never asking for a variant at all.
+
+    Swiggy spells out which sibling a group belongs to right in the group's
+    own name ('<label> [<size>]' / '<label>[<size>]'), so this drops any
+    group whose name mentions a DIFFERENT sibling choice than the one just
+    picked. A group naming no sibling at all (Sides, Desserts, Add Drinks)
+    or naming the chosen sibling is kept. `chosen` and each variant group's
+    `choices` are both _ask_for_all_addons-shaped entries."""
+    chosen_names = {str(c.get("name") or "").strip().lower() for c in chosen}
+    sibling_names: set[str] = set()
+    for vg in variant_groups:
+        for c in vg.get("choices") or []:
+            name = str(c.get("name") or "").strip().lower()
+            if name and name not in chosen_names:
+                sibling_names.add(name)
+    if not sibling_names:
+        return addon_groups
+
+    def names_a_sibling(group_name: str) -> bool:
+        gn = (group_name or "").lower()
+        return any(sib in gn for sib in sibling_names)
+
+    kept = [g for g in addon_groups if not names_a_sibling(g.get("group_name") or "")]
+    dropped = [g.get("group_name") for g in addon_groups if names_a_sibling(g.get("group_name") or "")]
+    if dropped:
+        debug("cart_agent", f"addon-diag filtered out addon groups belonging to a different variant: {dropped!r}")
+    return kept
+
+
 def _add_item_with_variant(
     restaurant_id: str, address_id: str, restaurant_name: str | None,
     item_name: str, menu_item_id: str, quantity: int, variant_groups: list[dict[str, Any]],
@@ -580,6 +621,9 @@ def _add_item_with_variant(
     valid = detail.get("valid_addons") or []
     debug("cart_agent", f"addon-diag variant landed -- valid_addons for THIS variant: "
           f"{[(g.get('group_id'), g.get('group_name'), len(g.get('choices') or [])) for g in valid]!r}")
+    valid = _addon_groups_matching_variant(valid, variant_groups, selected_variants)
+    debug("cart_agent", f"addon-diag valid_addons after filtering to the chosen variant: "
+          f"{[(g.get('group_id'), g.get('group_name')) for g in valid]!r}")
     if not valid:
         return result, [], "", existing_items
 
