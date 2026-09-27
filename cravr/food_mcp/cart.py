@@ -38,10 +38,27 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
         arguments["restaurantName"] = restaurant_name
 
     try:
-        raw = _call_tool("get_food_cart", arguments, log_request=True)
+        raw, meta = _call_tool("get_food_cart", arguments, log_request=True, return_meta=True)
     except Exception as exc:
         debug("food_mcp", f"get_food_cart FAILED: {exc}")
         return {"status": "error", "message": f"Unable to retrieve cart: {exc}"}
+
+    # get_food_cart's content[].text is a human-readable summary meant for
+    # the chat transcript ("Items (1): ... "), not necessarily JSON -- the
+    # real, complete cart (items, pricing, etc.) lives in the MCP result's
+    # own structured_content instead. _call_tool's plain `raw` only ever
+    # looks at that text, so whenever it isn't valid JSON (increasingly the
+    # normal case), `raw` comes back as a bare string and the parsing below
+    # used to build an empty items=[] cart even with real items in it --
+    # which made "Proceed" wrongly claim the cart was empty, and hid every
+    # item's add-ons from the cart view. get_cart_item_details and
+    # update_cart already read structured_content directly for the same
+    # reason; do the same here whenever it actually carries cart data (a
+    # genuinely empty cart's structured_content has data=None, so this
+    # correctly falls through to the text-mode "Cart is empty" handling).
+    structured = meta.get("structured_content") if isinstance(meta, dict) else None
+    if isinstance(structured, dict) and isinstance(structured.get("data"), dict):
+        raw = structured
 
     if isinstance(raw, str):
         message = _strip_widget_disclaimer(raw)

@@ -1723,6 +1723,7 @@ class CheckoutFlowTests(unittest.TestCase):
     ADDRESS = {"status": "success", "location": "Home", "delivery_area": "S-27/3, DLF Phase 3", "address_id": "addr1"}
     BOTH_METHODS_AVAILABLE = {"status": "success", "cod_available": True, "upi_available": True, "payment_amount": 557}
     NEITHER_METHOD_AVAILABLE = {"status": "success", "cod_available": False, "upi_available": False}
+    NO_ITEM_DETAILS: dict = {}
 
     COD_SUCCESS = {
         "status": "success", "order_id": "ORD-COD-1", "swiggy_status": "CONFIRMED",
@@ -1742,7 +1743,7 @@ class CheckoutFlowTests(unittest.TestCase):
     }
     CONFIRM_SUCCESS = {"status": "success", "order_id": "ORD-UPI-1", "order_status": "CONFIRMED", "message": "ok"}
 
-    def _start(self, cart=None, address=None, payment_options=None):
+    def _start(self, cart=None, address=None, payment_options=None, item_details=None):
         """Invokes the real graph up to (and including) the payment-method
         interrupt -- run_checkout always asks before doing anything real,
         so every non-trivial test needs the full interrupt/resume dance,
@@ -1752,6 +1753,8 @@ class CheckoutFlowTests(unittest.TestCase):
         patches = [
             patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=cart or self.NON_EMPTY_CART),
             patch("cravr.cart.CartAgent.food_mcp.get_saved_address", return_value=address or self.ADDRESS),
+            patch("cravr.cart.CartAgent.food_mcp.get_cart_item_details",
+                  return_value=self.NO_ITEM_DETAILS if item_details is None else item_details),
             patch("cravr.cart.CartAgent.food_mcp.get_payment_options",
                   return_value=payment_options or self.BOTH_METHODS_AVAILABLE),
         ]
@@ -1760,6 +1763,23 @@ class CheckoutFlowTests(unittest.TestCase):
             self.addCleanup(p.stop)
         first = cravr_app.invoke(state, config=config)
         return first, config
+
+    def _pay_upi(self, config, *, paid: bool = True):
+        """Resumes past the payment-method question with "upi" -- that step
+        runs BEFORE place_order, so it's a real interrupt()/resume, safe to
+        replay. What follows ("I've paid" / "Cancel") is NOT an interrupt:
+        place_order already ran by then, and LangGraph replays a node's
+        earlier code whenever a LATER interrupt in the same invocation is
+        resumed -- an interrupt() here would have replayed (and re-run)
+        place_order itself (see checkout.py's module docstring for the bug
+        this caused and the fix). So it's a plain reply + a next-step
+        button instead, meaning confirming or cancelling is a FRESH graph
+        invocation carrying the sentinel value as an ordinary chat message,
+        not a Command(resume=...)."""
+        pending = cravr_app.invoke(Command(resume="upi"), config=config)
+        value = CartAgent.CART_UPI_PAID_VALUE if paid else CartAgent.CART_UPI_NOT_PAID_VALUE
+        final = cravr_app.invoke({"messages": [HumanMessage(content=value)]}, config=config)
+        return pending, final
 
     def test_empty_cart_never_reaches_the_payment_question(self):
         with patch("cravr.cart.CartAgent.food_mcp.get_cart",
@@ -1791,6 +1811,28 @@ class CheckoutFlowTests(unittest.TestCase):
         labels = {o["label"] for o in payload["options"]}
         self.assertEqual(labels, {"Cash on Delivery", "UPI (scan to pay)", "Cancel — don't place the order"})
 
+    def test_order_summary_shows_the_chosen_variant_and_addons_per_item(self):
+        """Regression guard: the order summary must show what was actually
+        picked (size, add-ons), sourced from get_cart_item_details -- not
+        just the item name and price, which says nothing about a size
+        choice or add-ons that change what's actually being ordered."""
+        cart_with_pizza = {
+            "status": "success",
+            "items": [{"item_name": "Classic Margherita Pizza", "menu_item_id": "152977469",
+                       "quantity": 1, "total": 695, "final_price": 695}],
+            "pricing": {"to_pay": 752},
+        }
+        item_details = {
+            "152977469": {
+                "variants": [{"name": "8 Slices", "variation_id": 68366800, "group_id": 68366736}],
+                "addons": [{"id": 141009291, "name": "Extra Cheese", "group_id": 254031236}],
+            },
+        }
+        first, _config = self._start(cart=cart_with_pizza, item_details=item_details)
+        question = first["__interrupt__"][0].value["question"]
+        self.assertIn("Classic Margherita Pizza x1 — ₹695 (8 Slices)", question)
+        self.assertIn("+ Extra Cheese", question)
+
     def test_cancel_leaves_the_cart_untouched_and_never_places_an_order(self):
         _first, config = self._start()
         with patch("cravr.cart.CartAgent.food_mcp.place_order") as mock_place:
@@ -1812,13 +1854,45 @@ class CheckoutFlowTests(unittest.TestCase):
         self.assertIn("ORD-COD-1", content)
         self.assertIn("35-40 mins", content)
 
+    def test_upi_shows_the_payment_link_and_waits_before_polling_at_all(self):
+        """The whole point of asking "I've paid" first: check_payment_status
+        must not be called until the user has actually had a chance to see
+        the payment link and act on it -- a chat turn can't show anything
+        while it's blocked inside the polling loop, so polling before this
+        step would mean the user never even saw where to pay. This step is
+        a plain reply + next-step button (NOT an interrupt) since place_order
+        has already run by this point -- see checkout.py's module docstring."""
+        _first, config = self._start()
+        with patch("cravr.cart.CartAgent.food_mcp.place_order", return_value=self.UPI_PENDING), \
+             patch("cravr.cart.CartAgent.food_mcp.check_payment_status") as mock_status:
+            pending = cravr_app.invoke(Command(resume="upi"), config=config)
+        mock_status.assert_not_called()
+        self.assertFalse(pending.get("__interrupt__"))
+        self.assertIn("https://pay.example/xyz", pending["messages"][-1].content)
+        cart_state = pending.get("cart_state") or {}
+        self.assertEqual(
+            {o["label"] for o in cart_state.get("options") or []},
+            {"I've paid", "Cancel — I haven't paid"},
+        )
+        self.assertEqual((cart_state.get("pending_upi_order") or {}).get("order_id"), "ORD-UPI-1")
+
+    def test_declining_i_have_paid_never_polls_or_confirms(self):
+        _first, config = self._start()
+        with patch("cravr.cart.CartAgent.food_mcp.place_order", return_value=self.UPI_PENDING), \
+             patch("cravr.cart.CartAgent.food_mcp.check_payment_status") as mock_status, \
+             patch("cravr.cart.CartAgent.food_mcp.confirm_order") as mock_confirm:
+            _pending, final = self._pay_upi(config, paid=False)
+        mock_status.assert_not_called()
+        mock_confirm.assert_not_called()
+        self.assertIn("ORD-UPI-1", final["messages"][-1].content)
+
     def test_upi_polls_once_then_confirms_on_a_terminal_success(self):
         _first, config = self._start()
         with patch("cravr.cart.CartAgent.food_mcp.place_order", return_value=self.UPI_PENDING) as mock_place, \
              patch("cravr.cart.CartAgent.food_mcp.check_payment_status",
                    return_value=self.PAYMENT_SUCCESS_TERMINAL) as mock_status, \
              patch("cravr.cart.CartAgent.food_mcp.confirm_order", return_value=self.CONFIRM_SUCCESS) as mock_confirm:
-            final = cravr_app.invoke(Command(resume="upi"), config=config)
+            _pending, final = self._pay_upi(config)
         mock_place.assert_called_once_with("addr1", "UPI", generate_upi_qr=True)
         mock_status.assert_called_once_with(
             "PAAS-1", order_id="ORD-UPI-1", address_id="addr1", lat=12.93, lng=77.61, cart_id="CART-1",
@@ -1834,7 +1908,7 @@ class CheckoutFlowTests(unittest.TestCase):
              patch("cravr.cart.CartAgent.food_mcp.check_payment_status",
                    return_value=self.PAYMENT_FAILED_TERMINAL), \
              patch("cravr.cart.CartAgent.food_mcp.confirm_order") as mock_confirm:
-            final = cravr_app.invoke(Command(resume="upi"), config=config)
+            _pending, final = self._pay_upi(config)
         mock_confirm.assert_not_called()
         self.assertIn("didn't go through", final["messages"][-1].content)
 
@@ -1854,3 +1928,125 @@ class CheckoutFlowTests(unittest.TestCase):
         mock_status.assert_not_called()
         mock_confirm.assert_not_called()
         self.assertIn("TEST MODE", final["messages"][-1].content)
+
+
+class GetCartFallsBackToStructuredContentTests(unittest.TestCase):
+    """Live regression (2026-09-27, Veg Ramen Bowl, see logger.txt):
+    get_food_cart's content[].text is a human-readable summary for the chat
+    transcript ("Items (1): ..."), not JSON -- the real, complete cart
+    (items, pricing) lives in the MCP result's own structured_content.
+    Before this fix, get_cart only ever looked at that text, so a non-empty
+    cart still came back as status='text' with items=[] -- which made
+    checkout.run_checkout's `not cart.get("items")` guard wrongly claim the
+    cart was empty on "Proceed", and hid every item (so its add-ons too)
+    from the plain cart view. get_cart_item_details and update_cart already
+    read structured_content directly for the same reason (see
+    CartItemDetailsParsingTests above) -- get_cart must too."""
+
+    def _fake_result(self, text, structured):
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)],
+            structured_content=structured, data=structured, is_error=False, meta=None,
+        )
+
+    def test_non_empty_cart_uses_structured_data_not_the_lossy_text_summary(self):
+        structured = {
+            "statusCode": 0, "statusMessage": "CART_UPDATED_SUCCESSFULLY", "addressId": "addr1",
+            "data": {
+                "cart_id": 1663405713, "restaurant": {"id": "R1"},
+                "items": [{"menu_item_id": 196112131, "name": "Veg Ramen Bowl", "quantity": 1,
+                           "total": 711.45, "final_price": 689, "in_stock": 1}],
+                "item_count": 1,
+                "pricing": {"item_total": 689, "delivery_charge": 105, "taxes_and_charges": 94.9, "to_pay": 889},
+                "offers": {"coupon_applied": None, "coupon_discount": 0},
+            },
+        }
+        result_obj = self._fake_result("Items (1):\n  - Veg Ramen Bowl — ₹689 (ID: 196112131)", structured)
+        with patch("cravr.food_mcp.call_tool_sync", return_value=result_obj):
+            result = food_mcp.get_cart("addr1")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["menu_item_id"], 196112131)
+        self.assertEqual(result["pricing"]["to_pay"], 889)
+
+    def test_genuinely_empty_cart_still_uses_the_text_summary(self):
+        """structured_content is present even for an empty cart, but its
+        own `data` is None -- must still fall through to the existing
+        text-mode 'Cart is empty' handling rather than misreporting it as
+        the (impossible) json-mode 'error' or 'success' outcome."""
+        structured = {"statusCode": 0, "statusMessage": "CART", "data": None}
+        result_obj = self._fake_result(
+            "Cart is empty.\n\nCart widget is displayed — do not repeat the cart items.", structured,
+        )
+        with patch("cravr.food_mcp.call_tool_sync", return_value=result_obj):
+            result = food_mcp.get_cart("addr1")
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["items"], [])
+
+
+class CheckoutSeesTheRealCartAfterTheStructuredContentFixTests(unittest.TestCase):
+    """End-to-end guard for the "Proceed" bug: run_checkout must not refuse
+    a non-empty cart just because get_food_cart's own text summary wasn't
+    JSON (the exact live failure -- see GetCartFallsBackToStructuredContentTests)."""
+
+    def test_proceed_reaches_the_payment_question_from_a_text_summary_cart(self):
+        structured = {
+            "statusCode": 0, "addressId": "addr1",
+            "data": {
+                "items": [{"menu_item_id": 196112131, "name": "Veg Ramen Bowl", "quantity": 1,
+                           "total": 689, "final_price": 689, "in_stock": 1}],
+                "item_count": 1, "pricing": {"to_pay": 889}, "offers": {},
+            },
+        }
+        result_obj = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="Items (1):\n  - Veg Ramen Bowl — ₹689")],
+            structured_content=structured, data=structured, is_error=False, meta=None,
+        )
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        state = _state(CartAgent.CART_PROCEED_VALUE)
+        with patch("cravr.food_mcp.call_tool_sync", return_value=result_obj), \
+             patch("cravr.cart.CartAgent.food_mcp.get_saved_address",
+                   return_value={"status": "success", "location": "Home", "delivery_area": "Area"}), \
+             patch("cravr.cart.CartAgent.food_mcp.get_cart_item_details", return_value={}), \
+             patch("cravr.cart.CartAgent.food_mcp.get_payment_options",
+                   return_value={"status": "success", "cod_available": True, "upi_available": True}):
+            result = cravr_app.invoke(state, config=config)
+        self.assertTrue(result.get("__interrupt__"), "checkout must ask how to pay, not claim the cart is empty")
+        payload = result["__interrupt__"][0].value
+        self.assertIn("Veg Ramen Bowl", payload["question"])
+
+
+class CartViewShowsAddonsTests(unittest.TestCase):
+    """The plain 'show my cart' view (not just the checkout summary) must
+    also show each item's chosen add-ons/variant -- sourced from
+    get_cart_item_details via the shared _item_lines helper -- so a user
+    isn't left thinking an add-on selection was lost just because the cart
+    view never mentioned it (the other half of the live "addon" report:
+    the add-ons genuinely landed in the real Swiggy cart, but nothing in
+    the reply ever said so)."""
+
+    def test_show_cart_lists_addons_under_the_item(self):
+        cart = {
+            "status": "success",
+            "items": [{"item_name": "Veg Ramen Bowl", "menu_item_id": "196112131",
+                       "quantity": 1, "total": 689, "final_price": 689}],
+            "pricing": {"to_pay": 889},
+        }
+        item_details = {
+            "196112131": {"variants": [], "addons": [
+                {"name": "Veg Steam Momos (2)"}, {"name": "Coke (300 Ml Can)"}, {"name": "Sprite (300 Ml Can)"},
+            ]},
+        }
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart", return_value=cart), \
+             patch("cravr.cart.CartAgent.food_mcp.get_cart_item_details", return_value=item_details):
+            result = cart_agent_node(_state("show my cart"))
+        content = result["messages"][0].content
+        self.assertIn("Veg Ramen Bowl x1 — ₹689", content)
+        self.assertIn("+ Veg Steam Momos (2), Coke (300 Ml Can), Sprite (300 Ml Can)", content)
+
+    def test_show_cart_skips_the_item_details_lookup_when_the_cart_is_empty(self):
+        with patch("cravr.cart.CartAgent.food_mcp.get_cart",
+                   return_value={"status": "empty", "message": "Cart is empty."}), \
+             patch("cravr.cart.CartAgent.food_mcp.get_cart_item_details") as mock_details:
+            cart_agent_node(_state("show my cart"))
+        mock_details.assert_not_called()

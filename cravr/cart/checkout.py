@@ -38,7 +38,7 @@ from langgraph.types import interrupt
 from .. import food_mcp
 from ..debug_utils import debug, test_mode_enabled
 from ..options import resolve_option_choice
-from .display import _cart_reply
+from .display import _cart_reply, _item_lines
 from .routing import _UPI_CONFIRM_OPTIONS
 
 _PAY_COD = "cod"
@@ -59,21 +59,8 @@ def _order_summary(cart: dict[str, Any], address: dict[str, Any], item_details: 
     chosen variant and add-ons -- shown right under its line -- so the user
     confirms exactly what they picked, not just names and prices."""
     items = cart.get("items") or []
-    item_details = item_details or {}
     if items:
-        lines = []
-        for i in items:
-            lines.append(
-                f"  - {i.get('item_name')} x{i.get('quantity', 1)} — ₹{i.get('total', i.get('final_price', 0))}"
-            )
-            detail = item_details.get(str(i.get("menu_item_id"))) or {}
-            variant_names = [v.get("name") for v in (detail.get("variants") or []) if v.get("name")]
-            if variant_names:
-                lines[-1] += f" ({', '.join(variant_names)})"
-            addon_names = [a.get("name") for a in (detail.get("addons") or []) if a.get("name")]
-            if addon_names:
-                lines.append(f"      + {', '.join(addon_names)}")
-        body = "Here's what you're about to order:\n" + "\n".join(lines)
+        body = "Here's what you're about to order:\n" + "\n".join(_item_lines(items, item_details))
     else:
         body = cart.get("message") or ""
     pricing = cart.get("pricing") or {}
