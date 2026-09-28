@@ -1848,7 +1848,10 @@ class CheckoutFlowTests(unittest.TestCase):
         self.assertIn("**Total to pay:** ₹557", payload["question"])
         self.assertIn("Home", payload["question"])
         labels = {o["label"] for o in payload["options"]}
-        self.assertEqual(labels, {"Cash on Delivery", "UPI (scan to pay)", "Cancel — don't place the order"})
+        self.assertEqual(
+            labels,
+            {"Cash on Delivery", "UPI (scan to pay)", "Clear my cart", "Cancel — don't place the order"},
+        )
 
     def test_order_summary_shows_the_chosen_variant_and_addons_per_item(self):
         """Regression guard: the order summary must show what was actually
@@ -1878,6 +1881,30 @@ class CheckoutFlowTests(unittest.TestCase):
             final = cravr_app.invoke(Command(resume="__cancel_checkout__"), config=config)
         mock_place.assert_not_called()
         self.assertIn("didn't place the order", final["messages"][-1].content)
+
+    def test_clear_my_cart_button_flushes_the_cart_and_never_places_an_order(self):
+        """The "Clear my cart" button on the final order/payment question --
+        looking at the whole order is exactly when someone decides they
+        don't want any of it, so this offers clearing it right there
+        instead of a separate command afterward. Must flush the cart, and
+        must never call place_order -- clearing isn't a payment choice."""
+        _first, config = self._start()
+        with patch("cravr.cart.CartAgent.food_mcp.flush_cart",
+                   return_value={"status": "success", "message": "Cart cleared."}) as mock_flush, \
+             patch("cravr.cart.CartAgent.food_mcp.place_order") as mock_place:
+            final = cravr_app.invoke(Command(resume="__checkout_clear_cart__"), config=config)
+        mock_flush.assert_called_once()
+        mock_place.assert_not_called()
+        self.assertIn("Cart cleared.", final["messages"][-1].content)
+        self.assertEqual(final["cart_state"]["items"], [])
+
+    def test_clear_my_cart_button_surfaces_a_flush_failure(self):
+        _first, config = self._start()
+        with patch("cravr.cart.CartAgent.food_mcp.flush_cart",
+                   return_value={"status": "error", "message": "network timeout"}):
+            final = cravr_app.invoke(Command(resume="__checkout_clear_cart__"), config=config)
+        self.assertIn("Couldn't clear the cart", final["messages"][-1].content)
+        self.assertIn("network timeout", final["messages"][-1].content)
 
     def test_cod_places_a_real_order_immediately_with_no_polling(self):
         _first, config = self._start()

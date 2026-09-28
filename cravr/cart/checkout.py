@@ -43,6 +43,7 @@ from .routing import _UPI_CONFIRM_OPTIONS
 
 _PAY_COD = "cod"
 _PAY_UPI = "upi"
+_PAY_CLEAR_CART = "__checkout_clear_cart__"
 _PAY_CANCEL = "__cancel_checkout__"
 
 # Gentle defaults if Swiggy's own place_order response doesn't say --
@@ -87,6 +88,11 @@ def _payment_method_options(payment_options: dict[str, Any]) -> list[dict[str, s
         options.append({"value": _PAY_COD, "label": "Cash on Delivery"})
     if unknown or payment_options.get("upi_available"):
         options.append({"value": _PAY_UPI, "label": "UPI (scan to pay)"})
+    # Right here -- looking at the final order -- is exactly when someone
+    # decides they don't want any of it, so offer clearing the cart as its
+    # own button rather than making them go find a separate "clear cart"
+    # command afterward.
+    options.append({"value": _PAY_CLEAR_CART, "label": "Clear my cart"})
     options.append({"value": _PAY_CANCEL, "label": "Cancel — don't place the order"})
     return options
 
@@ -108,7 +114,9 @@ def run_checkout(address_id: str) -> dict:
     if payment_options.get("status") != "success":
         debug("cart_agent", f"checkout: get_payment_options FAILED: {payment_options.get('message')!r}")
     options = _payment_method_options(payment_options)
-    if len(options) == 1:  # only "Cancel" -- Swiggy is offering neither Cash nor UPI right now
+    if not any(o["value"] in (_PAY_COD, _PAY_UPI) for o in options):
+        # Neither Cash nor UPI is offered -- only "Clear my cart"/"Cancel"
+        # are left, and neither of those is a way to pay.
         return _cart_reply(
             "Checkout isn't available for this cart right now (Swiggy isn't offering Cash or UPI for it) "
             "-- try again in a bit, or finish the order in the Swiggy app."
@@ -124,6 +132,9 @@ def run_checkout(address_id: str) -> dict:
     debug("cart_agent", f"checkout: payment choice raw_answer={raw_answer!r}")
     choice = resolve_option_choice(str(raw_answer), options)
 
+    if choice == _PAY_CLEAR_CART:
+        return _clear_cart_at_checkout()
+
     if choice not in (_PAY_COD, _PAY_UPI):
         return _cart_reply("Okay, I didn't place the order -- your cart's untouched.")
 
@@ -131,6 +142,20 @@ def run_checkout(address_id: str) -> dict:
         return _run_test_mode_order(choice, cart)
 
     return _run_real_order(choice, address_id)
+
+
+def _clear_cart_at_checkout() -> dict:
+    """Handles the "Clear my cart" button on the order summary/payment
+    question -- same flush_cart used by the ordinary "clear my cart" chat
+    command (node.py's "clear" action), offered right here too since
+    looking at the final order is exactly when someone decides they don't
+    want any of it. Never calls place_order -- nothing about it is a
+    payment choice."""
+    result = food_mcp.flush_cart()
+    debug("cart_agent", f"checkout: 'Clear my cart' button -> flush_cart {result!r}")
+    if result.get("status") != "success":
+        return _cart_reply(f"Couldn't clear the cart: {result.get('message', 'unknown error')}")
+    return _cart_reply(result.get("message") or "Your cart is now empty.", items=[], pricing={})
 
 
 def _run_test_mode_order(choice: str, cart: dict[str, Any]) -> dict:
