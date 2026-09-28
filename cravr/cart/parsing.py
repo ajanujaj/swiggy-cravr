@@ -20,22 +20,6 @@ def _parse_existing_cart_items(cart_message: str) -> list[dict[str, Any]]:
 
 
 def _existing_cart_items(cart: dict[str, Any]) -> list[dict[str, Any]]:
-    """The current cart's items as {"menu_item_id", "quantity"} dicts, for
-    building a merged cartItems payload before an update_cart call, or for
-    verifying an item actually landed after one. Prefers food_mcp.get_cart's
-    own structured `items` list -- reliable now that get_cart reads
-    Swiggy's structured_content directly rather than only its
-    human-readable text (see food_mcp/cart.py) -- and falls back to
-    regex-parsing `message` only for the residual case where get_cart
-    genuinely had nothing but text to work with (status == "text").
-    get_cart's `message` is None whenever it already parsed real items, so
-    parsing it unconditionally (the old code at every call site here) saw
-    an empty cart any time get_cart succeeded via structured data instead
-    of text -- silently dropping whatever was already in the cart on the
-    next merged update_cart call, or wrongly refusing an add-on attempt
-    that had actually landed (live regression, 2026-09-27: an add-on going
-    out of stock made update_cart's own response json-mode-parseable, and
-    the "verify it landed" check here then saw an empty cart)."""
     items = cart.get("items")
     if items:
         parsed = [

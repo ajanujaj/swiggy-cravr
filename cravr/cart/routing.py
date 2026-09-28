@@ -50,13 +50,6 @@ _NEXT_STEP_OPTIONS = [
     {"value": CART_START_OVER_VALUE, "label": "Browse other restaurants"},
 ]
 
-# Offered by checkout.py's own reply once a UPI order is PENDING_PAYMENT --
-# a plain next-step-button choice (fresh graph invoke), never an
-# interrupt()/resume: place_food_order is a real, non-idempotent write, and
-# LangGraph replays a node's earlier code on every resume of a LATER
-# interrupt in the same invocation (see checkout.py's module docstring), so
-# an interrupt() placed after place_order would risk placing the order a
-# second time. Routing it as a fresh invocation instead sidesteps that.
 _UPI_CONFIRM_OPTIONS = [
     {"value": CART_UPI_PAID_VALUE, "label": "I've paid"},
     {"value": CART_UPI_NOT_PAID_VALUE, "label": "Cancel — I haven't paid"},

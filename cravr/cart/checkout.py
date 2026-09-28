@@ -1,33 +1,3 @@
-"""The "Proceed" checkout flow: show the order + delivery address, ask how
-to pay, place the order, and (UPI only) wait for payment then confirm.
-Wired from cart_agent_node's "checkout"/"upi_paid"/"upi_not_paid" actions
-(routing.py's CART_PROCEED_VALUE / CART_UPI_PAID_VALUE /
-CART_UPI_NOT_PAID_VALUE) -- see node.py.
-
-Swiggy has no sandbox/dummy-payment mode (checked their docs at the user's
-request): place_food_order always creates a REAL order -- Cash on Delivery
-dispatches an actual delivery that needs real cash, UPI moves real money.
-With CRAVR_TEST_MODE=1 (see debug_utils.test_mode_enabled), this module
-fabricates the same-shaped responses instead of ever calling place_order /
-confirm_order / check_payment_status, so the whole conversation flow can be
-exercised safely. Never set that env var in production (e.g. on Render).
-
-IMPORTANT -- why the UPI "have you paid?" step is a NEXT-STEP BUTTON
-(cart_state["options"], a fresh graph invoke) and not an interrupt()/resume:
-LangGraph replays a node function's earlier code from the top whenever a
-LATER interrupt() in that same invocation gets resumed (see add_flow.py's
-own notes on this). Every OTHER real call in this module -- get_cart,
-get_saved_address, get_cart_item_details, get_payment_options,
-check_payment_status -- is a read, safe to run twice. place_order is not:
-it's the one call that creates a new, real order each time it runs. So no
-interrupt() may ever sit after place_order() in the same function call --
-one did in an earlier version of this file, and it made place_order fire
-TWICE (once for the initial "upi" resume reaching that interrupt, again
-when THAT interrupt itself got resumed), i.e. two real orders from a single
-UPI checkout. Ending the turn with a plain reply + cart_state["options"]
-instead starts a brand-new invocation on the next button tap, so nothing
-upstream of it ever replays."""
-
 from __future__ import annotations
 
 import time
@@ -46,9 +16,6 @@ _PAY_UPI = "upi"
 _PAY_CLEAR_CART = "__checkout_clear_cart__"
 _PAY_CANCEL = "__cancel_checkout__"
 
-# Gentle defaults if Swiggy's own place_order response doesn't say --
-# never tight-loop, and never block a chat turn forever even if
-# maxTimeToPollForInMs comes back missing or absurd.
 _DEFAULT_POLL_INTERVAL_MS = 4000
 _MAX_TOTAL_POLL_MS = 3 * 60 * 1000
 
@@ -56,15 +23,6 @@ _FAKE_ORDER_ID = "TEST-ORDER-0001"
 
 
 def _order_summary(cart: dict[str, Any], address: dict[str, Any], item_details: dict[str, Any] | None = None) -> str:
-    """Item lines plus, when known (via get_cart_item_details), each item's
-    chosen variant and add-ons -- shown right under its line -- so the user
-    confirms exactly what they picked, not just names and prices. Built as
-    separate markdown sections (order / total / delivery address) joined by
-    blank lines -- packing everything onto one or two lines with no blank
-    lines between them is exactly what made a real checkout summary render
-    as one run-on paragraph (a list needs a blank line to end, or whatever
-    follows gets swallowed into the last bullet); see _item_lines for why
-    bullets, never numbers, are used for the items themselves."""
     items = cart.get("items") or []
     if items:
         sections = ["**Your order:**\n\n" + "\n".join(_item_lines(items, item_details))]
@@ -80,18 +38,12 @@ def _order_summary(cart: dict[str, Any], address: dict[str, Any], item_details: 
 
 
 def _payment_method_options(payment_options: dict[str, Any]) -> list[dict[str, str]]:
-    # If get_payment_options itself failed we still let the user try --
-    # place_food_order will say plainly if a method really isn't available.
     unknown = payment_options.get("status") != "success"
     options = []
     if unknown or payment_options.get("cod_available"):
         options.append({"value": _PAY_COD, "label": "Cash on Delivery"})
     if unknown or payment_options.get("upi_available"):
         options.append({"value": _PAY_UPI, "label": "UPI (scan to pay)"})
-    # Right here -- looking at the final order -- is exactly when someone
-    # decides they don't want any of it, so offer clearing the cart as its
-    # own button rather than making them go find a separate "clear cart"
-    # command afterward.
     options.append({"value": _PAY_CLEAR_CART, "label": "Clear my cart"})
     options.append({"value": _PAY_CANCEL, "label": "Cancel — don't place the order"})
     return options
@@ -115,8 +67,6 @@ def run_checkout(address_id: str) -> dict:
         debug("cart_agent", f"checkout: get_payment_options FAILED: {payment_options.get('message')!r}")
     options = _payment_method_options(payment_options)
     if not any(o["value"] in (_PAY_COD, _PAY_UPI) for o in options):
-        # Neither Cash nor UPI is offered -- only "Clear my cart"/"Cancel"
-        # are left, and neither of those is a way to pay.
         return _cart_reply(
             "Checkout isn't available for this cart right now (Swiggy isn't offering Cash or UPI for it) "
             "-- try again in a bit, or finish the order in the Swiggy app."
@@ -145,12 +95,6 @@ def run_checkout(address_id: str) -> dict:
 
 
 def _clear_cart_at_checkout() -> dict:
-    """Handles the "Clear my cart" button on the order summary/payment
-    question -- same flush_cart used by the ordinary "clear my cart" chat
-    command (node.py's "clear" action), offered right here too since
-    looking at the final order is exactly when someone decides they don't
-    want any of it. Never calls place_order -- nothing about it is a
-    payment choice."""
     result = food_mcp.flush_cart()
     debug("cart_agent", f"checkout: 'Clear my cart' button -> flush_cart {result!r}")
     if result.get("status") != "success":
@@ -185,18 +129,9 @@ def _run_real_order(choice: str, address_id: str) -> dict:
     if order.get("status") == "error":
         return _cart_reply(f"Couldn't place the order: {order.get('message', 'unknown error')}")
 
-    if order.get("status") == "success":  # Cash: placed immediately
+    if order.get("status") == "success":
         return _order_placed_reply(order, "Cash on Delivery")
 
-    # UPI: PENDING_PAYMENT. check_payment_status's own polling window is
-    # short (Swiggy's maxTimeToPollForInMs, typically ~2 minutes) and this
-    # chat turn can't show the user anything WHILE it's blocked inside that
-    # loop -- so show the payment link now and end THIS turn with a plain
-    # "I've paid" / "Cancel" button choice (never an interrupt() -- see the
-    # module docstring for why place_order must not be replayable). The
-    # pending order's identifiers ride along in cart_state so the next tap
-    # (a fresh invocation -- see node.py's "upi_paid" action) can pick the
-    # polling back up without ever calling place_order again.
     bridge_url = order.get("bridge_url")
     content = f"Order created (ID: {order.get('order_id')}) — complete the payment to confirm it."
     if bridge_url:
@@ -206,10 +141,6 @@ def _run_real_order(choice: str, address_id: str) -> dict:
 
 
 def resume_upi_payment(cart_state: dict[str, Any], address_id: str) -> dict:
-    """Handles node.py's "upi_paid" action -- the user tapped "I've paid" on
-    the reply _run_real_order left behind. A fresh invocation (see this
-    module's docstring on why), so it reconstructs the pending order from
-    cart_state rather than anything computed earlier in a call stack."""
     order = cart_state.get("pending_upi_order")
     if not isinstance(order, dict) or not order.get("paas_id"):
         return _cart_reply("I don't have a pending UPI payment to check -- try checking out again.")
@@ -219,9 +150,6 @@ def resume_upi_payment(cart_state: dict[str, Any], address_id: str) -> dict:
 
 
 def cancel_upi_payment(cart_state: dict[str, Any]) -> dict:
-    """Handles node.py's "upi_not_paid" action -- never calls check_payment_
-    status or confirm_order; the order (if the user does pay some other way)
-    is still what Swiggy has on file, just not something Cravr will confirm."""
     order = cart_state.get("pending_upi_order") or {}
     order_id = order.get("order_id", "")
     return _cart_reply(
@@ -267,9 +195,6 @@ def _finish_upi_order(order: dict[str, Any], status: dict[str, Any], address_id:
     if status.get("is_terminal_failure") or state_status == "failed":
         return _cart_reply("That payment didn't go through -- your cart's still here, try checking out again.")
 
-    # Still pending at the deadline: per Swiggy's own guidance, call
-    # confirm_order once anyway -- a late success reconciles server-side --
-    # then stop waiting rather than blocking this chat turn any longer.
     confirm = food_mcp.confirm_order(
         order.get("order_id"), address_id, order.get("lat"), order.get("lng"), cart_id=order.get("cart_id"),
     )

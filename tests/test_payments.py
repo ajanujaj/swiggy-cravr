@@ -1,10 +1,3 @@
-"""cravr/food_mcp/payments.py -- the four checkout tools (get_payment_options,
-place_food_order, check_payment_status, confirm_order), tested against the
-response shapes documented at
-https://mcp.swiggy.com/builders/docs/reference/food/ (per-tool pages) and
-https://mcp.swiggy.com/builders/docs/build/recipes/pay-with-upi/ (the
-end-to-end recipe)."""
-
 import unittest
 from unittest.mock import patch
 

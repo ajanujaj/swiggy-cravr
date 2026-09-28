@@ -17,11 +17,6 @@ KOREAN_WINGS_RESPONSE_TEXT = 'Found 10 menu items for "Korean Honey Gochujang Ch
 BROAD_RESPONSE_TEXT = 'Found 10 menu items for "Hummus & pita":\n1. Falafel Hummus Pita Pocket — ₹249 | Veg | 4.8★ | Caterspoint (restaurantId: 300897) (ID: 186053967) [has addons]\n2. Hummus With Pita Bread — ₹210 | Veg | 4.0★ | Shawarmao Na (restaurantId: 1374628) (ID: 200616039) [has addons]\n3. Mini Hummus And Pita — ₹295 | Veg | 4.8★ | Layr\'d (restaurantId: 1096649) (ID: 182906973) [has addons]\n4. Hummus Falafel Pita — ₹399 | Veg | 3.8★ | Nutriobox (restaurantId: 979965) (ID: 155354051) [has addons]\n5. Avocado & Chili Oil Hummus Veg Pita Pocket — ₹369 | Veg | Witchery-The Sandwich Co. (restaurantId: 592168) (ID: 207555927) [has addons]\n6. Hummus With Pita Triangles — ₹299 | Veg | 4.2★ | Caterspoint (restaurantId: 300897) (ID: 63799487) [has addons]\n7. The Hummus & Pita Plate — ₹439 | Veg | Coffee Island (restaurantId: 1024381) (ID: 193115134)\n8. Hummus And Pita Platter — ₹315 | Veg | 4.1★ | Third Wave Coffee (restaurantId: 450915) (ID: 127378953)\n9. Falafel Pita Hummus — ₹379 | Veg | The Big Tree (restaurantId: 1074936) (ID: 169539818)\n10. Hummus, Pita Strips & PERi-PERi Drizzle — ₹399 | Veg | 4.3★ | Nando\'s (restaurantId: 17464) (ID: 90359506)\n\nSome items have customisation options (variants/add-ons). Briefly ask the user which variant/size they prefer or if they want any add-ons. Keep it concise, e.g. "Chicken Biryani has size options (Reg/Large) — which do you prefer? Any add-ons?"\n\n⚠️ A rich UI widget may be shown to the user with this data. Avoid restating everything the widget already displays — instead, provide a brief recommendation or ask what they\'d like to do next.'
 
 
-# Reproduces the live 2026-09-28 regression (see logger.txt): the user
-# picked craving_tag="sandwich" then craving="Grilled Cheese", and Swiggy's
-# own free-text search_menu came back with dishes that have nothing to do
-# with grilled cheese at all (a wrap, a burger, an unrelated sandwich)
-# mixed in among the genuine matches.
 GRILLED_CHEESE_SEARCH_TEXT = (
     'Found 10 menu items for "Grilled Cheese":\n'
     "1. Grilled Cheese \u2014 \u20b9125 | 5.0\u2605 | AKU'S - The Burger Co. (restaurantId: 2001) (ID: 184895813)\n"
@@ -51,14 +46,6 @@ class MatchesCravingTests(unittest.TestCase):
 
 
 class SearchDishesCravingRelevanceTests(unittest.TestCase):
-    """search_dishes' primary (search_menu) path only ever re-applied
-    _apply_filters (dietary/price/cuisine) to what Swiggy's free-text
-    search handed back -- never a relevance check against the craving
-    itself, unlike the search_restaurants fallback path below it, which
-    already ran dishes through _matches_craving. That meant the one path
-    actually taken whenever search_menu finds anything (the normal case)
-    was the one path with no relevance filtering at all."""
-
     def test_dishes_unrelated_to_the_craving_are_dropped(self):
         from unittest.mock import patch
 

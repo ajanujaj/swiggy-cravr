@@ -340,16 +340,6 @@ def flush_food_cart() -> dict:
     return {"success": True, "data": {}, "message": "Cart cleared"}
 
 
-# --- Checkout (place_food_order / get_payment_options / check_payment_status
-# / confirm_order) --------------------------------------------------------
-# A local, fake stand-in for the real Swiggy checkout tools, so the full
-# cravr/cart/checkout.py flow (payment-method question, UPI polling,
-# confirm) can be exercised end to end against this mock server -- useful
-# on top of (not instead of) CRAVR_TEST_MODE, which skips calling these
-# tools altogether: this path actually exercises checkout.py's and
-# food_mcp/payments.py's real parsing logic, just against fake data instead
-# of a real Swiggy order. No real money or real deliveries are ever
-# involved here, unlike the real Swiggy MCP.
 _MOCK_LAT, _MOCK_LNG = 12.9716, 77.5946
 _pending_order: dict = {}
 

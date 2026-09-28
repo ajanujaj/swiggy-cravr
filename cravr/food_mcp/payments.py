@@ -14,13 +14,6 @@ def _check_success(raw: Any) -> str | None:
 
 
 def get_payment_options(address_id: str) -> dict[str, Any]:
-    """Wraps Swiggy's get_payment_options. Cravr only ever offers a user two
-    payment families (see cart/checkout.py): Cash/COD, and UPI-by-QR
-    (generateUPIQR=true on place_food_order) -- the only UPI path that
-    doesn't require picking a specific app/intent, which fits a web chat
-    better than deep-linking into a native UPI app. This normalizes down to
-    just whether each family is currently offered; `raw` keeps the full
-    per-method list for anything else a caller might need later."""
     try:
         raw = _call_tool("get_payment_options", {"addressId": address_id}, log_request=True)
     except Exception as exc:
@@ -66,16 +59,6 @@ def place_order(
     address_id: str, payment_method: str, *, generate_upi_qr: bool = False,
     intent_app: str | None = None, note_to_restaurant: str | None = None,
 ) -> dict[str, Any]:
-    """Wraps place_food_order -- THE point of no return: this creates a REAL
-    order (Swiggy has no sandbox/dummy-payment mode -- checked their docs).
-    `payment_method` is Swiggy's own vocabulary ("Cash" or "UPI"), echoed
-    from get_payment_options. Pass generate_upi_qr=True for the scan-to-pay
-    path (see get_payment_options's docstring for why Cravr prefers this
-    over intentApp deep-linking).
-
-    Returns status="success" (Cash: placed immediately, CONFIRMED) or
-    status="pending_payment" (UPI: PENDING_PAYMENT, with paas_id/bridge_url/
-    polling fields to hand to check_payment_status) or status="error"."""
     arguments: dict[str, Any] = {"addressId": address_id}
     if payment_method:
         arguments["paymentMethod"] = payment_method
@@ -142,10 +125,6 @@ def check_payment_status(
     paas_id: str, order_id: str | None = None, address_id: str | None = None,
     lat: float | None = None, lng: float | None = None, cart_id: str | None = None,
 ) -> dict[str, Any]:
-    """Wraps check_payment_status. For Food, always pass addressId+lat+lng
-    (echoed from place_order's response) or reconciliation fails per Swiggy's
-    docs. `status` is one of success/paid/failed/refund-initiated/cancelled/
-    cart_changed/pending/"" -- `terminal` says whether to stop polling."""
     arguments: dict[str, Any] = {"paasId": paas_id}
     if order_id:
         arguments["orderId"] = order_id
@@ -198,11 +177,6 @@ def confirm_order(
     order_id: str, address_id: str, lat: float | None, lng: float | None,
     cart_id: str | None = None,
 ) -> dict[str, Any]:
-    """Food's confirm_order signature per docs: orderId + addressId + lat +
-    lng (NOT paasId -- that's Instamart/Dineout only). Idempotent for the
-    same identifiers, so it's safe to call again if unsure an earlier call
-    landed. Call only after a terminal-success payment status for UPI, or
-    once more at a polling deadline (a late success reconciles server-side)."""
     arguments: dict[str, Any] = {"orderId": order_id, "addressId": address_id, "lat": lat, "lng": lng}
     if cart_id:
         arguments["cartId"] = cart_id

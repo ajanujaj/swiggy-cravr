@@ -17,19 +17,6 @@ def _cart_reply(content: str, **cart_state: Any) -> dict:
 
 
 def _item_lines(items: list[dict[str, Any]], item_details: dict[str, Any] | None = None) -> list[str]:
-    """One "- name xN — ₹price" bullet per cart item, with any chosen
-    variant inline and each add-on as its OWN indented sub-bullet directly
-    under it (never comma-joined onto one line -- that reads as a wall of
-    text) -- sourced from get_cart_item_details, since get_cart's own items
-    list carries no variant/add-on info. Shared by the plain cart view and
-    the checkout order summary so both look the same and both render as a
-    real nested list rather than a run-on paragraph.
-
-    Always "-" -- never "+" (markdown-inconsistent with the item bullet
-    above it) and never a numbered "1."/"2." marker: UI/components.py's
-    _clean_text strips any line starting with a digit whenever the message
-    carries option chips (e.g. the payment-method question always does),
-    which would silently delete a numbered item line."""
     item_details = item_details or {}
     lines = []
     for i in items:
@@ -47,11 +34,6 @@ def _item_lines(items: list[dict[str, Any]], item_details: dict[str, Any] | None
 
 
 def _format_cart(cart: dict[str, Any], item_details: dict[str, Any] | None = None) -> str:
-    """Built as separate markdown sections (items / total / coupon) joined
-    by blank lines -- never packed onto one or two lines with no blank-line
-    separation, which markdown reads as one run-on paragraph (a list needs
-    a blank line to end, or whatever text follows gets swallowed into the
-    last bullet)."""
     items = cart.get("items") or []
     if not items:
         return cart.get("message") or "Your cart is empty."

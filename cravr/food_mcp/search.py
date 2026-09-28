@@ -210,17 +210,6 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
         if result["items"]:
             local_filters = {k: v for k, v in filters.items() if k != "dietary_type"}
             filtered = _apply_filters(result["items"], local_filters)
-            # search_menu is Swiggy's own free-text search, not an exact-name
-            # lookup -- it happily returns semantically-nearby dishes that
-            # don't actually contain the craving at all (live regression,
-            # 2026-09-28: craving="Grilled Cheese" came back with "Truffle
-            # Shroom Wrap", "Louis Grand Royale" (a burger), "Veg Achaari
-            # Sandwich", none of them grilled cheese). _apply_filters above
-            # only checks dietary/price/cuisine, never relevance to what was
-            # actually asked for -- the same _matches_craving name-relevance
-            # check the search_restaurants fallback below already applies
-            # has to run here too, since this (non-fallback) path is the one
-            # actually taken whenever search_menu finds anything at all.
             filtered = [d for d in filtered if _matches_craving(str(d.get("item_name") or ""), str(craving))]
             if filtered:
                 return filtered
