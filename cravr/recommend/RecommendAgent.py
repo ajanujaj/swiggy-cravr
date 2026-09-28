@@ -12,6 +12,7 @@ from ..cart.CartAgent import add_dish_to_cart, _current_restaurant_id, _current_
 from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
+from ..intent.meal_utils import CRAVING_TAG_CUES
 from ..profile_utils import latest_user_text
 from ..state import CravrState
 
@@ -209,7 +210,27 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
         filters["tags"] = ",".join(tag_terms)
 
     if intent_profile.get("craving"):
-        filters["craving"] = str(intent_profile["craving"])
+        craving = str(intent_profile["craving"])
+        craving_tag = intent_profile.get("craving_tag")
+        # craving_tag ("what round 1 said") and craving ("what round 2 said")
+        # can each name a genuinely different, real dish -- round 1 isn't
+        # always a vague category needing narrowing; it can already BE a
+        # specific one (e.g. "Palak Paneer"), with round 2's pick a pairing
+        # or side (e.g. "Naan"), not a narrower version of it. Using craving
+        # alone then silently drops round 1's dish entirely (live
+        # regression, 2026-09-28: "Palak Paneer" -> "Naan" searched for
+        # "Naan" only, "giving only Naan"). Combine them unless craving_tag
+        # is one of CRAVING_TAG_CUES' generic mood tags (nothing to search
+        # for on its own, e.g. "comfort-food") or already says the same
+        # thing as craving (avoid a redundant, duplicated query).
+        if (
+            craving_tag
+            and str(craving_tag) not in CRAVING_TAG_CUES
+            and str(craving_tag).strip().lower() not in craving.lower()
+            and craving.lower() not in str(craving_tag).strip().lower()
+        ):
+            craving = f"{craving_tag} {craving}"
+        filters["craving"] = craving
 
     cuisine = intent_profile.get("cuisine")
     if cuisine:

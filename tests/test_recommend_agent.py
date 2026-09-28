@@ -76,6 +76,30 @@ class RecommendationFilterTests(unittest.TestCase):
     def test_an_empty_profile_still_asks_for_a_meal(self):
         self.assertEqual(_build_recommendation_filters({}), {"course": "main"})
 
+    def test_a_specific_round1_dish_is_not_dropped_by_a_round2_side_pick(self):
+        # Live regression, 2026-09-28: round 1 ("category") had already
+        # named a specific, complete dish ("Palak Paneer"), and round 2
+        # ("craving_or_cuisine") picked a pairing/side ("Naan"), not a
+        # narrower version of it. craving alone ("Naan") searched for Naan
+        # only, silently dropping Palak Paneer -- "giving only Naan".
+        filters = _build_recommendation_filters(
+            {"craving_tag": "Palak Paneer", "craving": "Naan"}
+        )
+        self.assertIn("Palak Paneer", filters["craving"])
+        self.assertIn("Naan", filters["craving"])
+
+    def test_a_generic_mood_tag_is_not_folded_into_the_craving(self):
+        filters = _build_recommendation_filters(
+            {"craving_tag": "comfort-food", "craving": "Grilled Cheese"}
+        )
+        self.assertEqual(filters["craving"], "Grilled Cheese")
+
+    def test_a_craving_tag_repeating_the_craving_is_not_duplicated(self):
+        filters = _build_recommendation_filters(
+            {"craving_tag": "Palak Paneer", "craving": "Palak Paneer"}
+        )
+        self.assertEqual(filters["craving"], "Palak Paneer")
+
 
 class FilterRelaxationTests(unittest.TestCase):
     def test_diet_and_budget_are_never_relaxed(self):
