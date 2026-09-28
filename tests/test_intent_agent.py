@@ -164,6 +164,32 @@ class ApplyAnswerTests(unittest.TestCase):
         self.assertIsNone(profile.get("craving"))
         self.assertNotIn("craving_or_cuisine", _missing_fields(profile))
 
+    def test_a_cuisine_answer_does_not_wipe_out_an_already_specific_dish(self):
+        # Round 1 ("category") can itself already be a specific, named dish
+        # -- "Palak Paneer", not a vague mood tag -- live regression,
+        # 2026-09-28: naming a cuisine at round 2 afterwards silently
+        # dropped it, leaving filters={cuisine, course} with no dish name
+        # at all and 272 unfiltered options coming back.
+        profile = _apply_answer(
+            {"craving_tag": "Palak Paneer"}, "craving_or_cuisine", "North Indian", TEN_PM,
+        )
+        self.assertEqual(profile["cuisine"], "North Indian")
+        self.assertEqual(profile["craving"], "Palak Paneer")
+
+    def test_a_cuisine_answer_does_not_promote_a_generic_mood_tag_into_a_craving(self):
+        profile = _apply_answer(
+            {"craving_tag": "comfort-food"}, "craving_or_cuisine", "Thai", TEN_PM,
+        )
+        self.assertEqual(profile["cuisine"], "Thai")
+        self.assertIsNone(profile.get("craving"))
+
+    def test_a_cuisine_answer_does_not_override_a_craving_already_set(self):
+        profile = _apply_answer(
+            {"craving_tag": "Palak Paneer", "craving": "Butter Chicken"},
+            "craving_or_cuisine", "North Indian", TEN_PM,
+        )
+        self.assertEqual(profile["craving"], "Butter Chicken")
+
 
 class IntentFillLoopTests(unittest.TestCase):
     def test_complete_request_never_interrupts(self):

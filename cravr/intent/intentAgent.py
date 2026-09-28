@@ -213,6 +213,18 @@ def _apply_answer(profile: dict, field: str, answer: str, now: datetime | None =
         )
         if matched_cuisine:
             updated["cuisine"] = answer if len(answer) <= 30 else matched_cuisine
+            # Round 1's answer can already BE a specific, named dish (e.g.
+            # "Palak Paneer"), not a vague mood category needing narrowing
+            # (craving_tag only holds raw free text here -- it's one of
+            # CRAVING_TAG_CUES' generic tags otherwise). Naming a cuisine at
+            # round 2 refines that, it doesn't replace it -- without this,
+            # `craving` never gets set at all and the recommendation filters
+            # end up as just {cuisine, course}, matching an entire cuisine's
+            # whole menu instead of the dish actually asked for (live
+            # regression, 2026-09-28: "Palak Paneer" -> "North Indian"
+            # returned 272 unfiltered options).
+            if not updated.get("craving") and updated.get("craving_tag") not in CRAVING_TAG_CUES and updated.get("craving_tag"):
+                updated["craving"] = updated["craving_tag"]
         else:
             updated["craving"] = answer
         return updated
