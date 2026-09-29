@@ -181,6 +181,42 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
     return None
 
 
+# Sent verbatim by the Chainlit UI when the user submits a multi-select
+# offer (OptionChips.jsx's `multi` mode) with nothing checked -- the
+# "Skip -- none of these" button. Mirrors UI/components.py's
+# _NONE_ADDON_VALUE / cart/add_flow.py's _NONE_ADDON_VALUE (same literal,
+# kept as its own constant here since RecommendAgent doesn't otherwise
+# depend on either of those modules).
+_NO_SELECTION_VALUE = "__no_addon__"
+
+
+def _resolve_multiple_choices(
+    user_input: str, options: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Like _resolve_choice, but for a multi-select submission -- a
+    comma-joined string of chip values (see UI/components.py's
+    multiselect_answer, fired by OptionChips.jsx's multi-select submit
+    button) or free-typed text naming several options ("Breads and Rice",
+    "Breads, Rice"). Splits on comma/"and"/"&", resolves each token with
+    the same matching rules as a single _resolve_choice pick, preserves
+    the order picked, and drops duplicates. A plain single-token input (an
+    ordinary one-at-a-time reply) still resolves exactly like
+    _resolve_choice, so this is a safe drop-in wherever a category offer
+    might get either kind of reply."""
+    if not (user_input or "").strip() or not options:
+        return []
+
+    tokens = [t.strip() for t in re.split(r",|\band\b|&", user_input, flags=re.IGNORECASE) if t.strip()]
+    chosen: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for token in tokens:
+        match = _resolve_choice(token, options)
+        if match is not None and id(match) not in seen_ids:
+            seen_ids.add(id(match))
+            chosen.append(match)
+    return chosen
+
+
 def _course_preference(intent_profile: dict[str, Any]) -> str:
     haystack = " ".join(
         str(value).lower()
@@ -544,18 +580,24 @@ def _offer_category_batch(
     lead_in: str, categories: list[dict[str, Any]], restaurant_scope: dict[str, Any] | None = None,
 ) -> dict:
     """Offer a restaurant's menu categories (Breads, Rice, Chinese, ...) as
-    pick options -- the browsing step before _offer_dish_batch shows the
-    actual dishes in whichever one gets picked (see _handle_category_pick).
-    `categories` is _menu_categories()' shape: [{"category": str, "items":
-    [...]}, ...]. Shows every category at once (not capped to DISPLAY_COUNT)
-    since the whole point is to let the user see the restaurant's breadth
-    in one glance."""
+    multi-select pick options -- the user can check several at once (see
+    UI/graph_bridge.py routing offer_kind == "category" to
+    components.send_multiselect_message) before the browsing step in
+    _offer_dish_batch shows the combined dishes from every category picked
+    (see _handle_category_pick). `categories` is _menu_categories()' shape:
+    [{"category": str, "items": [...]}, ...]. Shows every category at once
+    (not capped to DISPLAY_COUNT) since the whole point is to let the user
+    see the restaurant's breadth in one glance."""
     summaries = [{"item_name": c["category"], "category": c["category"]} for c in categories]
     lines = "\n".join(
         f"  {i}. {c['category']} ({len(c['items'])} item{'' if len(c['items']) == 1 else 's'})"
         for i, c in enumerate(categories, start=1)
     )
-    content = f"{lead_in}\n{lines}\nPick one by number or name." if lead_in else lines
+    # Rendered as a multi-select, which only shows this content's FIRST
+    # LINE (the chips themselves list every category) -- kept in full here
+    # anyway since debug logs, and any non-chip fallback rendering, still
+    # read the whole thing.
+    content = f"{lead_in}\n{lines}\nPick as many as you like, then hit submit." if lead_in else lines
     return _reply(
         content,
         awaiting_feedback=True, satisfied=False,
@@ -592,28 +634,51 @@ def _offer_dish_batch(
     )
 
 
+def _join_labels(labels: list[str]) -> str:
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} and {labels[1]}"
+    return f"{', '.join(labels[:-1])}, and {labels[-1]}"
+
+
 def _handle_category_pick(
-    chosen: dict[str, Any], recommendation_state: dict[str, Any], address_id: str | None,
+    chosen: list[dict[str, Any]], recommendation_state: dict[str, Any], address_id: str | None,
 ) -> dict:
-    """The user picked one of the categories _offer_category_batch offered
-    -- show that category's own dishes as the next pick-list, instead of
-    treating the category itself as something to add to the cart."""
+    """The user picked one or more of the categories _offer_category_batch
+    offered (OptionChips' multi-select lets them check several at once) --
+    merge the picked categories' items into one combined pick-list, instead
+    of treating any category itself as something to add to the cart."""
     offered = recommendation_state.get("last_recommendations") or []
     categories = recommendation_state.get("categories") or []
     restaurant_scope = dict(recommendation_state.get("restaurant_scope") or {})
-    try:
-        index = offered.index(chosen)
-    except ValueError:
-        index = -1
-    items = categories[index] if 0 <= index < len(categories) else []
-    label = chosen.get("category") or chosen.get("item_name") or "that category"
+
+    labels: list[str] = []
+    seen_ids: set[str] = set()
+    items: list[dict[str, Any]] = []
+    for pick in chosen:
+        try:
+            index = offered.index(pick)
+        except ValueError:
+            continue
+        label = pick.get("category") or pick.get("item_name") or "that category"
+        labels.append(label)
+        for item in categories[index] if 0 <= index < len(categories) else []:
+            item_id = str(item.get("menu_item_id"))
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            items.append(item)
+
     if not items:
+        label_text = _join_labels(labels) if labels else "that category"
         return _reply(
-            f"Couldn't find items under {label} right now -- try again in a moment.",
+            f"Couldn't find items under {label_text} right now -- try again in a moment.",
             awaiting_feedback=False, satisfied=False,
         )
-    restaurant_scope["current_category"] = label
-    return _offer_dish_batch(f"Here's what's under {label}:", items, restaurant_scope)
+
+    restaurant_scope["current_category"] = labels
+    return _offer_dish_batch(f"Here's what's under {_join_labels(labels)}:", items, restaurant_scope)
 
 
 def _widen_within_restaurant(
@@ -654,9 +719,16 @@ def _widen_within_restaurant(
     exclude_ids |= {str(d.get("menu_item_id")) for d in offered if d.get("menu_item_id")}
     categories = _menu_categories(menu_items, exclude_ids)
 
-    current_category = restaurant_scope.get("current_category")
-    if current_category:
-        categories = [c for c in categories if c["category"] != current_category]
+    current_categories = restaurant_scope.get("current_category")
+    if current_categories:
+        # Stamped by _handle_category_pick as a list (one or more categories
+        # picked in the same multi-select submission); tolerate a plain str
+        # too, in case an older single-category restaurant_scope is still
+        # floating around in a resumed session's checkpoint.
+        if isinstance(current_categories, str):
+            current_categories = [current_categories]
+        excluded = {str(c) for c in current_categories}
+        categories = [c for c in categories if c["category"] not in excluded]
     if not categories:
         return None
 
@@ -690,6 +762,14 @@ def is_pure_feedback(user_input: str, recommendation_state: dict[str, Any] | Non
     offered = state.get("last_recommendations") or []
     if not offered or not state.get("awaiting_feedback") or state.get("satisfied"):
         return False
+
+    # The multi-select "Skip -- none of these" submission never resolves to
+    # a pick or matches any of the acceptance/rejection wording below (its
+    # literal text doesn't read like either), but it's still definitely
+    # feedback on the current offer, not a fresh request -- see
+    # recommendation_agent_node's is_category_offer branch.
+    if (user_input or "").strip() == _NO_SELECTION_VALUE:
+        return True
 
     if _resolve_choice(user_input, offered):
         return True
@@ -779,16 +859,39 @@ def recommendation_agent_node(state: CravrState) -> dict:
     debug("recommendation_agent", f"user_input={user_input!r} awaiting_feedback={awaiting_feedback}")
 
     if awaiting_feedback and not satisfied:
-        chosen = _resolve_choice(user_input, offered)
-        if chosen:
-            if recommendation_state.get("offer_kind") == "category":
-                debug("recommendation_agent", f"user picked category {chosen.get('category')!r}")
-                return _handle_category_pick(chosen, recommendation_state, address_id)
-            debug("recommendation_agent", f"user chose {chosen.get('item_name')!r}")
-            return _reply_with_pick(
-                chosen, address_id, state=state,
-                awaiting_feedback=False, satisfied=True, last_recommendations=[chosen],
-            )
+        is_category_offer = recommendation_state.get("offer_kind") == "category"
+        if is_category_offer:
+            if user_input.strip() == _NO_SELECTION_VALUE:
+                debug("recommendation_agent", "user skipped every category option")
+                restaurant_scope = recommendation_state.get("restaurant_scope")
+                if restaurant_scope and restaurant_scope.get("restaurant_id"):
+                    return _reply(
+                        "No problem -- let me know if you'd like to see something else from "
+                        "this restaurant, or somewhere else entirely.",
+                        awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+                    )
+                return _reply(
+                    "No problem \u2014 tell me what you want to change, such as cuisine, budget, "
+                    "or dietary preference.",
+                    awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+                )
+            chosen_many = _resolve_multiple_choices(user_input, offered)
+            if chosen_many:
+                debug(
+                    "recommendation_agent",
+                    f"user picked {len(chosen_many)} categor"
+                    f"{'y' if len(chosen_many) == 1 else 'ies'}: "
+                    f"{[c.get('category') for c in chosen_many]}",
+                )
+                return _handle_category_pick(chosen_many, recommendation_state, address_id)
+        else:
+            chosen = _resolve_choice(user_input, offered)
+            if chosen:
+                debug("recommendation_agent", f"user chose {chosen.get('item_name')!r}")
+                return _reply_with_pick(
+                    chosen, address_id, state=state,
+                    awaiting_feedback=False, satisfied=True, last_recommendations=[chosen],
+                )
 
         if len(offered) == 1 and _looks_like_decline_only_offer(user_input):
             restaurant_scope = recommendation_state.get("restaurant_scope")
@@ -833,8 +936,8 @@ def recommendation_agent_node(state: CravrState) -> dict:
 
         if _looks_like_acceptance(user_input):
             if len(offered) == 1:
-                if recommendation_state.get("offer_kind") == "category":
-                    return _handle_category_pick(offered[0], recommendation_state, address_id)
+                if is_category_offer:
+                    return _handle_category_pick([offered[0]], recommendation_state, address_id)
                 return _reply_with_pick(
                     offered[0], address_id, state=state,
                     awaiting_feedback=False, satisfied=True, last_recommendations=offered,

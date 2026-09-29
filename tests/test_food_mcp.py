@@ -1,8 +1,11 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from cravr.food_mcp import (
     _parse_detailed_search_menu_items,
     _parse_search_menu_items,
+    get_restaurant_menu_items,
     search_dishes,
     search_menu_items,
 )
@@ -259,3 +262,80 @@ class DetailedAddonGroupNameWithBracketsTests(unittest.TestCase):
             ["Add Grain", "Add Protein And Veggie Boosts (Veg & Non-veg)", "Make It A Meal (Sides & Drinks)"],
         )
         self.assertEqual(groups[1]["choices"][0]["id"], "151898192")
+
+
+class GetRestaurantMenuItemsPaginationTests(unittest.TestCase):
+    """Regression, 2026-09-29: get_restaurant_menu paginates by CATEGORY (5
+    per page by default) and a real restaurant can have far more categories
+    than that -- AKU'S - The Burger Co. has 14. Only ever fetching page 1
+    silently dropped 9 of its 14 categories, which "add more from this
+    restaurant" then had almost nothing left to offer from. This replays
+    that shape with 2 pages standing in for many: page 1 says hasMore=True,
+    so a second call for page 2 must follow."""
+
+    PAGE_1_TEXT = (
+        "Menu for AKU'S - The Burger Co. (ID: 1231669)\n"
+        "Page 1 — 5 of 14 categories. Use page=2 for more.\n\n"
+        "## Recommended\n"
+        "  - Beetburg Burger — ₹365 | Veg, has addons (ID: 184895806)\n"
+    )
+    PAGE_2_TEXT = (
+        "Menu for AKU'S - The Burger Co. (ID: 1231669)\n"
+        "Page 2 — 5 of 14 categories.\n\n"
+        "## Sides\n"
+        "  - Salt & Parsley Fries — ₹265 | Veg (ID: 184895815)\n"
+    )
+
+    @staticmethod
+    def _result(text, structured):
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)],
+            structured_content=structured, data=structured, is_error=False, meta=None,
+        )
+
+    def _fake_call_tool_sync(self, name, arguments):
+        assert name == "get_restaurant_menu"
+        page = arguments.get("page")
+        if page == 1:
+            return self._result(
+                self.PAGE_1_TEXT,
+                {"totalCategories": 14, "page": 1, "pageSize": 8, "hasMore": True},
+            )
+        if page == 2:
+            return self._result(
+                self.PAGE_2_TEXT,
+                {"totalCategories": 14, "page": 2, "pageSize": 8, "hasMore": False},
+            )
+        raise AssertionError(f"unexpected page {page!r}")
+
+    def test_it_follows_hasMore_to_collect_every_page(self):
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=self._fake_call_tool_sync) as mock_call:
+            items = get_restaurant_menu_items("1231669", "addr1", "AKU'S - The Burger Co.")
+
+        self.assertEqual(mock_call.call_count, 2)
+        names = {i["item_name"] for i in items}
+        self.assertEqual(names, {"Beetburg Burger", "Salt & Parsley Fries"})
+        categories = {i["tags"].split(";")[0].strip() for i in items}
+        self.assertEqual(categories, {"Recommended", "Sides"})
+
+    def test_it_stops_as_soon_as_hasMore_is_false(self):
+        def single_page(name, arguments):
+            assert arguments.get("page") == 1
+            return self._result(
+                self.PAGE_2_TEXT,
+                {"totalCategories": 1, "page": 1, "pageSize": 8, "hasMore": False},
+            )
+
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=single_page) as mock_call:
+            items = get_restaurant_menu_items("1231669", "addr1", "AKU'S - The Burger Co.")
+
+        self.assertEqual(mock_call.call_count, 1)
+        self.assertEqual([i["item_name"] for i in items], ["Salt & Parsley Fries"])
+
+    def test_pagination_requests_the_maximum_page_size(self):
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=self._fake_call_tool_sync) as mock_call:
+            get_restaurant_menu_items("1231669", "addr1")
+
+        first_call_args = mock_call.call_args_list[0].args[1]
+        self.assertEqual(first_call_args["pageSize"], 8)
+        self.assertEqual(first_call_args["page"], 1)

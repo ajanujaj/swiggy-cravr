@@ -69,16 +69,27 @@ async def process_result(result: dict[str, Any] | None) -> None:
 
     dishes = None
     options = None
+    is_category_offer = False
     if source == "recommendation_agent":
         rec_state = result.get("recommendation_state") or {}
         dishes = rec_state.get("last_recommendations") or None
         options = rec_state.get("options") or None
+        # A restaurant's menu categories (Breads, Rice, ...) offered by
+        # RecommendAgent._offer_category_batch -- render as a multi-select
+        # (OptionChips.jsx's `multi` mode) so the user can check several at
+        # once, rather than as single-pick dish cards. A category offer's
+        # recommendation_state always carries offer_kind == "category";
+        # anything else (a plain dish batch, the dishes shown after picking
+        # categories, ...) never sets it, so this only fires here.
+        is_category_offer = rec_state.get("offer_kind") == "category"
     elif source == "cart_agent":
         options = (result.get("cart_state") or {}).get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
 
-    if dishes:
+    if is_category_offer and options:
+        await components.send_multiselect_message(content, options)
+    elif dishes:
         await components.send_dish_cards(content, dishes, options)
     else:
         await components.send_assistant_message(content, options)

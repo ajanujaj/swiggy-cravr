@@ -6,11 +6,13 @@ from langchain_core.messages import AIMessage, HumanMessage
 from cravr.graph import FEEDBACK, NEW_REQUEST, _route_entry, app
 from cravr.recommend.RecommendAgent import (
     ONLY_MATCH_OPTIONS,
+    _NO_SELECTION_VALUE,
     _build_recommendation_filters,
     _craving_match_score,
     _dish_pick_options,
     _offer_category_batch,
     _rank_candidates,
+    _resolve_multiple_choices,
     _widen_within_restaurant,
     build_recommendation_brief,
     _filter_variants,
@@ -752,7 +754,7 @@ class RestaurantScopedWidenTests(unittest.TestCase):
 
     def test_widen_within_restaurant_pulls_the_same_restaurants_menu_and_offers_its_other_categories(self):
         restaurant_scope = self._restaurant_scope()
-        restaurant_scope["current_category"] = "Curries"
+        restaurant_scope["current_category"] = ["Curries"]
         offered = [{"item_name": "Soya Angithi Meal", "menu_item_id": "999"}]
         menu_items = [
             {"item_name": "Dal Makhani", "menu_item_id": "1", "tags": "Curries"},
@@ -824,7 +826,7 @@ class CategoryBrowsingTests(unittest.TestCase):
         self.assertNotEqual(result["recommendation_state"].get("satisfied"), True)
         names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
         self.assertEqual(names, ["Butter Naan", "Garlic Naan"])
-        self.assertEqual(result["recommendation_state"]["restaurant_scope"]["current_category"], "Breads")
+        self.assertEqual(result["recommendation_state"]["restaurant_scope"]["current_category"], ["Breads"])
 
     def test_a_single_remaining_category_is_still_browsed_not_auto_added(self):
         state = self._category_offer_state("1", categories=self.CATEGORIES[:1])
@@ -870,6 +872,137 @@ class CategoryBrowsingTests(unittest.TestCase):
         self.assertEqual(mock_add.call_args[0][0]["item_name"], "Butter Naan")
 
 
+class MultiSelectCategoryTests(unittest.TestCase):
+    """The category offer is a multi-select (OptionChips.jsx's `multi`
+    mode -- see UI/graph_bridge.py routing offer_kind == "category" to
+    components.send_multiselect_message): the user can check several
+    categories in one submission, which arrives here either as a
+    comma-joined value string (UI/components.py's multiselect_answer,
+    fired by the chips' submit button) or free-typed text naming more than
+    one ("Breads and Rice"). See RecommendAgent._resolve_multiple_choices
+    and _handle_category_pick."""
+
+    RESTAURANT_SCOPE = {
+        "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
+        "cart_item_id": "63356710", "existing_ids": ["63356710"],
+    }
+    BREADS = [
+        {"item_name": "Butter Naan", "menu_item_id": "10", "price_inr": 60},
+        {"item_name": "Garlic Naan", "menu_item_id": "11", "price_inr": 70},
+    ]
+    RICE = [{"item_name": "Jeera Rice", "menu_item_id": "12", "price_inr": 180}]
+    CHINESE = [{"item_name": "Veg Manchurian", "menu_item_id": "13", "price_inr": 220}]
+    CATEGORIES = [
+        {"category": "Breads", "items": BREADS},
+        {"category": "Rice", "items": RICE},
+        {"category": "Chinese", "items": CHINESE},
+    ]
+
+    _UNSET = object()
+
+    def _category_offer_state(self, user_text, categories=None, restaurant_scope=_UNSET):
+        scope = self.RESTAURANT_SCOPE if restaurant_scope is self._UNSET else restaurant_scope
+        offer = _offer_category_batch(
+            "Pick some categories:", categories if categories is not None else self.CATEGORIES,
+            dict(scope) if scope else scope,
+        )
+        return {
+            "messages": [{"role": "user", "content": user_text}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": offer["recommendation_state"],
+            "context_profile": {"address_id": "addr1"},
+        }
+
+    def test_resolve_multiple_choices_splits_comma_joined_values(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}, {"item_name": "Chinese"}]
+        chosen = _resolve_multiple_choices("1,3", options)
+        self.assertEqual([o["item_name"] for o in chosen], ["Breads", "Chinese"])
+
+    def test_resolve_multiple_choices_splits_free_typed_and(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}, {"item_name": "Chinese"}]
+        chosen = _resolve_multiple_choices("Breads and Chinese", options)
+        self.assertEqual([o["item_name"] for o in chosen], ["Breads", "Chinese"])
+
+    def test_resolve_multiple_choices_ignores_unresolvable_tokens_and_dedupes(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("1, nonsense, 1, Rice", options)
+        self.assertEqual([o["item_name"] for o in chosen], ["Breads", "Rice"])
+
+    def test_resolve_multiple_choices_with_no_input_returns_empty(self):
+        self.assertEqual(_resolve_multiple_choices("", [{"item_name": "Breads"}]), [])
+        self.assertEqual(_resolve_multiple_choices("1", []), [])
+
+    def test_picking_two_categories_merges_their_dishes(self):
+        state = self._category_offer_state("1,2")
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan", "Jeera Rice"])
+        self.assertEqual(
+            result["recommendation_state"]["restaurant_scope"]["current_category"],
+            ["Breads", "Rice"],
+        )
+        self.assertIn("Breads and Rice", result["messages"][0].content)
+
+    def test_picking_all_three_categories_joins_labels_with_oxford_comma(self):
+        state = self._category_offer_state("Breads, Rice and Chinese")
+        result = recommendation_agent_node(state)
+
+        rec_state = result["recommendation_state"]
+        names = (
+            [d["item_name"] for d in rec_state["last_recommendations"]]
+            + [d["item_name"] for d in rec_state.get("alternates") or []]
+        )
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan", "Jeera Rice", "Veg Manchurian"])
+        self.assertIn("Breads, Rice, and Chinese", result["messages"][0].content)
+
+    def test_merged_items_are_deduped_by_menu_item_id(self):
+        shared = {"item_name": "House Special Combo", "menu_item_id": "99", "price_inr": 300}
+        categories = [
+            {"category": "Combos", "items": [shared]},
+            {"category": "Specials", "items": [shared]},
+        ]
+        state = self._category_offer_state("1,2", categories=categories)
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["House Special Combo"])
+
+    def test_skipping_every_category_within_a_restaurant_declines_gracefully(self):
+        state = self._category_offer_state(_NO_SELECTION_VALUE)
+        result = recommendation_agent_node(state)
+
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("this restaurant", result["messages"][0].content.lower())
+
+    def test_skipping_every_category_without_a_restaurant_scope_gives_the_generic_decline(self):
+        state = self._category_offer_state(
+            _NO_SELECTION_VALUE, categories=self.CATEGORIES[:1], restaurant_scope=None,
+        )
+        result = recommendation_agent_node(state)
+
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("tell me what you want to change", result["messages"][0].content)
+
+    def test_widen_within_restaurant_excludes_every_previously_picked_category(self):
+        restaurant_scope = dict(self.RESTAURANT_SCOPE)
+        restaurant_scope["current_category"] = ["Breads", "Rice"]
+        offered = [{"item_name": "Butter Naan", "menu_item_id": "10"}]
+        menu_items = [
+            {"item_name": "Butter Naan", "menu_item_id": "10", "tags": "Breads"},
+            {"item_name": "Jeera Rice", "menu_item_id": "12", "tags": "Rice"},
+            {"item_name": "Veg Manchurian", "menu_item_id": "13", "tags": "Chinese"},
+        ]
+        with patch(
+            "cravr.recommend.RecommendAgent.food_mcp.get_restaurant_menu_items",
+            return_value=menu_items,
+        ):
+            result = _widen_within_restaurant(restaurant_scope, offered, "addr1")
+
+        category_names = [c["category"] for c in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(category_names, ["Chinese"])
+
+
 class FeedbackShortcutTests(unittest.TestCase):
     OFFERED = [{"item_name": "Hyderabadi Veg Biryani"}, {"item_name": "Schezwan Paneer"},
                {"item_name": "Green Curry with Rice"}]
@@ -879,6 +1012,9 @@ class FeedbackShortcutTests(unittest.TestCase):
         for reply in ["3", "the second one", "yes", "something else", "I'll take the biryani"]:
             with self.subTest(reply=reply):
                 self.assertTrue(is_pure_feedback(reply, self.STATE))
+
+    def test_the_multiselect_skip_sentinel_shortcuts_to_the_recommender(self):
+        self.assertTrue(is_pure_feedback(_NO_SELECTION_VALUE, self.STATE))
 
     def test_a_changed_request_takes_the_full_path(self):
         for reply in ["make it non-veg", "something under 200", "actually Thai", "no, milder please"]:

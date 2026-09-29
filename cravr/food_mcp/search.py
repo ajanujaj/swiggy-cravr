@@ -6,7 +6,7 @@ from typing import Any
 from ..debug_utils import debug
 from . import _call_tool
 from ._shared import _first
-from .menu import _IMAGE_REF_RE, _normalize_item, _parse_menu_items
+from .menu import _IMAGE_REF_RE, _fetch_full_menu, _normalize_item, _parse_menu_items
 
 _EATRIGHT_TAGS = {"low-calorie", "high-protein", "low-carb", "gluten-free", "sugar-free-option", "organic"}
 
@@ -278,10 +278,7 @@ def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaur
         if not restaurant_id:
             continue
         try:
-            menu_raw = _call_tool(
-                "get_restaurant_menu", {"restaurantId": restaurant_id, "addressId": address_id},
-                context=f"for {restaurant_id}",
-            )
+            menu_raw = _fetch_full_menu(restaurant_id, address_id)
         except Exception as exc:
             debug("food_mcp", f"get_restaurant_menu FAILED for {restaurant_id}: {exc}")
             continue
