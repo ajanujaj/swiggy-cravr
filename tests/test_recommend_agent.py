@@ -86,16 +86,6 @@ class RecommendationFilterTests(unittest.TestCase):
         self.assertEqual(_build_recommendation_filters({}), {"course": "main"})
 
     def test_a_specific_round1_dish_becomes_a_secondary_search_term(self):
-        # Live regression, 2026-09-28: round 1 ("category") had already
-        # named a specific, complete dish ("Palak Paneer"), and round 2
-        # ("craving_or_cuisine") picked a pairing/side ("Naan"), not a
-        # narrower version of it. craving alone ("Naan") searched for Naan
-        # only, silently dropping Palak Paneer -- "giving only Naan". A
-        # single combined search string ("Palak Paneer Naan") was tried
-        # live and made things worse: it ranked "Paneer Naan" -- a
-        # different, unrelated dish -- above genuine Palak Paneer options.
-        # So craving stays a single clean term and craving_tag becomes a
-        # SEPARATE search (craving_secondary, see search.py), not glued on.
         filters = _build_recommendation_filters(
             {"craving_tag": "Palak Paneer", "craving": "Naan"}
         )
@@ -103,11 +93,6 @@ class RecommendationFilterTests(unittest.TestCase):
         self.assertEqual(filters["craving_secondary"], "Palak Paneer")
 
     def test_a_single_word_category_is_not_promoted_to_a_secondary_search(self):
-        # "sandwich" is a vague category, not a specific dish -- round 2
-        # narrowing it down to "Grilled Cheese" must win outright, not get
-        # diluted by a secondary search re-admitting every other kind of
-        # sandwich (this is exactly the over-broad-options bug already
-        # fixed once in search.py's _matches_craving).
         filters = _build_recommendation_filters(
             {"craving_tag": "sandwich", "craving": "Grilled Cheese"}
         )
@@ -115,10 +100,6 @@ class RecommendationFilterTests(unittest.TestCase):
         self.assertNotIn("craving_secondary", filters)
 
     def test_a_cuisine_name_is_not_promoted_to_a_secondary_search(self):
-        # A cuisine name isn't a dish -- search_menu returns poor results
-        # for a bare cuisine query (this is the "North Indian" -> 272
-        # unfiltered options bug), so it must not become craving_secondary
-        # even though it's two words.
         filters = _build_recommendation_filters(
             {"craving_tag": "North Indian", "craving": "Palak Paneer"}
         )
@@ -221,13 +202,6 @@ class CravingMatchScoreTests(unittest.TestCase):
 
 
 class RankCandidatesCravingRelevanceTests(unittest.TestCase):
-    """Live regression, 2026-09-28: round 1 gave a specific dish ("Palak
-    Paneer") and round 2 picked a side ("Naan"), so both get searched
-    separately (search.py) and merged into one pool. Without a relevance
-    score to rank that merged pool by, "Paneer Naan" (only related to the
-    side) tied with "Palak Paneer" (the actual dish asked for) on every
-    other ranking criterion and could out-rank it on rating alone."""
-
     def test_the_dish_that_actually_matches_wins_over_a_look_alike(self):
         candidates = [
             {"item_name": "Paneer Naan", "rating": 4.9, "course": "main"},
@@ -240,9 +214,6 @@ class RankCandidatesCravingRelevanceTests(unittest.TestCase):
         self.assertEqual(ranked[0]["item_name"], "Palak Paneer")
 
     def test_a_generic_side_match_does_not_dilute_an_exact_narrowing_pick(self):
-        # No secondary term here (single-word categories like "sandwich"
-        # never become craving_secondary -- see _build_recommendation_filters),
-        # so this just confirms plain craving relevance still sorts first.
         candidates = [
             {"item_name": "Veg Achaari Sandwich", "rating": 4.9, "course": "main"},
             {"item_name": "Grilled Cheese", "rating": 4.2, "course": "main"},
@@ -663,17 +634,6 @@ class RecommendationOptionsTests(unittest.TestCase):
 
 
 class RestaurantScopedWidenTests(unittest.TestCase):
-    """Regression for the 'add more from this restaurant' -> decline -> widen
-    flow (live bug, 2026-09-29): after adding Palak Paneer to the cart from
-    Punjabi Angithi and asking for more items from that restaurant, declining
-    the single suggestion used to fall back to a global, stale-brief widen
-    that surfaced "Palak Paneer from Punjab Grill" -- a different restaurant
-    entirely. recommendation_state.restaurant_scope (stamped by
-    cart/flows.py's _suggest_more_from_restaurant) is how
-    recommendation_agent_node now tells that case apart from an ordinary
-    catalog-wide "only match, widen" and keeps the widen within the same
-    restaurant instead."""
-
     MENU = ThreeSuggestionTests.MENU
 
     def _restaurant_scope(self):
@@ -709,8 +669,6 @@ class RestaurantScopedWidenTests(unittest.TestCase):
 
         mock_restaurant_widen.assert_called_once()
         mock_global_widen.assert_not_called()
-        # _widen_within_restaurant now builds the whole reply itself (a category
-        # offer, see CategoryBrowsingTests below) -- the node just forwards it.
         self.assertIs(result, canned_reply)
 
     def test_declining_within_a_restaurant_falls_back_to_a_browse_elsewhere_message_when_nothing_is_left(self):
@@ -774,9 +732,7 @@ class RestaurantScopedWidenTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["recommendation_state"]["offer_kind"], "category")
         category_names = [c["category"] for c in result["recommendation_state"]["last_recommendations"]]
-        # "Curries" was the category just declined -- it's not immediately re-offered.
         self.assertEqual(category_names, ["Breads"])
-        # the scope carries forward for a further decline, with current_category cleared
         self.assertNotIn("current_category", result["recommendation_state"]["restaurant_scope"])
 
     def test_widen_within_restaurant_with_no_restaurant_id_returns_nothing(self):
@@ -791,12 +747,6 @@ class RestaurantScopedWidenTests(unittest.TestCase):
 
 
 class CategoryBrowsingTests(unittest.TestCase):
-    """The 'add more from this restaurant' flow now offers the restaurant's
-    own menu categories (Bread, Rice, Chinese, ...) to browse instead of
-    guessing a single complementary dish -- see cart/flows.py's
-    _suggest_more_from_restaurant and RecommendAgent's
-    _offer_category_batch / _handle_category_pick."""
-
     RESTAURANT_SCOPE = {
         "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
         "cart_item_id": "63356710", "existing_ids": ["63356710"],
@@ -884,15 +834,6 @@ class CategoryBrowsingTests(unittest.TestCase):
 
 
 class DishMultiSelectTests(unittest.TestCase):
-    """The dishes shown after picking one or more categories are ALSO a
-    multi-select (OptionChips.jsx's `multi` mode -- see UI/graph_bridge.py
-    routing offer_kind == "dish" to components.send_multiselect_message):
-    the user can check several dishes and add them all to the cart in one
-    go, instead of one at a time across several separate round trips (live
-    regression, 2026-09-29: picking 5 categories in one go still took 4
-    more round trips to get everything from them into the cart). See
-    RecommendAgent._offer_dish_batch and _handle_dish_multiselect."""
-
     RESTAURANT_SCOPE = {
         "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
         "cart_item_id": "63356710", "existing_ids": ["63356710"],
@@ -962,7 +903,7 @@ class DishMultiSelectTests(unittest.TestCase):
         ) as mock_add:
             result = recommendation_agent_node(state)
 
-        self.assertEqual(mock_add.call_count, 2)  # stopped before the third dish
+        self.assertEqual(mock_add.call_count, 2)
         self.assertIn("Added Butter Naan first.", result["messages"][0].content)
         self.assertIn("Couldn't add that to your cart", result["messages"][0].content)
 
@@ -997,15 +938,6 @@ class DishMultiSelectTests(unittest.TestCase):
 
 
 class MultiSelectCategoryTests(unittest.TestCase):
-    """The category offer is a multi-select (OptionChips.jsx's `multi`
-    mode -- see UI/graph_bridge.py routing offer_kind == "category" to
-    components.send_multiselect_message): the user can check several
-    categories in one submission, which arrives here either as a
-    comma-joined value string (UI/components.py's multiselect_answer,
-    fired by the chips' submit button) or free-typed text naming more than
-    one ("Breads and Rice"). See RecommendAgent._resolve_multiple_choices
-    and _handle_category_pick."""
-
     RESTAURANT_SCOPE = {
         "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
         "cart_item_id": "63356710", "existing_ids": ["63356710"],

@@ -84,13 +84,6 @@ PALAK_PANEER_SEARCH_TEXT = (
 
 
 class SearchDishesCravingSecondaryTests(unittest.TestCase):
-    """Live regression, 2026-09-28: "Palak Paneer" -> "Naan" only ever
-    searched for "Naan" (craving), silently dropping the actual dish asked
-    for. craving_secondary triggers a second, separate search_menu call
-    (never one compound query -- that was tried live and made things
-    worse, see RecommendAgent's _build_recommendation_filters), and its
-    relevant results get merged into the primary ones."""
-
     @staticmethod
     def _fake_call(name, arguments):
         query = arguments.get("query", "")
@@ -265,14 +258,6 @@ class DetailedAddonGroupNameWithBracketsTests(unittest.TestCase):
 
 
 class GetRestaurantMenuItemsPaginationTests(unittest.TestCase):
-    """Regression, 2026-09-29: get_restaurant_menu paginates by CATEGORY (5
-    per page by default) and a real restaurant can have far more categories
-    than that -- AKU'S - The Burger Co. has 14. Only ever fetching page 1
-    silently dropped 9 of its 14 categories, which "add more from this
-    restaurant" then had almost nothing left to offer from. This replays
-    that shape with 2 pages standing in for many: page 1 says hasMore=True,
-    so a second call for page 2 must follow."""
-
     PAGE_1_TEXT = (
         "Menu for AKU'S - The Burger Co. (ID: 1231669)\n"
         "Page 1 — 5 of 14 categories. Use page=2 for more.\n\n"

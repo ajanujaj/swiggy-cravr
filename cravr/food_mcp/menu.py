@@ -80,24 +80,11 @@ def _normalize_item(
     }
 
 
-# get_restaurant_menu paginates by CATEGORY (5 per page by default, 8 max
-# -- its own inputSchema caps pageSize at 8), and a real restaurant can
-# easily have more categories than that: AKU'S - The Burger Co. has 14.
-# Only ever fetching page 1 silently drops most of the menu (live
-# regression, 2026-09-29: "add more from this restaurant" there only ever
-# found ONE survivable category, because 9 of its 14 were never fetched at
-# all -- not filtered out, just never seen).
 _MENU_PAGE_SIZE = 8
-_MENU_MAX_PAGES = 12  # safety cap (96 categories) -- real menus never get close
+_MENU_MAX_PAGES = 12
 
 
 def _fetch_full_menu(restaurant_id: str, address_id: str | None) -> Any:
-    """Loop get_restaurant_menu's pages (using the response's own
-    hasMore/page fields, read via _call_tool's return_meta=True) until the
-    whole menu has been collected, and concatenate the raw text so the
-    existing regex-based _parse_menu_items parser sees one combined menu.
-    Each page's "## Category" headers parse independently of page
-    boundaries, so naive concatenation is safe."""
     parts: list[str] = []
     page = 1
     while page <= _MENU_MAX_PAGES:
@@ -110,8 +97,6 @@ def _fetch_full_menu(restaurant_id: str, address_id: str | None) -> Any:
             return_meta=True,
         )
         if not isinstance(raw, str):
-            # Structured/JSON response -- pagination shape unproven here
-            # (never observed live); use the single response as-is.
             return raw
         parts.append(raw)
         structured = (meta or {}).get("structured_content")

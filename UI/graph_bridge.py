@@ -74,15 +74,6 @@ async def process_result(result: dict[str, Any] | None) -> None:
         rec_state = result.get("recommendation_state") or {}
         dishes = rec_state.get("last_recommendations") or None
         options = rec_state.get("options") or None
-        # A restaurant's menu categories (Breads, Rice, ...) offered by
-        # RecommendAgent._offer_category_batch, or the dishes under
-        # whichever categories got picked (_offer_dish_batch) -- both
-        # render as a multi-select (OptionChips.jsx's `multi` mode) so the
-        # user can check several at once and, for dishes, add them all to
-        # the cart in one go, rather than as single-pick dish cards. Either
-        # offer's recommendation_state carries offer_kind == "category" or
-        # "dish"; a plain catalog-wide dish batch never sets it, so this
-        # only fires for these two.
         is_multiselect_offer = rec_state.get("offer_kind") in ("category", "dish")
     elif source == "cart_agent":
         options = (result.get("cart_state") or {}).get("options") or None

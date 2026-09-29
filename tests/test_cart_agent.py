@@ -523,14 +523,6 @@ class RealTextResponseRegressionTests(unittest.TestCase):
 
 
 class SuggestMoreFromRestaurantScopeTests(unittest.TestCase):
-    """Regression, 2026-09-29: 'add more items from the restaurant' has to
-    stamp WHICH restaurant it suggested from onto recommendation_state, so
-    that if the user declines the single suggestion, RecommendAgent's widen
-    fallback can stay within that same restaurant instead of falling back to
-    the stale, session-wide recommendation_brief and searching the whole
-    catalog again (which surfaced a same-named dish from a totally
-    different restaurant)."""
-
     def test_offering_more_from_the_current_restaurant_stamps_a_restaurant_scope(self):
         from cravr.cart.flows import _suggest_more_from_restaurant
 
@@ -659,9 +651,7 @@ class CartNextStepTests(unittest.TestCase):
         offered = result["recommendation_state"]["last_recommendations"]
         categories = result["recommendation_state"]["categories"]
         category_names = [d["category"] for d in offered]
-        # every item under it needs an add-on/variant choice Cravr can't supply
         self.assertNotIn("Gourmet Soups", category_names)
-        # its only item is already in the cart
         self.assertNotIn("Mains", category_names)
         self.assertEqual(category_names, ["Recommended"])
         recommended_names = [i["item_name"] for i in categories[category_names.index("Recommended")]]

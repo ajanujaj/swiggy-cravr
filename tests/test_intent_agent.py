@@ -165,11 +165,6 @@ class ApplyAnswerTests(unittest.TestCase):
         self.assertNotIn("craving_or_cuisine", _missing_fields(profile))
 
     def test_a_cuisine_answer_does_not_wipe_out_an_already_specific_dish(self):
-        # Round 1 ("category") can itself already be a specific, named dish
-        # -- "Palak Paneer", not a vague mood tag -- live regression,
-        # 2026-09-28: naming a cuisine at round 2 afterwards silently
-        # dropped it, leaving filters={cuisine, course} with no dish name
-        # at all and 272 unfiltered options coming back.
         profile = _apply_answer(
             {"craving_tag": "Palak Paneer"}, "craving_or_cuisine", "North Indian", TEN_PM,
         )

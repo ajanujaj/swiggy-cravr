@@ -20,13 +20,6 @@ def _offer_dishes(
 ) -> dict:
     from ..recommend.RecommendAgent import ONLY_MATCH_OPTIONS, _build_recommendation_text, _dish_pick_options
 
-    # restaurant_scope marks that this batch was suggested from ONE specific
-    # restaurant's own menu (see _suggest_more_from_restaurant below), not a
-    # fresh catalog-wide search. recommendation_agent_node reads it back when
-    # the offer is a single dish the user declines, so "widen the search"
-    # stays within this restaurant instead of falling back to the stale,
-    # session-wide recommendation_brief and surfacing a same-named dish from
-    # a different restaurant entirely.
     body = _build_recommendation_text(batch)
     content = f"{lead_in}\n{body}".strip() if lead_in else body
     options = ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch)
@@ -67,11 +60,6 @@ def _suggest_more_from_restaurant(state: CravrState, address_id: str) -> dict:
     if not menu_items:
         return _cart_reply("Couldn't load that restaurant's menu right now -- try again in a moment.")
 
-    # Show the restaurant's own menu categories (Breads, Rice, Chinese, ...
-    # whatever it actually has -- see _menu_categories) rather than guessing
-    # a single "goes well with X" dish: easier to navigate, and it never
-    # runs out the way a single complementary pick did (live regression,
-    # 2026-09-29 -- see RecommendAgent's _widen_within_restaurant docstring).
     categories = _menu_categories(menu_items, existing_ids)
     if not categories:
         return _cart_reply("Looks like you've already got everything worth adding from this restaurant!")

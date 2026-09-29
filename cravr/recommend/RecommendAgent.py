@@ -136,11 +136,6 @@ def _dish_pick_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 def _dish_multiselect_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Like _dish_pick_options, but with the price folded into each chip's
-    label -- multi-select chips (OptionChips.jsx) only ever show a label,
-    none of DishCards' price/rating fields, so this is the only place that
-    information survives once _offer_dish_batch stops rendering as
-    DishCards."""
     options = []
     for i, dish in enumerate(dishes, start=1):
         name = dish.get("item_name") or f"Option {i}"
@@ -181,9 +176,6 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
     if match and 1 <= int(match.group(1)) <= len(options):
         return options[int(match.group(1)) - 1]
 
-    # Exact match against the whole name, whatever its length -- catches
-    # short names (a menu category like "Rice" or "Naan", 4 letters) that
-    # the >=5-letter word filter below would otherwise miss entirely.
     for dish in options:
         if str(dish.get("item_name") or "").strip().lower() == normalized:
             return dish
@@ -196,28 +188,12 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
     return None
 
 
-# Sent verbatim by the Chainlit UI when the user submits a multi-select
-# offer (OptionChips.jsx's `multi` mode) with nothing checked -- the
-# "Skip -- none of these" button. Mirrors UI/components.py's
-# _NONE_ADDON_VALUE / cart/add_flow.py's _NONE_ADDON_VALUE (same literal,
-# kept as its own constant here since RecommendAgent doesn't otherwise
-# depend on either of those modules).
 _NO_SELECTION_VALUE = "__no_addon__"
 
 
 def _resolve_multiple_choices(
     user_input: str, options: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Like _resolve_choice, but for a multi-select submission -- a
-    comma-joined string of chip values (see UI/components.py's
-    multiselect_answer, fired by OptionChips.jsx's multi-select submit
-    button) or free-typed text naming several options ("Breads and Rice",
-    "Breads, Rice"). Splits on comma/"and"/"&", resolves each token with
-    the same matching rules as a single _resolve_choice pick, preserves
-    the order picked, and drops duplicates. A plain single-token input (an
-    ordinary one-at-a-time reply) still resolves exactly like
-    _resolve_choice, so this is a safe drop-in wherever a category offer
-    might get either kind of reply."""
     if not (user_input or "").strip() or not options:
         return []
 
@@ -272,31 +248,6 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
         craving = str(intent_profile["craving"])
         filters["craving"] = craving
         craving_tag = intent_profile.get("craving_tag")
-        # craving_tag ("what round 1 said") can already BE a specific,
-        # multi-word dish name (e.g. "Palak Paneer"), with round 2's pick a
-        # pairing/side (e.g. "Naan"), not a narrower version of it -- using
-        # craving alone then searches for the side only, silently dropping
-        # the dish actually asked for (live regression, 2026-09-28: "Palak
-        # Paneer" -> "Naan" searched for "Naan" only, "giving only Naan").
-        # A single combined search string doesn't fix this either -- tried
-        # live and confirmed worse: "Palak Paneer Naan" ranked "Paneer
-        # Naan" (a different, unrelated dish that just happens to share two
-        # of the three words) above genuine Palak Paneer options, because
-        # Swiggy's free-text search doesn't reliably weigh multi-concept
-        # queries. So both are searched separately instead (see
-        # search.py's craving_secondary handling) and ranking picks the
-        # better match -- see _rank_candidates' craving-relevance term.
-        #
-        # Only promote craving_tag to a secondary search when it reads as
-        # an already-specific dish: 2+ words rules out a single vague
-        # category word like "sandwich" (round 2 narrowing that down to
-        # "Grilled Cheese" must still win outright, not get diluted by
-        # re-admitting every other kind of sandwich), and it must not be a
-        # cuisine name (that's a restaurant-level filter, not a dish, and
-        # search_menu returns poor results for a bare cuisine query -- see
-        # the "North Indian" -> 272-unfiltered-options regression) or one
-        # of CRAVING_TAG_CUES' generic mood tags (nothing to search for on
-        # its own, e.g. "comfort-food") or already the same dish as craving.
         if (
             craving_tag
             and len(str(craving_tag).split()) >= 2
@@ -414,17 +365,6 @@ def _filter_variants(filters: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _craving_match_score(item_name: str, *phrases: str | None) -> int:
-    """+2 for each given phrase the item's name matches exactly, +1 for
-    each it merely contains as a substring -- across every phrase passed,
-    not just one. Used to rank a merged pool of results pulled from two
-    separate searches (craving + craving_secondary -- see
-    _build_recommendation_filters) so a dish genuinely named after what was
-    asked for outranks one that only shares a single stray word with one
-    of the two phrases (live regression, 2026-09-28: without this, a
-    same-tier boolean relevance check let "Paneer Naan" -- matches only
-    "Naan" -- rank ahead of "Palak Paneer" -- matches "Palak Paneer"
-    exactly -- since both merely "passed" the relevance filter with no
-    notion of how well)."""
     name = (item_name or "").strip().lower()
     score = 0
     for phrase in phrases:
@@ -594,24 +534,11 @@ def widen_recommendations(
 def _offer_category_batch(
     lead_in: str, categories: list[dict[str, Any]], restaurant_scope: dict[str, Any] | None = None,
 ) -> dict:
-    """Offer a restaurant's menu categories (Breads, Rice, Chinese, ...) as
-    multi-select pick options -- the user can check several at once (see
-    UI/graph_bridge.py routing offer_kind == "category" to
-    components.send_multiselect_message) before the browsing step in
-    _offer_dish_batch shows the combined dishes from every category picked
-    (see _handle_category_pick). `categories` is _menu_categories()' shape:
-    [{"category": str, "items": [...]}, ...]. Shows every category at once
-    (not capped to DISPLAY_COUNT) since the whole point is to let the user
-    see the restaurant's breadth in one glance."""
     summaries = [{"item_name": c["category"], "category": c["category"]} for c in categories]
     lines = "\n".join(
         f"  {i}. {c['category']} ({len(c['items'])} item{'' if len(c['items']) == 1 else 's'})"
         for i, c in enumerate(categories, start=1)
     )
-    # Rendered as a multi-select, which only shows this content's FIRST
-    # LINE (the chips themselves list every category) -- kept in full here
-    # anyway since debug logs, and any non-chip fallback rendering, still
-    # read the whole thing.
     content = f"{lead_in}\n{lines}\nPick as many as you like, then hit submit." if lead_in else lines
     return _reply(
         content,
@@ -628,20 +555,6 @@ def _offer_dish_batch(
     lead_in: str, items: list[dict[str, Any]], restaurant_scope: dict[str, Any] | None = None,
     filters: dict[str, Any] | None = None,
 ) -> dict:
-    """Offer every dish under the category/categories just picked (see
-    _handle_category_pick) as a multi-select -- OptionChips' multi mode,
-    the same UI pattern _offer_category_batch uses -- so the user can check
-    as many as they want and add them all to the cart in one go (see
-    _handle_dish_multiselect), instead of one at a time across several
-    separate round trips (live regression, 2026-09-29: picking 5 categories
-    in one go still took 4 more separate "add more" round trips afterwards
-    to actually get everything from them into the cart). Shows every item
-    at once, not capped to DISPLAY_COUNT, for the same reason
-    _offer_category_batch does -- the whole point is to let the user see
-    everything on offer and grab what they want in one pass. Carries
-    restaurant_scope forward so a decline widens within this restaurant --
-    see _widen_within_restaurant -- rather than falling back to a stale,
-    unrelated catalog-wide search."""
     content = (
         f"{lead_in}\n{_numbered(items)}\nPick as many as you like, then hit submit."
         if lead_in else _numbered(items)
@@ -667,10 +580,6 @@ def _join_labels(labels: list[str]) -> str:
 def _handle_category_pick(
     chosen: list[dict[str, Any]], recommendation_state: dict[str, Any], address_id: str | None,
 ) -> dict:
-    """The user picked one or more of the categories _offer_category_batch
-    offered (OptionChips' multi-select lets them check several at once) --
-    merge the picked categories' items into one combined pick-list, instead
-    of treating any category itself as something to add to the cart."""
     offered = recommendation_state.get("last_recommendations") or []
     categories = recommendation_state.get("categories") or []
     restaurant_scope = dict(recommendation_state.get("restaurant_scope") or {})
@@ -706,19 +615,6 @@ def _handle_category_pick(
 def _handle_dish_multiselect(
     dishes: list[dict[str, Any]], address_id: str | None, state: CravrState | None,
 ) -> dict:
-    """The user picked one or more dishes from _offer_dish_batch's
-    multi-select -- add all of them to the cart in one go and report a
-    single combined summary, instead of only ever adding one dish per turn
-    (live regression, 2026-09-29: picking 5 categories' worth of dishes
-    still needed 4 separate turns to get them all into the cart). Each dish
-    goes through add_dish_to_cart exactly as a single pick always has --
-    every dish reaching here came from _menu_categories, which already
-    guarantees none of them need an add-on/variant choice -- and each call
-    re-reads the cart fresh, so it merges correctly on top of whatever the
-    previous call in this loop just added. Stops at the first dish that
-    doesn't land cleanly (a cart-restaurant conflict, or Swiggy rejecting
-    the add) and surfaces that result directly, noting whatever already
-    made it in first so nothing looks silently dropped."""
     if not dishes:
         return _reply("Nothing was picked to add.", awaiting_feedback=False, satisfied=False)
 
@@ -741,9 +637,6 @@ def _handle_dish_multiselect(
             known_restaurant_id=known_restaurant_id, known_restaurant_name=known_restaurant_name,
         )
         cart_state = result.get("cart_state") or {}
-        # add_dish_to_cart only ever stamps cart_state["restaurant"] on its
-        # success path (see its final lines) -- never on an error/conflict
-        # reply -- so this is the same signal it already uses internally.
         if "restaurant" not in cart_state:
             if added:
                 prior_note = f"Added {_join_labels(added)} first. "
@@ -757,10 +650,6 @@ def _handle_dish_multiselect(
         known_restaurant_id = known_restaurant_id or restaurant.get("id")
         known_restaurant_name = known_restaurant_name or restaurant.get("name")
 
-    # The LAST loop iteration already rendered the full, up-to-date cart
-    # (every dish just added, since each add_dish_to_cart call re-reads it
-    # fresh) -- just swap its message for one naming everything added this
-    # round instead of only the last dish.
     messages = result.get("messages") or []
     body = getattr(messages[0], "content", "") if messages else ""
     lead_in = f"Added {_join_labels(added)} to your cart."
@@ -777,27 +666,6 @@ def _handle_dish_multiselect(
 def _widen_within_restaurant(
     restaurant_scope: dict[str, Any], offered: list[dict[str, Any]], address_id: str | None,
 ) -> dict | None:
-    """A restaurant-scoped 'only match, widen' fallback -- returns a full
-    reply dict, or None if there's genuinely nothing else to show.
-
-    Used when the single offer being declined came from a restaurant-scoped
-    context (an "add more from this restaurant" category browse, or a
-    single dish inside one of its categories -- see cart/flows.py's
-    _suggest_more_from_restaurant and _handle_category_pick above), not a
-    fresh catalog-wide search. Falling through to the generic
-    widen_recommendations() there used the stale, unrelated
-    recommendation_brief left over from however the user originally found
-    this restaurant -- searching the whole Swiggy catalog again and
-    surfacing a same-named dish from a completely different restaurant
-    (live regression, 2026-09-29: "add more items" after adding Palak
-    Paneer from Punjabi Angithi widened into "Palak Paneer from Punjab
-    Grill" -- a different restaurant entirely).
-
-    Re-shows the restaurant's OTHER menu categories (excluding whichever
-    one was just declined, and anything already in the cart) rather than
-    guessing one more complementary dish -- that's how the user actually
-    wants to browse a restaurant (see _offer_category_batch).
-    """
     restaurant_id = restaurant_scope.get("restaurant_id")
     if not restaurant_id:
         return None
@@ -814,10 +682,6 @@ def _widen_within_restaurant(
 
     current_categories = restaurant_scope.get("current_category")
     if current_categories:
-        # Stamped by _handle_category_pick as a list (one or more categories
-        # picked in the same multi-select submission); tolerate a plain str
-        # too, in case an older single-category restaurant_scope is still
-        # floating around in a resumed session's checkpoint.
         if isinstance(current_categories, str):
             current_categories = [current_categories]
         excluded = {str(c) for c in current_categories}
@@ -856,11 +720,6 @@ def is_pure_feedback(user_input: str, recommendation_state: dict[str, Any] | Non
     if not offered or not state.get("awaiting_feedback") or state.get("satisfied"):
         return False
 
-    # The multi-select "Skip -- none of these" submission never resolves to
-    # a pick or matches any of the acceptance/rejection wording below (its
-    # literal text doesn't read like either), but it's still definitely
-    # feedback on the current offer, not a fresh request -- see
-    # recommendation_agent_node's is_category_offer branch.
     if (user_input or "").strip() == _NO_SELECTION_VALUE:
         return True
 
