@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage
 
 from .. import food_mcp
 from ..cart.CartAgent import add_dish_to_cart, _current_restaurant_id, _current_restaurant_name
+from ..cart.guards import _menu_categories
 from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
@@ -164,6 +165,13 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
     match = re.search(r"(?<!\d)(\d{1,3})(?!\d)", normalized)
     if match and 1 <= int(match.group(1)) <= len(options):
         return options[int(match.group(1)) - 1]
+
+    # Exact match against the whole name, whatever its length -- catches
+    # short names (a menu category like "Rice" or "Naan", 4 letters) that
+    # the >=5-letter word filter below would otherwise miss entirely.
+    for dish in options:
+        if str(dish.get("item_name") or "").strip().lower() == normalized:
+            return dish
 
     for dish in options:
         words = [w for w in re.findall(r"\w+", str(dish.get("item_name") or "").lower()) if len(w) >= 5]
@@ -532,6 +540,130 @@ def widen_recommendations(
     return []
 
 
+def _offer_category_batch(
+    lead_in: str, categories: list[dict[str, Any]], restaurant_scope: dict[str, Any] | None = None,
+) -> dict:
+    """Offer a restaurant's menu categories (Breads, Rice, Chinese, ...) as
+    pick options -- the browsing step before _offer_dish_batch shows the
+    actual dishes in whichever one gets picked (see _handle_category_pick).
+    `categories` is _menu_categories()' shape: [{"category": str, "items":
+    [...]}, ...]. Shows every category at once (not capped to DISPLAY_COUNT)
+    since the whole point is to let the user see the restaurant's breadth
+    in one glance."""
+    summaries = [{"item_name": c["category"], "category": c["category"]} for c in categories]
+    lines = "\n".join(
+        f"  {i}. {c['category']} ({len(c['items'])} item{'' if len(c['items']) == 1 else 's'})"
+        for i, c in enumerate(categories, start=1)
+    )
+    content = f"{lead_in}\n{lines}\nPick one by number or name." if lead_in else lines
+    return _reply(
+        content,
+        awaiting_feedback=True, satisfied=False,
+        last_recommendations=summaries, alternates=[], filters={},
+        categories=[c["items"] for c in categories],
+        offer_kind="category",
+        options=_dish_pick_options(summaries),
+        restaurant_scope=restaurant_scope,
+    )
+
+
+def _offer_dish_batch(
+    lead_in: str, items: list[dict[str, Any]], restaurant_scope: dict[str, Any] | None = None,
+    filters: dict[str, Any] | None = None,
+) -> dict:
+    """Offer a restaurant-scoped batch of dishes (e.g. everything under one
+    menu category) the same way a fresh catalog search would, but carrying
+    restaurant_scope forward so a decline widens within this restaurant --
+    see _widen_within_restaurant -- rather than falling back to a stale,
+    unrelated catalog-wide search."""
+    batch, rest = items[:DISPLAY_COUNT], items[DISPLAY_COUNT:]
+    if len(batch) == 1:
+        content = _build_recommendation_text(batch)
+    elif lead_in:
+        content = f"{lead_in}\n{_numbered(batch)}\n{PICK_PROMPT}"
+    else:
+        content = _build_recommendation_text(batch)
+    return _reply(
+        content,
+        awaiting_feedback=True, satisfied=False,
+        last_recommendations=batch, alternates=rest, filters=filters or {},
+        options=ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch),
+        restaurant_scope=restaurant_scope,
+    )
+
+
+def _handle_category_pick(
+    chosen: dict[str, Any], recommendation_state: dict[str, Any], address_id: str | None,
+) -> dict:
+    """The user picked one of the categories _offer_category_batch offered
+    -- show that category's own dishes as the next pick-list, instead of
+    treating the category itself as something to add to the cart."""
+    offered = recommendation_state.get("last_recommendations") or []
+    categories = recommendation_state.get("categories") or []
+    restaurant_scope = dict(recommendation_state.get("restaurant_scope") or {})
+    try:
+        index = offered.index(chosen)
+    except ValueError:
+        index = -1
+    items = categories[index] if 0 <= index < len(categories) else []
+    label = chosen.get("category") or chosen.get("item_name") or "that category"
+    if not items:
+        return _reply(
+            f"Couldn't find items under {label} right now -- try again in a moment.",
+            awaiting_feedback=False, satisfied=False,
+        )
+    restaurant_scope["current_category"] = label
+    return _offer_dish_batch(f"Here's what's under {label}:", items, restaurant_scope)
+
+
+def _widen_within_restaurant(
+    restaurant_scope: dict[str, Any], offered: list[dict[str, Any]], address_id: str | None,
+) -> dict | None:
+    """A restaurant-scoped 'only match, widen' fallback -- returns a full
+    reply dict, or None if there's genuinely nothing else to show.
+
+    Used when the single offer being declined came from a restaurant-scoped
+    context (an "add more from this restaurant" category browse, or a
+    single dish inside one of its categories -- see cart/flows.py's
+    _suggest_more_from_restaurant and _handle_category_pick above), not a
+    fresh catalog-wide search. Falling through to the generic
+    widen_recommendations() there used the stale, unrelated
+    recommendation_brief left over from however the user originally found
+    this restaurant -- searching the whole Swiggy catalog again and
+    surfacing a same-named dish from a completely different restaurant
+    (live regression, 2026-09-29: "add more items" after adding Palak
+    Paneer from Punjabi Angithi widened into "Palak Paneer from Punjab
+    Grill" -- a different restaurant entirely).
+
+    Re-shows the restaurant's OTHER menu categories (excluding whichever
+    one was just declined, and anything already in the cart) rather than
+    guessing one more complementary dish -- that's how the user actually
+    wants to browse a restaurant (see _offer_category_batch).
+    """
+    restaurant_id = restaurant_scope.get("restaurant_id")
+    if not restaurant_id:
+        return None
+
+    menu_items = food_mcp.get_restaurant_menu_items(
+        restaurant_id, address_id, restaurant_scope.get("restaurant_name") or ""
+    )
+    if not menu_items:
+        return None
+
+    exclude_ids = {str(i) for i in (restaurant_scope.get("existing_ids") or [])}
+    exclude_ids |= {str(d.get("menu_item_id")) for d in offered if d.get("menu_item_id")}
+    categories = _menu_categories(menu_items, exclude_ids)
+
+    current_category = restaurant_scope.get("current_category")
+    if current_category:
+        categories = [c for c in categories if c["category"] != current_category]
+    if not categories:
+        return None
+
+    next_scope = {k: v for k, v in restaurant_scope.items() if k != "current_category"}
+    return _offer_category_batch("Here's what else this restaurant has:", categories, next_scope)
+
+
 def _carries_new_constraints(user_input: str) -> bool:
     normalized = (user_input or "").strip().lower()
     if re.search(r"\d{2,}", normalized):
@@ -603,6 +735,7 @@ def _serve_next_batch(
     offered: list[dict[str, Any]],
     alternates: list[dict[str, Any]],
     filters: dict[str, Any],
+    restaurant_scope: dict[str, Any] | None = None,
 ) -> dict:
     if alternates:
         batch, rest = alternates[:DISPLAY_COUNT], alternates[DISPLAY_COUNT:]
@@ -612,6 +745,7 @@ def _serve_next_batch(
             awaiting_feedback=True, satisfied=False,
             last_recommendations=batch, alternates=rest, filters=filters,
             options=_dish_pick_options(batch),
+            restaurant_scope=restaurant_scope,
         )
 
     debug("recommendation_agent", "no alternates left to offer")
@@ -620,6 +754,7 @@ def _serve_next_batch(
         "a different cuisine, a higher budget, or including sides and desserts?",
         awaiting_feedback=True, satisfied=False,
         last_recommendations=offered, alternates=[], filters=filters,
+        restaurant_scope=restaurant_scope,
     )
 
 
@@ -646,6 +781,9 @@ def recommendation_agent_node(state: CravrState) -> dict:
     if awaiting_feedback and not satisfied:
         chosen = _resolve_choice(user_input, offered)
         if chosen:
+            if recommendation_state.get("offer_kind") == "category":
+                debug("recommendation_agent", f"user picked category {chosen.get('category')!r}")
+                return _handle_category_pick(chosen, recommendation_state, address_id)
             debug("recommendation_agent", f"user chose {chosen.get('item_name')!r}")
             return _reply_with_pick(
                 chosen, address_id, state=state,
@@ -653,8 +791,24 @@ def recommendation_agent_node(state: CravrState) -> dict:
             )
 
         if len(offered) == 1 and _looks_like_decline_only_offer(user_input):
-            debug("recommendation_agent", "user declined the only match — widening the search")
+            restaurant_scope = recommendation_state.get("restaurant_scope")
             already_shown = {str(d.get("item_name") or "") for d in offered}
+            if restaurant_scope and restaurant_scope.get("restaurant_id"):
+                debug(
+                    "recommendation_agent",
+                    f"user declined the only match — widening within restaurant "
+                    f"{restaurant_scope.get('restaurant_id')!r}",
+                )
+                widened_reply = _widen_within_restaurant(restaurant_scope, offered, address_id)
+                if widened_reply:
+                    return widened_reply
+                return _reply(
+                    "That's everything I can find at this restaurant beyond what's already in "
+                    "your cart -- want to browse other restaurants instead?",
+                    awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+                )
+
+            debug("recommendation_agent", "user declined the only match — widening the search")
             widened = widen_recommendations(brief, address_id=address_id, exclude_items=already_shown)
             if widened:
                 batch, rest = widened[:DISPLAY_COUNT], widened[DISPLAY_COUNT:]
@@ -672,10 +826,15 @@ def recommendation_agent_node(state: CravrState) -> dict:
 
         if _looks_like_more_request(user_input):
             debug("recommendation_agent", "user asked for more")
-            return _serve_next_batch("Here are a few more:", offered, alternates, brief_filters)
+            return _serve_next_batch(
+                "Here are a few more:", offered, alternates, brief_filters,
+                recommendation_state.get("restaurant_scope"),
+            )
 
         if _looks_like_acceptance(user_input):
             if len(offered) == 1:
+                if recommendation_state.get("offer_kind") == "category":
+                    return _handle_category_pick(offered[0], recommendation_state, address_id)
                 return _reply_with_pick(
                     offered[0], address_id, state=state,
                     awaiting_feedback=False, satisfied=True, last_recommendations=offered,
@@ -691,7 +850,8 @@ def recommendation_agent_node(state: CravrState) -> dict:
             debug("recommendation_agent", "user rejected the batch")
             if alternates:
                 return _serve_next_batch(
-                    "No problem, here are some others:", offered, alternates, brief_filters
+                    "No problem, here are some others:", offered, alternates, brief_filters,
+                    recommendation_state.get("restaurant_scope"),
                 )
             return _reply(
                 "No problem — tell me what you want to change, such as cuisine, budget, "
@@ -701,7 +861,10 @@ def recommendation_agent_node(state: CravrState) -> dict:
 
         if brief_filters == (recommendation_state.get("filters") or {}):
             debug("recommendation_agent", "unrecognised reply, filters unchanged — treating as 'more'")
-            return _serve_next_batch("Here are a few more:", offered, alternates, brief_filters)
+            return _serve_next_batch(
+                "Here are a few more:", offered, alternates, brief_filters,
+                recommendation_state.get("restaurant_scope"),
+            )
 
     ranked = fetch_recommendations(brief, address_id=address_id)
     if not ranked:

@@ -9,7 +9,9 @@ from cravr.recommend.RecommendAgent import (
     _build_recommendation_filters,
     _craving_match_score,
     _dish_pick_options,
+    _offer_category_batch,
     _rank_candidates,
+    _widen_within_restaurant,
     build_recommendation_brief,
     _filter_variants,
     _looks_like_acceptance,
@@ -653,6 +655,219 @@ class RecommendationOptionsTests(unittest.TestCase):
         self.assertEqual(
             result["recommendation_state"]["options"], _dish_pick_options(self.MENU[1:4]),
         )
+
+
+class RestaurantScopedWidenTests(unittest.TestCase):
+    """Regression for the 'add more from this restaurant' -> decline -> widen
+    flow (live bug, 2026-09-29): after adding Palak Paneer to the cart from
+    Punjabi Angithi and asking for more items from that restaurant, declining
+    the single suggestion used to fall back to a global, stale-brief widen
+    that surfaced "Palak Paneer from Punjab Grill" -- a different restaurant
+    entirely. recommendation_state.restaurant_scope (stamped by
+    cart/flows.py's _suggest_more_from_restaurant) is how
+    recommendation_agent_node now tells that case apart from an ordinary
+    catalog-wide "only match, widen" and keeps the widen within the same
+    restaurant instead."""
+
+    MENU = ThreeSuggestionTests.MENU
+
+    def _restaurant_scope(self):
+        return {
+            "restaurant_id": "336078",
+            "restaurant_name": "Punjabi Angithi (Vegorama Group)",
+            "cart_item_id": "63356710",
+            "existing_ids": ["63356710"],
+        }
+
+    def test_declining_a_restaurant_scoped_only_match_widens_within_the_same_restaurant(self):
+        offered = [{"item_name": "Soya Angithi Meal", "menu_item_id": "999", "restaurant_id": "336078"}]
+        restaurant_scope = self._restaurant_scope()
+        state = {
+            "messages": [{"role": "user", "content": "2"}],
+            "recommendation_brief": {
+                "filters": {"craving": "Naan", "craving_secondary": "Palak Paneer", "course": "main,side"},
+                "history": {}, "summary": "",
+            },
+            "recommendation_state": {
+                "awaiting_feedback": True, "satisfied": False,
+                "last_recommendations": offered, "alternates": [],
+                "restaurant_scope": restaurant_scope,
+            },
+        }
+        canned_reply = {"recommendation_state": {"awaiting_feedback": True}, "messages": []}
+        with patch(
+            "cravr.recommend.RecommendAgent._widen_within_restaurant", return_value=canned_reply
+        ) as mock_restaurant_widen, patch(
+            "cravr.recommend.RecommendAgent.widen_recommendations"
+        ) as mock_global_widen:
+            result = recommendation_agent_node(state)
+
+        mock_restaurant_widen.assert_called_once()
+        mock_global_widen.assert_not_called()
+        # _widen_within_restaurant now builds the whole reply itself (a category
+        # offer, see CategoryBrowsingTests below) -- the node just forwards it.
+        self.assertIs(result, canned_reply)
+
+    def test_declining_within_a_restaurant_falls_back_to_a_browse_elsewhere_message_when_nothing_is_left(self):
+        offered = [{"item_name": "Soya Angithi Meal", "menu_item_id": "999", "restaurant_id": "336078"}]
+        restaurant_scope = self._restaurant_scope()
+        state = {
+            "messages": [{"role": "user", "content": "2"}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": {
+                "awaiting_feedback": True, "satisfied": False,
+                "last_recommendations": offered, "alternates": [],
+                "restaurant_scope": restaurant_scope,
+            },
+        }
+        with patch(
+            "cravr.recommend.RecommendAgent._widen_within_restaurant", return_value=None
+        ), patch("cravr.recommend.RecommendAgent.widen_recommendations") as mock_global_widen:
+            result = recommendation_agent_node(state)
+
+        mock_global_widen.assert_not_called()
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("other restaurants", result["messages"][0].content.lower())
+
+    def test_an_ordinary_catalog_wide_decline_still_uses_the_global_widen(self):
+        offered = self.MENU[:1]
+        state = {
+            "messages": [{"role": "user", "content": "2"}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": {
+                "awaiting_feedback": True, "satisfied": False,
+                "last_recommendations": offered, "alternates": [],
+            },
+        }
+        with patch(
+            "cravr.recommend.RecommendAgent._widen_within_restaurant"
+        ) as mock_restaurant_widen, patch(
+            "cravr.recommend.RecommendAgent.widen_recommendations", return_value=self.MENU[1:4]
+        ) as mock_global_widen:
+            result = recommendation_agent_node(state)
+
+        mock_restaurant_widen.assert_not_called()
+        mock_global_widen.assert_called_once()
+        self.assertEqual(result["recommendation_state"]["last_recommendations"], self.MENU[1:4])
+
+    def test_widen_within_restaurant_pulls_the_same_restaurants_menu_and_offers_its_other_categories(self):
+        restaurant_scope = self._restaurant_scope()
+        restaurant_scope["current_category"] = "Curries"
+        offered = [{"item_name": "Soya Angithi Meal", "menu_item_id": "999"}]
+        menu_items = [
+            {"item_name": "Dal Makhani", "menu_item_id": "1", "tags": "Curries"},
+            {"item_name": "Garlic Naan", "menu_item_id": "2", "tags": "Breads"},
+        ]
+
+        with patch(
+            "cravr.recommend.RecommendAgent.food_mcp.get_restaurant_menu_items",
+            return_value=menu_items,
+        ) as mock_get_menu:
+            result = _widen_within_restaurant(restaurant_scope, offered, "addr1")
+
+        mock_get_menu.assert_called_once_with("336078", "addr1", "Punjabi Angithi (Vegorama Group)")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["recommendation_state"]["offer_kind"], "category")
+        category_names = [c["category"] for c in result["recommendation_state"]["last_recommendations"]]
+        # "Curries" was the category just declined -- it's not immediately re-offered.
+        self.assertEqual(category_names, ["Breads"])
+        # the scope carries forward for a further decline, with current_category cleared
+        self.assertNotIn("current_category", result["recommendation_state"]["restaurant_scope"])
+
+    def test_widen_within_restaurant_with_no_restaurant_id_returns_nothing(self):
+        self.assertIsNone(_widen_within_restaurant({}, [], "addr1"))
+
+    def test_widen_within_restaurant_with_nothing_left_returns_none(self):
+        restaurant_scope = self._restaurant_scope()
+        with patch(
+            "cravr.recommend.RecommendAgent.food_mcp.get_restaurant_menu_items", return_value=[],
+        ):
+            self.assertIsNone(_widen_within_restaurant(restaurant_scope, [], "addr1"))
+
+
+class CategoryBrowsingTests(unittest.TestCase):
+    """The 'add more from this restaurant' flow now offers the restaurant's
+    own menu categories (Bread, Rice, Chinese, ...) to browse instead of
+    guessing a single complementary dish -- see cart/flows.py's
+    _suggest_more_from_restaurant and RecommendAgent's
+    _offer_category_batch / _handle_category_pick."""
+
+    RESTAURANT_SCOPE = {
+        "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
+        "cart_item_id": "63356710", "existing_ids": ["63356710"],
+    }
+    BREADS = [
+        {"item_name": "Butter Naan", "menu_item_id": "10", "price_inr": 60},
+        {"item_name": "Garlic Naan", "menu_item_id": "11", "price_inr": 70},
+    ]
+    CATEGORIES = [
+        {"category": "Breads", "items": BREADS},
+        {"category": "Rice", "items": [{"item_name": "Jeera Rice", "menu_item_id": "12", "price_inr": 180}]},
+    ]
+
+    def _category_offer_state(self, user_text, categories=None):
+        offer = _offer_category_batch(
+            "Pick a category:", categories if categories is not None else self.CATEGORIES,
+            dict(self.RESTAURANT_SCOPE),
+        )
+        return {
+            "messages": [{"role": "user", "content": user_text}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": offer["recommendation_state"],
+            "context_profile": {"address_id": "addr1"},
+        }
+
+    def test_picking_a_category_shows_its_own_dishes(self):
+        state = self._category_offer_state("Breads")
+        result = recommendation_agent_node(state)
+
+        self.assertNotEqual(result["recommendation_state"].get("satisfied"), True)
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan"])
+        self.assertEqual(result["recommendation_state"]["restaurant_scope"]["current_category"], "Breads")
+
+    def test_a_single_remaining_category_is_still_browsed_not_auto_added(self):
+        state = self._category_offer_state("1", categories=self.CATEGORIES[:1])
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan"])
+        self.assertNotEqual(result["recommendation_state"].get("satisfied"), True)
+
+    def test_saying_yes_to_a_single_category_offer_browses_it_not_adds_it(self):
+        state = self._category_offer_state("yes", categories=self.CATEGORIES[:1])
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan"])
+        self.assertNotEqual(result["recommendation_state"].get("satisfied"), True)
+
+    def test_a_category_with_a_single_dish_offers_it_with_the_only_match_prompt(self):
+        state = self._category_offer_state("Rice")
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Jeera Rice"])
+        self.assertEqual(result["recommendation_state"]["options"], ONLY_MATCH_OPTIONS)
+
+    def test_picking_a_dish_within_a_category_adds_it_to_the_cart_normally(self):
+        state = self._category_offer_state("Breads")
+        dish_offer = recommendation_agent_node(state)
+
+        pick_state = {
+            "messages": [{"role": "user", "content": "1"}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": dish_offer["recommendation_state"],
+            "context_profile": {"address_id": "addr1"},
+        }
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            return_value={"messages": [], "cart_state": {}},
+        ) as mock_add:
+            recommendation_agent_node(pick_state)
+
+        mock_add.assert_called_once()
+        self.assertEqual(mock_add.call_args[0][0]["item_name"], "Butter Naan")
 
 
 class FeedbackShortcutTests(unittest.TestCase):

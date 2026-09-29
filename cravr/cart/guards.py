@@ -52,3 +52,40 @@ def _suggest_complementary_items(
         _take(bucketed.get(bucket, []))
     _take(candidates)
     return ordered[:limit]
+
+
+def _menu_categories(
+    menu_items: list[dict[str, Any]], exclude_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Group a restaurant's menu into its own categories (Breads, Rice,
+    Chinese, Starters, ... -- whatever get_restaurant_menu's ## headers
+    group the dishes under). food_mcp/menu.py's _parse_menu_items already
+    packs the category as the first ';'-separated segment of each item's
+    "tags" field; this just re-groups by it, skipping anything already in
+    the cart. Order follows first appearance in the menu.
+
+    Used so "add more from this restaurant" can offer a browsable category
+    list (Bread? Rice? Chinese?) instead of guessing one complementary dish
+    at a time -- easier to navigate when there's no obvious single "goes
+    well with X" pick.
+    """
+    exclude = {str(i) for i in (exclude_ids or ())}
+    order: list[str] = []
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for item in menu_items:
+        if str(item.get("menu_item_id")) in exclude:
+            continue
+        # Same guarantee _suggest_complementary_items always made: never
+        # surface something Cravr can't actually add to the cart (a
+        # variant/add-on choice it can't collect). A category made up
+        # entirely of such items simply doesn't appear.
+        if _requires_customization(item.get("tags") or ""):
+            continue
+        category = str(item.get("tags") or "").split(";")[0].strip()
+        if not category:
+            continue
+        if category not in buckets:
+            order.append(category)
+            buckets[category] = []
+        buckets[category].append(item)
+    return [{"category": name, "items": buckets[name]} for name in order]

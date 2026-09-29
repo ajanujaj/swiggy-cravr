@@ -522,6 +522,39 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         self.assertEqual(CartAgent._current_restaurant_name(state), "Healthy Eats")
 
 
+class SuggestMoreFromRestaurantScopeTests(unittest.TestCase):
+    """Regression, 2026-09-29: 'add more items from the restaurant' has to
+    stamp WHICH restaurant it suggested from onto recommendation_state, so
+    that if the user declines the single suggestion, RecommendAgent's widen
+    fallback can stay within that same restaurant instead of falling back to
+    the stale, session-wide recommendation_brief and searching the whole
+    catalog again (which surfaced a same-named dish from a totally
+    different restaurant)."""
+
+    def test_offering_more_from_the_current_restaurant_stamps_a_restaurant_scope(self):
+        from cravr.cart.flows import _suggest_more_from_restaurant
+
+        state = _state(
+            "add more items",
+            cart_state={"restaurant": {"id": "336078", "name": "Punjabi Angithi (Vegorama Group)"}},
+        )
+        cart = {"items": [{"menu_item_id": "63356710", "item_name": "Palak Paneer"}]}
+        menu_items = [
+            {"menu_item_id": "63356710", "item_name": "Palak Paneer", "tags": "Curries"},
+            {"menu_item_id": "77", "item_name": "Soya Angithi Meal", "tags": "Meals"},
+        ]
+        with patch("cravr.cart.flows.food_mcp.get_cart", return_value=cart), \
+             patch("cravr.cart.flows.food_mcp.get_restaurant_menu_items", return_value=menu_items):
+            result = _suggest_more_from_restaurant(state, "addr1")
+
+        self.assertEqual(result["recommendation_state"]["offer_kind"], "category")
+        scope = result["recommendation_state"]["restaurant_scope"]
+        self.assertEqual(scope["restaurant_id"], "336078")
+        self.assertEqual(scope["restaurant_name"], "Punjabi Angithi (Vegorama Group)")
+        self.assertEqual(scope["cart_item_id"], "63356710")
+        self.assertEqual(scope["existing_ids"], ["63356710"])
+
+
 class CartNextStepTests(unittest.TestCase):
     NON_EMPTY_CART = {"status": "text", "message": "Items (1):\n  - Bowl — ₹200 (ID: 111)\n\nTO PAY: ₹250"}
 
@@ -560,7 +593,7 @@ class CartNextStepTests(unittest.TestCase):
             result = cart_agent_node(_state(CartAgent.CART_PROCEED_VALUE))
         self.assertIn("empty", result["messages"][0].content.lower())
 
-    def test_add_more_suggests_complementary_items_and_excludes_the_cart_item(self):
+    def test_add_more_offers_menu_categories_and_excludes_the_cart_item(self):
         full_menu = (
             "## Mains\n- Bowl — ₹200 | Veg (ID: 111)\n- Big Bowl — ₹250 | Veg (ID: 222)\n"
             "## Beverages\n- Lemonade — ₹80 | Veg (ID: 333)\n"
@@ -582,12 +615,17 @@ class CartNextStepTests(unittest.TestCase):
             ))
 
         self.assertEqual(result["messages"][0].name, "recommendation_agent")
-        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
-        self.assertNotIn("Bowl", names, "the item already in the cart must never be re-suggested")
-        self.assertIn("Lemonade", names[:2])
-        self.assertIn("Brownie", names[:2])
+        self.assertEqual(result["recommendation_state"]["offer_kind"], "category")
+        offered = result["recommendation_state"]["last_recommendations"]
+        categories = result["recommendation_state"]["categories"]
+        category_names = [d["category"] for d in offered]
+        self.assertEqual(set(category_names), {"Mains", "Beverages", "Desserts"})
 
-    def test_add_more_excludes_items_requiring_customization_even_as_fallback(self):
+        mains_names = [i["item_name"] for i in categories[category_names.index("Mains")]]
+        self.assertNotIn("Bowl", mains_names, "the item already in the cart must never be re-suggested")
+        self.assertIn("Big Bowl", mains_names)
+
+    def test_add_more_excludes_items_requiring_customization_from_categories(self):
         full_menu = (
             "## Gourmet Soups\n"
             "- Manchow Soup — ₹399 | Veg, has addons (ID: 156291316)\n"
@@ -618,10 +656,16 @@ class CartNextStepTests(unittest.TestCase):
             ))
 
         self.assertEqual(result["messages"][0].name, "recommendation_agent")
-        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
-        for addon_item in ("Manchow Soup", "Sichuan Hot & Sour Soup", "Burmese Khao Suey", "Fiery Avocado Roll"):
-            self.assertNotIn(addon_item, names, f"{addon_item!r} needs a variant/add-on choice Cravr can't supply")
-        self.assertEqual(names, ["Stuffed Mushroom In Thai Sauce"])
+        offered = result["recommendation_state"]["last_recommendations"]
+        categories = result["recommendation_state"]["categories"]
+        category_names = [d["category"] for d in offered]
+        # every item under it needs an add-on/variant choice Cravr can't supply
+        self.assertNotIn("Gourmet Soups", category_names)
+        # its only item is already in the cart
+        self.assertNotIn("Mains", category_names)
+        self.assertEqual(category_names, ["Recommended"])
+        recommended_names = [i["item_name"] for i in categories[category_names.index("Recommended")]]
+        self.assertEqual(recommended_names, ["Stuffed Mushroom In Thai Sauce"])
 
     def test_add_more_reports_nothing_left_when_every_remaining_item_needs_customization(self):
         full_menu = (

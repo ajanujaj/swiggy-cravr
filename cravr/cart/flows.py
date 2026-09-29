@@ -8,7 +8,7 @@ from .. import food_mcp
 from ..debug_utils import debug
 from ..state import CravrState
 from .display import _cart_reply
-from .guards import _suggest_complementary_items
+from .guards import _menu_categories
 from .parsing import _existing_cart_items
 from .restaurant_context import _current_restaurant_id, _current_restaurant_name
 
@@ -16,9 +16,17 @@ from .restaurant_context import _current_restaurant_id, _current_restaurant_name
 def _offer_dishes(
     lead_in: str, batch: list[dict[str, Any]], filters: dict[str, Any],
     cart_state: dict[str, Any] | None = None,
+    restaurant_scope: dict[str, Any] | None = None,
 ) -> dict:
     from ..recommend.RecommendAgent import ONLY_MATCH_OPTIONS, _build_recommendation_text, _dish_pick_options
 
+    # restaurant_scope marks that this batch was suggested from ONE specific
+    # restaurant's own menu (see _suggest_more_from_restaurant below), not a
+    # fresh catalog-wide search. recommendation_agent_node reads it back when
+    # the offer is a single dish the user declines, so "widen the search"
+    # stays within this restaurant instead of falling back to the stale,
+    # session-wide recommendation_brief and surfacing a same-named dish from
+    # a different restaurant entirely.
     body = _build_recommendation_text(batch)
     content = f"{lead_in}\n{body}".strip() if lead_in else body
     options = ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch)
@@ -30,6 +38,7 @@ def _offer_dishes(
             "awaiting_feedback": True,
             "satisfied": False,
             "options": options,
+            "restaurant_scope": restaurant_scope,
         },
         "messages": [AIMessage(content=content, name="recommendation_agent")],
     }
@@ -58,12 +67,26 @@ def _suggest_more_from_restaurant(state: CravrState, address_id: str) -> dict:
     if not menu_items:
         return _cart_reply("Couldn't load that restaurant's menu right now -- try again in a moment.")
 
-    suggestions = _suggest_complementary_items(menu_items, cart_item_id, existing_ids, limit=5)
-    if not suggestions:
+    # Show the restaurant's own menu categories (Breads, Rice, Chinese, ...
+    # whatever it actually has -- see _menu_categories) rather than guessing
+    # a single "goes well with X" dish: easier to navigate, and it never
+    # runs out the way a single complementary pick did (live regression,
+    # 2026-09-29 -- see RecommendAgent's _widen_within_restaurant docstring).
+    categories = _menu_categories(menu_items, existing_ids)
+    if not categories:
         return _cart_reply("Looks like you've already got everything worth adding from this restaurant!")
 
-    filters = dict((state.get("recommendation_state") or {}).get("filters") or {})
-    return _offer_dishes("Goes well with what's in your cart:", suggestions, filters)
+    restaurant_scope = {
+        "restaurant_id": restaurant_id,
+        "restaurant_name": restaurant_name,
+        "cart_item_id": cart_item_id,
+        "existing_ids": sorted(existing_ids),
+    }
+    from ..recommend.RecommendAgent import _offer_category_batch
+
+    return _offer_category_batch(
+        "What would you like more of from this restaurant?", categories, restaurant_scope,
+    )
 
 
 def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
