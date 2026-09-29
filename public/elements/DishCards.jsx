@@ -47,6 +47,7 @@ export default function DishCards() {
                 {d.cuisine ? <span className="cravr-card-cuisine">{d.cuisine}</span> : null}
               </div>
               <div className="cravr-card-body">
+                {d.badge ? <div className="cravr-card-badge">{d.badge}</div> : null}
                 <div className="cravr-card-title">
                   {d.veg === true ? <span className="cravr-diet veg" title="Veg" /> : null}
                   {d.veg === false ? <span className="cravr-diet nonveg" title="Non-veg" /> : null}
@@ -56,7 +57,10 @@ export default function DishCards() {
                 <div className="cravr-card-meta">
                   {d.rating != null ? <span className="cravr-rating">★ {d.rating}</span> : null}
                   {d.price != null ? <span className="cravr-price">₹{d.price}</span> : null}
+                  {d.eta ? <span className="cravr-eta">{d.eta} min</span> : null}
                 </div>
+                {d.offer ? <div className="cravr-offer">{d.offer}</div> : null}
+                {d.reason ? <div className="cravr-reason">{d.reason}</div> : null}
                 {d.tags && d.tags.length ? (
                   <div className="cravr-tags">
                     {d.tags.slice(0, 3).map((t) => <span className="cravr-tag" key={t}>{t}</span>)}

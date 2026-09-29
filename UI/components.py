@@ -80,6 +80,10 @@ def _dish_props(dish: dict[str, Any], option: dict[str, Any] | None) -> dict[str
         "rating": dish.get("rating"),
         "tags": [t for t in tags if t.lower() not in ("vegetarian", "veg", "non-veg")],
         "veg": True if diet == "veg" else False if diet in ("non-veg", "nonveg") else None,
+        "badge": dish.get("badge") or "",
+        "reason": dish.get("reason") or "",
+        "eta": dish.get("eta_min") or None,
+        "offer": dish.get("offer") or "",
         "option": option,
     }
 

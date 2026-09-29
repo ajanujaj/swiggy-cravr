@@ -11,6 +11,8 @@ from .. import food_mcp
 from ..cart.CartAgent import add_dish_to_cart, _current_restaurant_id, _current_restaurant_name
 from ..cart.guards import _menu_categories
 from ..client import call_tool_sync, using_real_food_mcp
+from .signals import attach_restaurant_info, history_signals, practical_score
+from .opening import OPENING_KIND, SOMETHING_ELSE_LABEL, SOMETHING_ELSE_VALUE
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
 from ..intent.meal_utils import CRAVING_TAG_CUES
@@ -94,6 +96,10 @@ def _describe(dish: dict[str, Any]) -> str:
         details.append(f"₹{dish['price_inr']}")
     if dish.get("rating") is not None:
         details.append(f"rating {dish['rating']}")
+    if dish.get("eta_min"):
+        details.append(f"{dish['eta_min']} min")
+    if dish.get("offer"):
+        details.append(str(dish["offer"]))
     detail_text = ", ".join(d for d in details if d)
     return (
         f"{dish.get('item_name') or 'a dish'} from {dish.get('restaurant_name') or 'the restaurant'}"
@@ -363,6 +369,8 @@ def _summarise_history(history_profile: dict[str, Any]) -> dict[str, Any]:
         "top_cuisines": [name for name, _count in cuisines.most_common(2)],
         "top_restaurants": [name for name, _count in restaurants.most_common(3)],
         "repeat_items": [name for name, count in items.most_common(3) if count > 1],
+        # Counts + recency used by signals.practical_score when ranking.
+        **history_signals(history_profile),
     }
 
 
@@ -453,6 +461,17 @@ def _craving_match_score(item_name: str, *phrases: str | None) -> int:
     return score
 
 
+def _ranking_signals(history: dict[str, Any] | None) -> dict[str, Any]:
+    """Signals for practical_score. Briefs built before signals existed (or
+    tests) only carry top_cuisines/top_restaurants -- treat those as counts of 1."""
+    history = dict(history or {})
+    if "restaurant_counts" not in history:
+        history["restaurant_counts"] = {str(r).strip().lower(): 1 for r in history.get("top_restaurants") or []}
+    if "cuisine_counts" not in history:
+        history["cuisine_counts"] = {str(c).strip().lower(): 1 for c in history.get("top_cuisines") or []}
+    return history
+
+
 def _rank_candidates(
     recommendations: list[dict[str, Any]],
     desired_tags: list[str],
@@ -462,21 +481,18 @@ def _rank_candidates(
     desired_craving: str | None = None,
     desired_craving_secondary: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Relevance first (what they asked for), then one practical score:
+    their usual restaurants/dishes, delivery time, offer, rating, and a
+    penalty for what they ate in the last day (see signals.py)."""
     wanted_tags = {t.strip().lower() for t in desired_tags if t}
     cuisine = (desired_cuisine or "").strip().lower()
     preferred_course = (desired_course or "").split(",")[0].strip().lower()
+    signals = _ranking_signals(history)
 
-    past_cuisines = {str(c).strip().lower() for c in (history or {}).get("top_cuisines") or []}
-    past_restaurants = {str(r).strip().lower() for r in (history or {}).get("top_restaurants") or []}
-
-    def sort_key(item: dict[str, Any]) -> tuple[int, int, int, int, int, float]:
+    def sort_key(item: dict[str, Any]) -> tuple[int, int, int, int, float]:
         item_tags = {t.strip().lower() for t in str(item.get("tags") or "").split(";") if t.strip()}
         item_cuisine = str(item.get("cuisine") or "").strip().lower()
         item_course = str(item.get("course") or "").strip().lower()
-        try:
-            rating = float(item.get("rating") or 0)
-        except (TypeError, ValueError):
-            rating = 0.0
         return (
             _craving_match_score(
                 str(item.get("item_name") or ""), desired_craving, desired_craving_secondary
@@ -484,12 +500,42 @@ def _rank_candidates(
             1 if preferred_course and item_course == preferred_course else 0,
             len(wanted_tags & item_tags),
             1 if cuisine and cuisine in item_cuisine else 0,
-            1 if (item_cuisine in past_cuisines
-                  or str(item.get("restaurant_name") or "").strip().lower() in past_restaurants) else 0,
-            rating,
+            practical_score(item, signals),
         )
 
     return sorted(recommendations, key=sort_key, reverse=True)
+
+
+# Restaurants looked up per search for delivery time / offer / open status.
+_ENRICH_RESTAURANTS = 5
+
+
+def _enrich_with_restaurant_info(
+    recommendations: list[dict[str, Any]], address_id: str | None,
+) -> list[dict[str, Any]]:
+    """Real Swiggy only: add delivery time, offer and open status from
+    `search_restaurants` for the first few restaurants in the result, and
+    drop dishes from restaurants that are closed."""
+    if not recommendations or not using_real_food_mcp():
+        return recommendations
+    wanted: list[tuple[str, str]] = []
+    for dish in recommendations:
+        pair = (str(dish.get("restaurant_id") or ""), str(dish.get("restaurant_name") or ""))
+        if pair[0] and pair[1] and pair not in wanted:
+            wanted.append(pair)
+        if len(wanted) >= _ENRICH_RESTAURANTS:
+            break
+    try:
+        info = food_mcp.restaurant_info(wanted, _resolve_address_id(address_id))
+    except Exception as exc:  # never lose results over missing extras
+        debug("recommendation_agent", f"restaurant info lookup failed ({exc}) -- ranking without it")
+        return recommendations
+    enriched = attach_restaurant_info(recommendations, info)
+    dropped = len(recommendations) - len(enriched)
+    if dropped:
+        debug("recommendation_agent", f"dropped {dropped} dish(es) from closed restaurants")
+    return enriched
+
 
 def _unwrap_tool_result(result: Any) -> list[dict[str, Any]]:
     if isinstance(result, dict):
@@ -558,6 +604,7 @@ def fetch_recommendations(
             ]
         debug("recommendation_agent", f"attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
+            recommendations = _enrich_with_restaurant_info(recommendations, address_id)
             ranked = _rank_candidates(
                 recommendations, desired_tags, desired_cuisine, desired_course, history,
                 desired_craving=filters.get("craving"),
@@ -598,6 +645,7 @@ def widen_recommendations(
         ]
         debug("recommendation_agent", f"widen attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
+            recommendations = _enrich_with_restaurant_info(recommendations, address_id)
             return _rank_candidates(
                 recommendations, desired_tags, desired_cuisine, desired_course, history,
                 desired_craving=filters.get("craving"),
@@ -805,6 +853,11 @@ def is_pure_feedback(user_input: str, recommendation_state: dict[str, Any] | Non
     if (user_input or "").strip() == _NO_SELECTION_VALUE:
         return True
 
+    if state.get("offer_kind") == OPENING_KIND:
+        # Only a pick is a reaction to the opening cards. "Something else", "no",
+        # "more" or anything typed is a (new) request -- intent asks what they want.
+        return bool(_resolve_choice(user_input, offered))
+
     if _resolve_choice(user_input, offered):
         return True
     if len(offered) == 1 and (user_input or "").strip().rstrip(".!") == "2":
@@ -842,6 +895,25 @@ def _reply_with_pick(
     )
     result["recommendation_state"] = rec_state
     return result
+
+
+OPENING_LEAD = "Not sure what to eat? Here are three ideas to start with:"
+OPENING_PROMPT = "Pick one, or tap Something else and I'll ask what you're in the mood for."
+
+
+def _offer_opening(picks: list[dict[str, Any]], filters: dict[str, Any], token: str | None) -> dict:
+    lines = []
+    for i, dish in enumerate(picks, start=1):
+        badge = f"{dish['badge']}: " if dish.get("badge") else ""
+        reason = f" — {dish['reason']}" if dish.get("reason") else ""
+        lines.append(f"  {i}. {badge}{_describe(dish)}{reason}")
+    options = _dish_pick_options(picks) + [{"value": SOMETHING_ELSE_VALUE, "label": SOMETHING_ELSE_LABEL}]
+    return _reply(
+        f"{OPENING_LEAD}\n" + "\n".join(lines) + f"\n{OPENING_PROMPT}",
+        awaiting_feedback=True, satisfied=False,
+        last_recommendations=picks, alternates=[], filters=filters,
+        options=options, offer_kind=OPENING_KIND, opening_token=token,
+    )
 
 
 def _serve_next_batch(
@@ -891,6 +963,18 @@ def recommendation_agent_node(state: CravrState) -> dict:
 
     user_input = _extract_latest_user_input(state.get("messages") or [])
     debug("recommendation_agent", f"user_input={user_input!r} awaiting_feedback={awaiting_feedback}")
+
+    opening_token = brief.get("opening_token")
+    showing_this_opening = (
+        recommendation_state.get("offer_kind") == OPENING_KIND
+        and opening_token
+        and recommendation_state.get("opening_token") == opening_token
+    )
+    if brief.get("opening_picks") and not showing_this_opening:
+        return _offer_opening(brief["opening_picks"], brief_filters, opening_token)
+    if recommendation_state.get("offer_kind") == OPENING_KIND and not showing_this_opening:
+        # They passed on the opening cards and told us what they want -- a fresh search.
+        awaiting_feedback = False
 
     if awaiting_feedback and not satisfied:
         is_category_offer = recommendation_state.get("offer_kind") == "category"

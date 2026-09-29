@@ -136,3 +136,12 @@ body { font-feature-settings: "ss01"; letter-spacing: -0.005em; }
 .cravr-diet::after { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
 .cravr-diet.veg { color: var(--cravr-green); border-color: var(--cravr-green); }
 .cravr-diet.nonveg { color: var(--cravr-red); border-color: var(--cravr-red); }
+
+/* Dishes-first opening: why this card, and the facts that decide an order */
+.cravr-card-badge {
+  align-self: flex-start; font-size: 11px; font-weight: 700; letter-spacing: 0.03em;
+  color: #fff; background: #ff5200; padding: 2px 8px; border-radius: 999px;
+}
+.cravr-eta { font-size: 12.5px; font-weight: 600; color: hsl(var(--muted-foreground)); }
+.cravr-offer { font-size: 12px; font-weight: 700; color: var(--cravr-green); }
+.cravr-reason { font-size: 12px; color: hsl(var(--muted-foreground)); line-height: 1.35; }

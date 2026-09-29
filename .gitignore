@@ -15,3 +15,5 @@ mcp_server/data/swiggy_tokens.json
 mcp_server/data/swiggy_client.json
 .chainlit/.files
 chainlit.db
+mcp_server/data/user_preferences.json
+logger.txt

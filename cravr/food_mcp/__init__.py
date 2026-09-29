@@ -56,6 +56,7 @@ from .search import (
     search_menu_items,
 )
 from .orders import get_order_history
+from .restaurants import restaurant_info, search_restaurants
 from .cart import (
     _strip_widget_disclaimer,
     apply_coupon,
@@ -80,6 +81,8 @@ __all__ = [
     "search_menu_items",
     "search_dishes",
     "get_order_history",
+    "restaurant_info",
+    "search_restaurants",
     "get_cart",
     "get_cart_item_details",
     "get_cart_valid_addons",

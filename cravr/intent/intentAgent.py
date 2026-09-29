@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime
 
@@ -113,6 +114,22 @@ def _derive(profile: dict, now: datetime | None = None) -> dict:
         )
 
     return derived
+
+
+def _should_open_with_dishes(state: dict, profile: dict) -> bool:
+    """True when the request says nothing about what to eat, and the user
+    hasn't just passed on the opening cards ("Something else" means: ask me)."""
+    if os.getenv("CRAVR_DISHES_FIRST", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    if _has_flavour_signal(profile) or profile.get("craving_tag"):
+        return False
+    rec = state.get("recommendation_state") or {}
+    declined = (
+        rec.get("offer_kind") == "opening"
+        and rec.get("awaiting_feedback")
+        and not rec.get("satisfied")
+    )
+    return not declined
 
 
 def _missing_fields(profile: dict) -> list[str]:
@@ -295,7 +312,22 @@ def intent_discovery_node(state: CravrState) -> dict:
         merged["dietary_preferences"] = [dietary_signal]
 
     profile = _derive(merged, now)
+    profile.pop("opening_picks", None)  # never carried over from an earlier turn
     debug("intent_agent", f"merged+derived profile={profile}")
+
+    if _should_open_with_dishes(state, profile):
+        # Dishes first: an undecided user can't answer "what are you in the mood
+        # for?", but can react to three concrete cards. Only if none can be
+        # built do we fall through to the questions below.
+        from ..recommend.opening import build_opening_picks
+
+        picks = build_opening_picks({**state, "intent_profile": profile}, now)
+        if picks:
+            debug("intent_agent", f"opening with {len(picks)} dish card(s) instead of questions")
+            profile["opening_picks"] = picks
+            profile["important_missing_information"] = []
+            profile["clarification_questions"] = []
+            return {"intent_profile": profile}
 
     transcript: list = []
     asked: list[str] = []

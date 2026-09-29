@@ -48,12 +48,20 @@ def _reorder_items(order: dict[str, Any]) -> list[dict[str, Any]]:
                 quantity = int(item.get("quantity") or 1)
             except (TypeError, ValueError):
                 quantity = 1
+            try:
+                unit_price = round(float(item.get("subtotal") or item.get("total") or 0) / max(quantity, 1), 2)
+            except (TypeError, ValueError):
+                unit_price = None
             out.append({
                 "menu_item_id": str(item.get("itemId") or ""),
                 "name": item.get("name") or "",
                 "quantity": quantity,
+                "price_inr": unit_price or None,
                 "is_veg": str(item.get("isVeg")) == "1",
                 "category": category.get("category") if isinstance(category, dict) else None,
+                # Any variant means the cart needs one set, so the add flow must look it up.
+                "has_variants": bool(item.get("variants")),
+                "has_addons": bool(item.get("addons")),
             })
         return out
     return []
