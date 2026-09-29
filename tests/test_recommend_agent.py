@@ -16,6 +16,7 @@ from cravr.recommend.RecommendAgent import (
     _offer_dish_batch,
     _rank_candidates,
     _resolve_multiple_choices,
+    _split_quantity,
     _widen_within_restaurant,
     build_recommendation_brief,
     _filter_variants,
@@ -893,6 +894,33 @@ class DishMultiSelectTests(unittest.TestCase):
         self.assertTrue(result["recommendation_state"]["satisfied"])
         self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
 
+    def test_picking_two_dishes_with_quantities_forwards_them_to_add_dish_to_cart(self):
+        # "1:2,3" is the chip-submitted shape (OptionChips.jsx's quantity
+        # stepper) -- option 1 (Butter Naan) qty 2, option 3 (Jeera Rice)
+        # defaults to qty 1.
+        state = self._dish_offer_state("1:2,3")
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), self._success("Jeera Rice", 180)],
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(mock_add.call_count, 2)
+        quantities = [call.kwargs.get("quantity") for call in mock_add.call_args_list]
+        self.assertEqual(quantities, [2, 1])
+        self.assertIn("Added 2x Butter Naan and Jeera Rice to your cart.", result["messages"][0].content)
+
+    def test_typed_quantity_suffix_also_works_from_the_dish_offer(self):
+        state = self._dish_offer_state("Butter Naan x3")
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            return_value=self._success("Butter Naan", 60),
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(mock_add.call_args.kwargs.get("quantity"), 3)
+        self.assertIn("Added 3x Butter Naan to your cart.", result["messages"][0].content)
+
     def test_a_dish_that_fails_partway_through_stops_the_batch_and_notes_what_already_landed(self):
         state = self._dish_offer_state("1,2,3")
         failure = {"messages": [AIMessage(content="Couldn't add that to your cart: rejected", name="cart_agent")],
@@ -936,6 +964,28 @@ class DishMultiSelectTests(unittest.TestCase):
         self.assertIn("Butter Naan", result["messages"][0].content)
         self.assertIn("Garlic Naan", result["messages"][0].content)
 
+    def test_handle_dish_multiselect_uses_the_quantities_dict_keyed_by_menu_item_id(self):
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), self._success("Garlic Naan", 70)],
+        ) as mock_add:
+            result = _handle_dish_multiselect(self.DISHES[:2], "addr1", None, quantities={"10": 4})
+
+        quantities = [call.kwargs.get("quantity") for call in mock_add.call_args_list]
+        self.assertEqual(quantities, [4, 1])
+        self.assertIn("4x Butter Naan", result["messages"][0].content)
+        self.assertIn("Garlic Naan", result["messages"][0].content)
+
+    def test_handle_dish_multiselect_with_no_quantities_dict_defaults_every_item_to_one(self):
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), self._success("Garlic Naan", 70)],
+        ) as mock_add:
+            _handle_dish_multiselect(self.DISHES[:2], "addr1", None)
+
+        quantities = [call.kwargs.get("quantity") for call in mock_add.call_args_list]
+        self.assertEqual(quantities, [1, 1])
+
 
 class MultiSelectCategoryTests(unittest.TestCase):
     RESTAURANT_SCOPE = {
@@ -972,22 +1022,42 @@ class MultiSelectCategoryTests(unittest.TestCase):
     def test_resolve_multiple_choices_splits_comma_joined_values(self):
         options = [{"item_name": "Breads"}, {"item_name": "Rice"}, {"item_name": "Chinese"}]
         chosen = _resolve_multiple_choices("1,3", options)
-        self.assertEqual([o["item_name"] for o in chosen], ["Breads", "Chinese"])
+        self.assertEqual([o["item_name"] for o, _qty in chosen], ["Breads", "Chinese"])
 
     def test_resolve_multiple_choices_splits_free_typed_and(self):
         options = [{"item_name": "Breads"}, {"item_name": "Rice"}, {"item_name": "Chinese"}]
         chosen = _resolve_multiple_choices("Breads and Chinese", options)
-        self.assertEqual([o["item_name"] for o in chosen], ["Breads", "Chinese"])
+        self.assertEqual([o["item_name"] for o, _qty in chosen], ["Breads", "Chinese"])
 
     def test_resolve_multiple_choices_ignores_unresolvable_tokens_and_dedupes(self):
         options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
         chosen = _resolve_multiple_choices("1, nonsense, 1, Rice", options)
-        self.assertEqual([o["item_name"] for o in chosen], ["Breads", "Rice"])
+        self.assertEqual([o["item_name"] for o, _qty in chosen], ["Breads", "Rice"])
 
     def test_resolve_multiple_choices_with_no_input_returns_empty(self):
         self.assertEqual(_resolve_multiple_choices("", [{"item_name": "Breads"}]), [])
         self.assertEqual(_resolve_multiple_choices("1", []), [])
 
+    def test_resolve_multiple_choices_defaults_every_pick_to_quantity_one(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("1,2", options)
+        self.assertEqual([qty for _o, qty in chosen], [1, 1])
+
+    def test_resolve_multiple_choices_picks_up_a_chip_submitted_quantity(self):
+        # OptionChips.jsx's quantity stepper encodes a >1 pick as "value:qty".
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("1:3,2", options)
+        self.assertEqual([(o["item_name"], qty) for o, qty in chosen], [("Breads", 3), ("Rice", 1)])
+
+    def test_resolve_multiple_choices_picks_up_a_typed_quantity_suffix(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("Breads x2, Rice", options)
+        self.assertEqual([(o["item_name"], qty) for o, qty in chosen], [("Breads", 2), ("Rice", 1)])
+
+    def test_resolve_multiple_choices_picks_up_a_typed_quantity_prefix(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("2x Breads", options)
+        self.assertEqual([(o["item_name"], qty) for o, qty in chosen], [("Breads", 2)])
     def test_picking_two_categories_merges_their_dishes(self):
         state = self._category_offer_state("1,2")
         result = recommendation_agent_node(state)
@@ -999,6 +1069,15 @@ class MultiSelectCategoryTests(unittest.TestCase):
             ["Breads", "Rice"],
         )
         self.assertIn("Breads and Rice", result["messages"][0].content)
+
+    def test_a_quantity_marker_on_a_category_pick_is_harmless(self):
+        # Categories aren't a quantity concept -- _handle_category_pick never
+        # sees the parsed quantity at all, so "1:2" behaves exactly like "1".
+        state = self._category_offer_state("1:2,2")
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan", "Jeera Rice"])
 
     def test_picking_all_three_categories_joins_labels_with_oxford_comma(self):
         state = self._category_offer_state("Breads, Rice and Chinese")
@@ -1057,6 +1136,35 @@ class MultiSelectCategoryTests(unittest.TestCase):
 
         category_names = [c["category"] for c in result["recommendation_state"]["last_recommendations"]]
         self.assertEqual(category_names, ["Chinese"])
+
+
+class SplitQuantityTests(unittest.TestCase):
+    """Unit coverage for the token-level quantity marker _resolve_multiple_choices
+    delegates to -- see its module-level docstring for the three recognised
+    shapes and why they don't collide."""
+
+    def test_plain_token_defaults_to_quantity_one(self):
+        self.assertEqual(_split_quantity("Falafel Wrap"), ("Falafel Wrap", 1))
+        self.assertEqual(_split_quantity("3"), ("3", 1))
+
+    def test_chip_submitted_colon_format(self):
+        self.assertEqual(_split_quantity("3:2"), ("3", 2))
+
+    def test_typed_suffix_on_a_name(self):
+        self.assertEqual(_split_quantity("Falafel Wrap x2"), ("Falafel Wrap", 2))
+        self.assertEqual(_split_quantity("Falafel Wrap×2"), ("Falafel Wrap", 2))
+
+    def test_typed_suffix_on_a_bare_index_means_index_then_quantity(self):
+        # "3x2" reads as "option 3, times 2" -- not "option 32".
+        self.assertEqual(_split_quantity("3x2"), ("3", 2))
+
+    def test_typed_prefix_on_a_name(self):
+        self.assertEqual(_split_quantity("2x Falafel Wrap"), ("Falafel Wrap", 2))
+        self.assertEqual(_split_quantity("2 x Falafel Wrap"), ("Falafel Wrap", 2))
+
+    def test_quantity_is_clamped_to_a_sane_range(self):
+        self.assertEqual(_split_quantity("3:0"), ("3", 1))
+        self.assertEqual(_split_quantity("3:99"), ("3", 20))
 
 
 class FeedbackShortcutTests(unittest.TestCase):

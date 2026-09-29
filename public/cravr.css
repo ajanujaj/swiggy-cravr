@@ -50,6 +50,23 @@ body { font-feature-settings: "ss01"; letter-spacing: -0.005em; }
 .cravr-chip:disabled:not(.is-picked):not(.is-on) { opacity: 0.45; }
 .cravr-chip .cravr-tick { font-size: 12px; }
 
+.cravr-chip-row { display: inline-flex; align-items: center; gap: 6px; }
+.cravr-qty {
+  display: inline-flex; align-items: center; gap: 2px;
+  border: 1.5px solid hsl(var(--primary)); border-radius: 999px;
+  background: hsl(var(--card)); padding: 2px;
+}
+.cravr-qty-btn {
+  appearance: none; cursor: pointer; font: inherit; font-weight: 700; font-size: 14px;
+  width: 22px; height: 22px; border-radius: 999px; border: 0; line-height: 1;
+  background: transparent; color: hsl(var(--primary));
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: background .15s;
+}
+.cravr-qty-btn:hover { background: hsl(var(--accent)); }
+.cravr-qty-btn:active { transform: scale(0.92); }
+.cravr-qty-val { font-size: 13px; font-weight: 700; min-width: 16px; text-align: center; }
+
 .cravr-primary {
   appearance: none; cursor: pointer; font: inherit; font-weight: 700; font-size: 14px;
   padding: 10px 20px; border-radius: 12px; border: 0;

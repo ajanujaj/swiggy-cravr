@@ -113,21 +113,37 @@ def _multiselect_question(question: str) -> str:
     return _clean_text(question.split("\n", 1)[0], True)
 
 
-async def send_multiselect_message(question: str, options: list[dict[str, str]] | None) -> None:
+async def send_multiselect_message(
+    question: str, options: list[dict[str, str]] | None, allow_quantity: bool = False,
+) -> None:
     chips = _chip_options(options)
-    element = _element("OptionChips", {"options": chips, "multi": True, "hint": _HINT})
+    element = _element("OptionChips", {"options": chips, "multi": True, "hint": _HINT, "quantities": allow_quantity})
     await _send(_multiselect_question(question), element)
     state.set_multiselect({"element": element, "options": chips})
     state.set_live_elements([element])
 
 
 def multiselect_answer(values: list[str]) -> tuple[str, str]:
+    """values may be plain option values ("3") or, when OptionChips.jsx's
+    quantity stepper was shown (allow_quantity=True on a dish multi-select),
+    "value:qty" for anything picked more than once. The raw string is what
+    actually goes on to the graph (RecommendAgent._split_quantity parses the
+    ":qty" suffix back out) -- this only needs to turn it into a readable
+    echoed label like "Falafel Wrap x2"."""
     current = state.get_multiselect() or {}
     state.set_multiselect(None)
     if not values:
         return _NONE_ADDON_VALUE, "None of these"
     labels = {o["value"]: o["label"] for o in current.get("options") or []}
-    return ",".join(values), ", ".join(labels.get(v, v) for v in values)
+
+    def _display(raw: str) -> str:
+        base, _, qty = raw.partition(":")
+        label = labels.get(base, base)
+        if qty.isdigit() and int(qty) > 1:
+            return f"{label} x{qty}"
+        return label
+
+    return ",".join(values), ", ".join(_display(v) for v in values)
 
 
 async def lock_element(element: cl.CustomElement, selected: Any = None) -> None:

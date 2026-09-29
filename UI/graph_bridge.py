@@ -70,18 +70,24 @@ async def process_result(result: dict[str, Any] | None) -> None:
     dishes = None
     options = None
     is_multiselect_offer = False
+    allow_quantity = False
     if source == "recommendation_agent":
         rec_state = result.get("recommendation_state") or {}
         dishes = rec_state.get("last_recommendations") or None
         options = rec_state.get("options") or None
         is_multiselect_offer = rec_state.get("offer_kind") in ("category", "dish")
+        # Quantity only makes sense once you're picking actual dishes to add,
+        # not restaurant categories -- so only the "dish" offer shows
+        # OptionChips.jsx's quantity stepper (and, symmetrically, the
+        # addon-selection interrupt above never sets allow_quantity at all).
+        allow_quantity = rec_state.get("offer_kind") == "dish"
     elif source == "cart_agent":
         options = (result.get("cart_state") or {}).get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
 
     if is_multiselect_offer and options:
-        await components.send_multiselect_message(content, options)
+        await components.send_multiselect_message(content, options, allow_quantity=allow_quantity)
     elif dishes:
         await components.send_dish_cards(content, dishes, options)
     else:

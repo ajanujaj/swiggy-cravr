@@ -190,21 +190,48 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
 
 _NO_SELECTION_VALUE = "__no_addon__"
 
+# A multi-select token can carry an optional quantity marker so a single
+# turn can say "2 of these, 1 of that" instead of everything defaulting to
+# one. Three shapes are recognised, tried in this order:
+#   "3:2"              -- chip-submitted (OptionChips.jsx's quantity
+#                          stepper encodes a >1 pick as "value:qty")
+#   "Falafel Wrap x2"   -- typed suffix, also covers "3x2" (index 3, qty 2)
+#   "2x Falafel Wrap"   -- typed prefix (guarded so it never also matches
+#                          the "3x2" suffix shape -- the remainder after
+#                          the marker must not itself be a bare number)
+# No marker at all still means quantity 1, exactly as before.
+_QTY_COLON_RE = re.compile(r"^(.*\S)\s*:\s*(\d{1,2})\s*$")
+_QTY_XSUFFIX_RE = re.compile(r"^(.*\S)\s*[x\u00d7]\s*(\d{1,2})\s*$", re.IGNORECASE)
+_QTY_XPREFIX_RE = re.compile(r"^\s*(\d{1,2})\s*[x\u00d7]\s*(\D.*\S)\s*$", re.IGNORECASE)
+
+
+def _split_quantity(token: str) -> tuple[str, int]:
+    t = (token or "").strip()
+    for pattern in (_QTY_COLON_RE, _QTY_XSUFFIX_RE):
+        m = pattern.match(t)
+        if m:
+            return m.group(1).strip(), max(1, min(20, int(m.group(2))))
+    m = _QTY_XPREFIX_RE.match(t)
+    if m:
+        return m.group(2).strip(), max(1, min(20, int(m.group(1))))
+    return t, 1
+
 
 def _resolve_multiple_choices(
     user_input: str, options: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
+) -> list[tuple[dict[str, Any], int]]:
     if not (user_input or "").strip() or not options:
         return []
 
     tokens = [t.strip() for t in re.split(r",|\band\b|&", user_input, flags=re.IGNORECASE) if t.strip()]
-    chosen: list[dict[str, Any]] = []
+    chosen: list[tuple[dict[str, Any], int]] = []
     seen_ids: set[int] = set()
     for token in tokens:
-        match = _resolve_choice(token, options)
+        identifier, quantity = _split_quantity(token)
+        match = _resolve_choice(identifier, options)
         if match is not None and id(match) not in seen_ids:
             seen_ids.add(id(match))
-            chosen.append(match)
+            chosen.append((match, quantity))
     return chosen
 
 
@@ -614,6 +641,7 @@ def _handle_category_pick(
 
 def _handle_dish_multiselect(
     dishes: list[dict[str, Any]], address_id: str | None, state: CravrState | None,
+    quantities: dict[str, int] | None = None,
 ) -> dict:
     if not dishes:
         return _reply("Nothing was picked to add.", awaiting_feedback=False, satisfied=False)
@@ -632,8 +660,11 @@ def _handle_dish_multiselect(
     added: list[str] = []
     result: dict[str, Any] = {}
     for dish in dishes:
+        quantity = 1
+        if quantities:
+            quantity = max(1, int(quantities.get(str(dish.get("menu_item_id")), 1) or 1))
         result = add_dish_to_cart(
-            dish, address_id,
+            dish, address_id, quantity=quantity,
             known_restaurant_id=known_restaurant_id, known_restaurant_name=known_restaurant_name,
         )
         cart_state = result.get("cart_state") or {}
@@ -645,7 +676,8 @@ def _handle_dish_multiselect(
                 result = {**result, "messages": [AIMessage(content=prior_note + original, name="cart_agent")]}
             result["recommendation_state"] = {"awaiting_feedback": False, "satisfied": False}
             return result
-        added.append(dish.get("item_name") or "that dish")
+        label = dish.get("item_name") or "that dish"
+        added.append(f"{quantity}x {label}" if quantity > 1 else label)
         restaurant = cart_state["restaurant"]
         known_restaurant_id = known_restaurant_id or restaurant.get("id")
         known_restaurant_name = known_restaurant_name or restaurant.get("name")
@@ -831,19 +863,22 @@ def recommendation_agent_node(state: CravrState) -> dict:
             chosen_many = _resolve_multiple_choices(user_input, offered)
             if chosen_many:
                 if is_category_offer:
+                    picked_categories = [dish for dish, _qty in chosen_many]
                     debug(
                         "recommendation_agent",
-                        f"user picked {len(chosen_many)} categor"
-                        f"{'y' if len(chosen_many) == 1 else 'ies'}: "
-                        f"{[c.get('category') for c in chosen_many]}",
+                        f"user picked {len(picked_categories)} categor"
+                        f"{'y' if len(picked_categories) == 1 else 'ies'}: "
+                        f"{[c.get('category') for c in picked_categories]}",
                     )
-                    return _handle_category_pick(chosen_many, recommendation_state, address_id)
+                    return _handle_category_pick(picked_categories, recommendation_state, address_id)
+                picked_dishes = [dish for dish, _qty in chosen_many]
+                quantities = {str(dish.get("menu_item_id")): qty for dish, qty in chosen_many}
                 debug(
                     "recommendation_agent",
                     f"user picked {len(chosen_many)} dish(es): "
-                    f"{[d.get('item_name') for d in chosen_many]}",
+                    f"{[(dish.get('item_name'), qty) for dish, qty in chosen_many]}",
                 )
-                return _handle_dish_multiselect(chosen_many, address_id, state)
+                return _handle_dish_multiselect(picked_dishes, address_id, state, quantities=quantities)
         else:
             chosen = _resolve_choice(user_input, offered)
             if chosen:
