@@ -43,6 +43,7 @@ The **single** place a dish gets added, used by both the cart agent's `add` acti
 | `_add_item_with_variant(...)` | For items with sizes/variants: asks for the variant, then tries each `_variant_shapes` payload until one is accepted. |
 | `_variant_shapes(variant_picks)` | Candidate request formats for variants (`variantsV2`, legacy `variants`, camelCase). |
 | `_addon_groups_matching_variant(addon_groups, variant_groups, chosen)` | Hides add-on groups that belong to a variant the user didn't pick. |
+| `_carry_forward_customizations(address_id, keep_ids)` | Reads the add-ons/variants of items already in the cart, so re-sending the full cart on the next `update_cart` doesn't silently drop them. |
 | `_retry_addons_via_valid_addons(...)` | Swiggy's documented fallback when add-ons are rejected: add the item alone, read its `valid_addons` from the cart, resend using those. |
 | `_map_to_valid_addons(selected, valid_groups)` | Pairs each pick with Swiggy's own `valid_addons` entry. |
 | `_addon_shapes(mapped)` / `_wire_addon(addon)` | Build the add-on payload in the formats Swiggy accepts (`choice_id` + `group_id`, ...). |
@@ -53,12 +54,12 @@ The **single** place a dish gets added, used by both the cart agent's `add` acti
 |---|---|
 | `_requires_customization(tags)` | `True` if the menu flagged the item "has addons" / "has variants". |
 | `_customization_refusal(item_name)` | The standard message when an item's required choices can't be set. |
-| `_suggest_complementary_items(menu_items, cart_item_id, exclude_ids, limit=5)` | Items from the same menu that pair with what's in the cart (e.g. drinks, desserts and sides after a main, following `_COMPLEMENT_ORDER`), skipping items that need customisation. |
+| `_menu_categories(menu_items, exclude_ids=None)` | Groups a restaurant's menu by category (first tag), in menu order, skipping excluded items and items that need customisation. Used for "add more from this restaurant". |
 
 ## `flows.py` — "what next" branches
 | Function | Usage |
 |---|---|
-| `_suggest_more_from_restaurant(state, address_id)` | "Add more from this restaurant": fetches that restaurant's menu and offers complementary items. |
+| `_suggest_more_from_restaurant(state, address_id)` | "Add more from this restaurant": fetches the restaurant's menu, groups it with `guards._menu_categories` (skipping what's already in the cart) and hands off to `recommend._offer_category_batch`, so the user picks categories, then dishes. |
 | `_start_over_new_restaurant(state, address_id)` | "Browse other restaurants": clears the cart and re-runs the search excluding the current restaurant. |
 | `_clear_cart_and_add_pending(state, address_id)` | "Clear my cart and add this": flushes the cart, then adds the parked dish with its already chosen add-ons. |
 | `_offer_dishes(lead_in, batch, filters, cart_state=None)` | Presents dishes through the recommender's own pick flow (same buttons and handling). |
@@ -92,8 +93,6 @@ The **single** place a dish gets added, used by both the cart agent's `add` acti
 |---|---|
 | `_parse_existing_cart_items(cart_message)` | Pulls `{menu_item_id, quantity}` pairs out of Swiggy's plain-text cart response. |
 | `_existing_cart_items(cart)` | Current cart items (structured data first, text fallback), used to merge a new add with what's there. |
-| `_menu_bucket(category_text)` | Coarse category: `main` / `side` / `drink` / `dessert`. |
-| `_format_cart(cart)` | Older plain cart formatter. Not called anywhere (`display._format_cart` is used instead), so it can be removed. |
 
 ## `restaurant_context.py`
 | Function | Usage |

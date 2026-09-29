@@ -88,7 +88,7 @@ async def process_result(result: dict[str, Any] | None) -> None:
         await components.send_assistant_message(content, options)
 
 
-async def send(value: str, display_label: str | None = None) -> None:
+async def send(value: str) -> None:
     try:
         if state.is_awaiting_interrupt():
             debug("ui", f"resuming interrupt with {value!r}")

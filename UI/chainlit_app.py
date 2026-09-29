@@ -46,7 +46,7 @@ async def on_pick(action: cl.Action) -> None:
     label = action.payload.get("label") or value
     await state.clear_live_options(selected=value)
     await cl.Message(content=str(label), type="user_message").send()
-    await graph_bridge.send(value, display_label=label)
+    await graph_bridge.send(value)
 
 
 @cl.action_callback("multiselect_submit")
@@ -57,4 +57,4 @@ async def on_multiselect_submit(action: cl.Action) -> None:
     await state.clear_live_options(selected=values)
     value, label = components.multiselect_answer(values)
     await cl.Message(content=label, type="user_message").send()
-    await graph_bridge.send(value, display_label=label)
+    await graph_bridge.send(value)

@@ -35,8 +35,9 @@ Swiggy's docs describe most tools as returning JSON, but many actually return **
 ## `search.py`
 | Function | Usage |
 |---|---|
-| `search_dishes(filters, address_id, limit_restaurants=5)` | Main dish search used by the recommender. If a specific craving is known → `search_menu_items`. Otherwise `search_restaurants` → `get_restaurant_menu` for the top restaurants → flatten → `_apply_filters` / `_matches_craving`. Returns a list of dish dicts (`item_name`, `menu_item_id`, `restaurant_name`, `restaurant_id`, `cuisine`, `price_inr`, `rating`, `tags`, `dietary_type`, ...). |
+| `search_dishes(filters, address_id, limit_restaurants=5)` | Main dish search used by the recommender. If a specific craving is known → `_search_menu_relevant` for `craving`, then also for `craving_secondary` (merged, no duplicates). Otherwise `search_restaurants` → `get_restaurant_menu` for the top restaurants → flatten → `_apply_filters` / `_matches_craving`. Returns a list of dish dicts (`item_name`, `menu_item_id`, `restaurant_name`, `restaurant_id`, `cuisine`, `price_inr`, `rating`, `tags`, `dietary_type`, ...). |
 | `search_menu_items(query, address_id, veg_only=False, offset=0, restaurant_id=None)` | `search_menu` by dish name. With `restaurant_id` it's a targeted lookup that also returns `detailed_items` (per-item add-on and variant groups), used by the cart's add-on flow. Returns `{"items", "has_more", "next_offset"}`, plus `detailed_items` on a targeted lookup. |
+| `_search_menu_relevant(query, address_id, veg_only, local_filters)` | One `search_menu_items` query, filtered locally and by `_matches_craving`, so unrelated items are dropped. |
 | `_parse_search_menu_items(text)` | Parses the numbered plain-text search results. |
 | `_parse_detailed_search_menu_items(text)` | Parses the targeted-lookup text into `{menu_item_id: {"item_name", "price_inr", "addon_groups", "variant_groups"}}`. |
 | `_attach_addon_limits(detailed, structured)` | Copies `minAddons` / `maxAddons` from `structured_content` onto those groups (the text has no selection rules). |
@@ -47,7 +48,8 @@ Swiggy's docs describe most tools as returning JSON, but many actually return **
 ## `menu.py`
 | Function | Usage |
 |---|---|
-| `get_restaurant_menu_items(restaurant_id, address_id, restaurant_name="")` | Full menu of one known restaurant (used by "add more from this restaurant"). |
+| `get_restaurant_menu_items(restaurant_id, address_id, restaurant_name="")` | Full menu of one known restaurant (used by "add more from this restaurant"), parsed into dish records. |
+| `_fetch_full_menu(restaurant_id, address_id)` | Pages through `get_restaurant_menu` (`_MENU_PAGE_SIZE` = 8 items, up to `_MENU_MAX_PAGES` = 12 pages) while `hasMore` is set, and joins the text. |
 | `_parse_menu_items(text, restaurant_name, restaurant_cuisine, restaurant_id=None)` | Parses menu text into dish records; each item gets its category from the nearest `##` / `###` header, and "has addons/variants" flags go into `tags`. |
 | `_normalize_item(item, ...)` | Same, for a JSON-shaped menu item (fallback path). |
 

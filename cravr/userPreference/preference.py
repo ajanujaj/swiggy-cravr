@@ -45,17 +45,6 @@ def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
     return _call_mcp_tool("user_preferences", user_id, mcp_url=MOCK_MCP_URL)
 
 
-def history_discovery_node(state: CravrState) -> dict:
-    user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
-    address_id = (state.get("context_profile") or {}).get("address_id")
-    history_profile = fetch_order_history(address_id, user_id=user_id)
-    debug(
-        "history_agent",
-        f"user_id={user_id!r} status={history_profile.get('status')!r} "
-        f"orders={len(history_profile.get('orders') or [])}",
-    )
-    return {"history_profile": history_profile, "user_id": user_id }
-
 def user_preference_node(state: CravrState) -> dict:
     user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
     context_profile = dict(state.get("context_profile") or {})

@@ -268,16 +268,6 @@ def _wire_addon(addon: dict[str, Any]) -> dict[str, Any]:
 
 
 def _carry_forward_customizations(address_id: str, keep_ids: set[str]) -> dict[str, dict[str, Any]]:
-    """A cart-payload rebuild resends every item in the cart, not just the one
-    being added -- update_cart replaces Swiggy's cart state with whatever
-    `cartItems` it's given. Without this, every item OTHER than the one
-    currently being added goes out bare (menu_item_id + quantity only),
-    silently stripping its addons/variant off the live cart. (Regression,
-    2026-09-29: add a Falafel Wrap with add-ons, then add a dessert -- the
-    wrap's add-ons vanished from the final order.) Look up each of those
-    other items' already-selected addons/variants (from the cart itself, via
-    get_cart_item_details) so they can be resent as-is instead of dropped.
-    """
     if not keep_ids:
         return {}
     details = food_mcp.get_cart_item_details(address_id)
@@ -450,17 +440,6 @@ def _add_item_with_variant(
         last_codes = result.get("error_codes")
         debug("cart_agent", f"addon-diag variant shape {label} rejected: error_codes={last_codes!r} "
               f"message={result.get('message')!r}")
-        # INVALID_ITEM_IDS_IN_REQUEST is a generic "didn't recognise an id in
-        # this payload" code from Swiggy, not a cart-conflict-specific one --
-        # add_dish_to_cart's own non-variant path (below) only treats it as a
-        # genuine cross-restaurant conflict when the existing cart actually
-        # holds some OTHER item. Do the same here: a live regression
-        # (2026-09-29, Margherita Ultimate Cheese Pizza / Pizza Hut) showed
-        # this code firing on a fresh add to an EMPTY cart -- no conflict was
-        # possible -- which was really shape V1 (variantsV2) getting
-        # rejected, and the retry gave up before ever trying V2/V3. Only
-        # short-circuit here when a same-cart-different-item conflict is
-        # actually proven; otherwise keep trying the remaining shapes.
         if "INVALID_ITEM_IDS_IN_REQUEST" in (last_codes or []) and any(
             str(i.get("menu_item_id")) != str(menu_item_id) for i in existing_items
         ):
@@ -701,7 +680,7 @@ def add_dish_to_cart(
                     f"Couldn't add {dish.get('item_name') or 'that item'} to your cart "
                     f"({', '.join(error_codes)}): {result.get('message') or 'Swiggy rejected the request'}"
                 )
-                return _cart_reply(f"{lead_in} {content}".strip() if False else content)
+                return _cart_reply(content)
             if error_codes:
                 reason = result.get("message") or "one or more add-ons weren't accepted"
                 debug("cart_agent", f"addon-only attempt: explicit rejection {error_codes!r} -- {reason!r}")

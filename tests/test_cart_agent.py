@@ -1831,20 +1831,6 @@ class ExistingCartItemsHelperTests(unittest.TestCase):
 
 
 class VariantShapeRetryTests(unittest.TestCase):
-    """Regression, 2026-09-29 (logger.txt: adding 'Margherita Ultimate
-    Cheese Pizza' from Pizza Hut with a 'Medium' size variant to a
-    completely EMPTY cart). _add_item_with_variant's wire-shape retry loop
-    used to stop trying the remaining shapes (V2, V3) the instant ANY shape
-    came back with INVALID_ITEM_IDS_IN_REQUEST, treating that code as an
-    unconditional 'the cart already holds another restaurant's items'
-    conflict -- even though the cart was empty, where no such conflict is
-    even possible. That's the same generic 'Swiggy didn't recognise an id
-    in this payload' code add_dish_to_cart's own non-variant path already
-    treats as ambiguous, only trusting it as a real conflict when the
-    existing cart provably holds some OTHER item -- this mirrors that same
-    guard for the variant path, so a genuine shape mismatch (V1 rejected,
-    V2 would have worked) no longer gets given up on early."""
-
     GROUP_ID = "66507856"
     VARIANT_ID = "200975505"
 
@@ -1920,16 +1906,6 @@ class VariantShapeRetryTests(unittest.TestCase):
 
 
 class CarryForwardCustomizationTests(unittest.TestCase):
-    """Regression, 2026-09-29 (user report: add a Falafel Wrap -> add its
-    add-ons -> "Add more from this restaurant" -> add a dessert -> the final
-    order has the main dish and the dessert, but the Falafel Wrap's add-ons
-    are gone). Every add_dish_to_cart / _add_item_with_variant call rebuilds
-    the *entire* cartItems payload sent to update_cart -- Swiggy replaces
-    cart state wholesale with whatever's sent, so any pre-existing item that
-    went out bare (menu_item_id + quantity only) silently lost its
-    addons/variant. These tests pin down that a second add's payload still
-    carries the first item's customization forward instead of dropping it."""
-
     _FALAFEL_ID = "204299705"
     _FALAFEL_DETAILS = {
         _FALAFEL_ID: {
@@ -2033,4 +2009,3 @@ class CarryForwardCustomizationTests(unittest.TestCase):
             [{"choice_id": 500, "group_id": 77, "name": "Double Smashed Falafel (+5 Pc)"}],
             first_payload,
         )
-

@@ -22,7 +22,7 @@ Turns the user's message into a structured **intent profile** and owns the clari
 | `_has_flavour_signal(profile)` | `True` once there's anything to search with (a dish, cuisine or taste). |
 | `_missing_fields(profile)` | What still needs asking, in order: `category` (only when there's no signal at all), then `craving_or_cuisine`. |
 | `_question_for(field, now, profile)` | The question text plus LLM-suggested options (`options.suggest_options`) with static fallbacks per category. |
-| `_apply_answer(profile, field, answer, now)` | Writes a reply straight into the field that was asked (no extra LLM round-trip), handling "no preference" answers. |
+| `_apply_answer(profile, field, answer, now)` | Writes a reply straight into the field that was asked (no extra LLM round-trip), handling "no preference" answers. When the answer to `craving_or_cuisine` names a cuisine and no craving is set yet, a free-typed category (one that isn't a known `CRAVING_TAG_CUES` tag) is carried over as the `craving`, so it isn't lost. |
 | `_is_no_preference(answer)` | Detects "anything", "no preference", etc. |
 
 ## `meal_clock.py`
