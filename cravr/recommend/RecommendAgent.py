@@ -12,6 +12,9 @@ from ..cart.CartAgent import add_dish_to_cart, _current_restaurant_id, _current_
 from ..cart.guards import _menu_categories
 from ..client import call_tool_sync, using_real_food_mcp
 from .signals import attach_restaurant_info, history_signals, practical_score
+from ..userPreference.taste import record_pick, record_rejection, taste_signals
+from . import feedback
+from .reasons import with_reasons
 from .opening import OPENING_KIND, SOMETHING_ELSE_LABEL, SOMETHING_ELSE_VALUE
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
@@ -131,7 +134,10 @@ ONLY_MATCH_PROMPT = "    1. Yes, I'll take it\n    2. Widen the search"
 
 
 def _numbered(dishes: list[dict[str, Any]]) -> str:
-    return "\n".join(f"  {i}. {_describe(d)}" for i, d in enumerate(dishes, start=1))
+    return "\n".join(
+        f"  {i}. {_describe(d)}" + (f" — {d['reason']}" if d.get("reason") else "")
+        for i, d in enumerate(dishes, start=1)
+    )
 
 
 def _dish_pick_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -426,7 +432,10 @@ def build_recommendation_brief(
         _coerce_profile(intent_profile), preference_profile
     )
     filters = _build_recommendation_filters(effective_intent)
-    history = _summarise_history(_coerce_profile(history_profile))
+    history = {
+        **_summarise_history(_coerce_profile(history_profile)),
+        **taste_signals(preference_profile),  # learned likes/dislikes (feature 1)
+    }
     return {"filters": filters, "history": history, "summary": _brief_summary(filters, history)}
 
 
@@ -619,7 +628,7 @@ def fetch_recommendations(
                 f"(relaxed: {relaxed or 'nothing'}, ranked against tags={desired_tags} "
                 f"cuisine={desired_cuisine!r} course={desired_course!r})",
             )
-            return ranked
+            return with_reasons(ranked, _ranking_signals(history), filters)
 
     debug("recommendation_agent", "no recommendations after exhausting all filter variants")
     return []
@@ -646,11 +655,11 @@ def widen_recommendations(
         debug("recommendation_agent", f"widen attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
             recommendations = _enrich_with_restaurant_info(recommendations, address_id)
-            return _rank_candidates(
+            return with_reasons(_rank_candidates(
                 recommendations, desired_tags, desired_cuisine, desired_course, history,
                 desired_craving=filters.get("craving"),
                 desired_craving_secondary=filters.get("craving_secondary"),
-            )
+            ), _ranking_signals(history), filters)
 
     debug("recommendation_agent", "widen found nothing beyond the original match")
     return []
@@ -862,6 +871,10 @@ def is_pure_feedback(user_input: str, recommendation_state: dict[str, Any] | Non
         return True
     if len(offered) == 1 and (user_input or "").strip().rstrip(".!") == "2":
         return True
+    # "too pricey", "something lighter", "too spicy": a reason for rejecting what's shown
+    # (feature 2). Checked before new constraints -- "too spicy" is not a request for spicy.
+    if feedback.infer_reason(user_input) and not re.search(r"\d{2,}", user_input or ""):
+        return True
     if _carries_new_constraints(user_input):
         return False
     return (
@@ -882,6 +895,7 @@ def _reply_with_pick(
     chosen: dict[str, Any], address_id: str | None, state: CravrState | None = None, **rec_state: Any
 ) -> dict:
     lead_in = f"Great — {_describe(chosen)} it is."
+    record_pick((state or {}).get("user_id"), chosen)  # feature 1: learn from every pick
     if not address_id:
         return _reply(
             f"{lead_in} I don't have a delivery address yet, so I couldn't add it to your cart.",
@@ -895,6 +909,57 @@ def _reply_with_pick(
     )
     result["recommendation_state"] = rec_state
     return result
+
+
+def _handle_rejection(
+    reason: str, state: CravrState, brief: dict[str, Any], rec_state: dict[str, Any], address_id: str | None,
+) -> dict:
+    """Fix what the user said was wrong (feature 2): tighten the search for that
+    reason, remember it, and show a new batch -- from the results already held
+    when enough of them pass, otherwise from a fresh search."""
+    offered = rec_state.get("last_recommendations") or []
+    alternates = rec_state.get("alternates") or []
+    record_rejection(state.get("user_id"), offered, reason)
+
+    adjustments = feedback.adjustments_for(reason, offered, rec_state.get("adjustments"))
+    shown = {str(n).strip().lower() for n in rec_state.get("shown_items") or []}
+    shown |= {str(d.get("item_name") or "").strip().lower() for d in offered}
+    debug("recommendation_agent", f"rejection reason={reason!r} adjustments={adjustments}")
+
+    def usable(dishes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        out = []
+        for d in dishes:
+            key = str(d.get("item_name") or "").strip().lower()
+            if key in shown or key in seen or not feedback.keeps(d, adjustments):
+                continue
+            seen.add(key)
+            out.append(d)
+        return out
+
+    new_brief = feedback.adjusted_brief(brief, adjustments)
+    candidates = usable(alternates)
+    if len(candidates) < DISPLAY_COUNT:
+        candidates = usable(candidates + fetch_recommendations(new_brief, address_id=address_id))
+
+    filters = dict(new_brief.get("filters") or {})
+    candidates = sorted(candidates, key=lambda d: feedback.preference_key(d, adjustments), reverse=True)
+    if not candidates:
+        return _reply(
+            f"{feedback.NOTHING_FOUND.get(reason, 'Nothing else fits.')} Tell me what to change "
+            "(a dish, cuisine or budget) and I'll look again.",
+            awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+            adjustments=adjustments, shown_items=sorted(shown),
+        )
+
+    batch, rest = candidates[:DISPLAY_COUNT], candidates[DISPLAY_COUNT:]
+    return _reply(
+        f"{feedback.LEAD_INS.get(reason, 'Here are some others:')}\n{_numbered(batch)}\n{PICK_PROMPT}",
+        awaiting_feedback=True, satisfied=False,
+        last_recommendations=batch, alternates=rest, filters=filters,
+        options=_dish_pick_options(batch),
+        adjustments=adjustments, shown_items=sorted(shown),
+    )
 
 
 OPENING_LEAD = "Not sure what to eat? Here are three ideas to start with:"
@@ -1022,6 +1087,13 @@ def recommendation_agent_node(state: CravrState) -> dict:
                     awaiting_feedback=False, satisfied=True, last_recommendations=[chosen],
                 )
 
+        if not (is_category_offer or is_dish_multiselect_offer):
+            reason = feedback.infer_reason(user_input)
+            if not reason and recommendation_state.get("awaiting_reason") and _looks_like_rejection(user_input):
+                reason = feedback.NOT_FOR_ME
+            if reason:
+                return _handle_rejection(reason, state, brief, recommendation_state, address_id)
+
         if len(offered) == 1 and _looks_like_decline_only_offer(user_input):
             restaurant_scope = recommendation_state.get("restaurant_scope")
             already_shown = {str(d.get("item_name") or "") for d in offered}
@@ -1078,6 +1150,14 @@ def recommendation_agent_node(state: CravrState) -> dict:
                 awaiting_feedback=True, satisfied=False,
                 last_recommendations=offered, alternates=alternates, filters=brief_filters,
                 options=_dish_pick_options(offered),
+            )
+
+        if _looks_like_rejection(user_input) and not (is_category_offer or is_dish_multiselect_offer):
+            # A bare "no": one tap tells us what to fix (feature 2).
+            debug("recommendation_agent", "user rejected the batch -- asking why")
+            return _reply(
+                feedback.REASON_QUESTION,
+                **{**recommendation_state, "awaiting_reason": True, "options": feedback.REASON_OPTIONS},
             )
 
         if _looks_like_rejection(user_input):

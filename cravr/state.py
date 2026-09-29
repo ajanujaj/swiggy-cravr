@@ -16,3 +16,4 @@ class CravrState(TypedDict):
     ready_to_recommend: bool
     decision: str
     cart_state: dict
+    group_state: dict  # group order poll (cravr/group)

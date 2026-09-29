@@ -6,6 +6,7 @@ from .node import cart_agent_node
 from .restaurant_context import _current_restaurant_id, _current_restaurant_name
 from .routing import (
     CART_ADD_MORE_VALUE,
+    CART_COMPLETE_MEAL_VALUE,
     CART_PROCEED_VALUE,
     CART_START_OVER_VALUE,
     CART_CLEAR_AND_ADD_VALUE,
@@ -24,6 +25,7 @@ __all__ = [
     "_current_restaurant_id",
     "_current_restaurant_name",
     "CART_ADD_MORE_VALUE",
+    "CART_COMPLETE_MEAL_VALUE",
     "CART_PROCEED_VALUE",
     "CART_START_OVER_VALUE",
     "CART_CLEAR_AND_ADD_VALUE",

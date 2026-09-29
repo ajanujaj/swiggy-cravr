@@ -26,6 +26,10 @@ _VIEW_RE = re.compile(
 )
 _COUPON_LIST_RE = re.compile(r"\bcoupons?\b|\boffers?\b|\bdiscounts?\b|\bdeals?\b", re.IGNORECASE)
 _QTY_RE = re.compile(r"\b(\d+)\b")
+_COMPLETE_MEAL_RE = re.compile(
+    r"\bcomplete (the |my )?meal\b|\b(add|suggest) (a )?(side|drink)s?\b|\bsomething to drink\b",
+    re.IGNORECASE,
+)
 
 CART_ADD_MORE_VALUE = "__cart_add_more__"
 CART_PROCEED_VALUE = "__cart_proceed__"
@@ -34,9 +38,11 @@ CART_CLEAR_AND_ADD_VALUE = "__cart_clear_and_add__"
 CART_KEEP_VALUE = "__cart_keep__"
 CART_UPI_PAID_VALUE = "__cart_upi_paid__"
 CART_UPI_NOT_PAID_VALUE = "__cart_upi_not_paid__"
+CART_COMPLETE_MEAL_VALUE = "__cart_complete_meal__"
 _NEXT_STEP_SENTINELS = {
     CART_ADD_MORE_VALUE, CART_PROCEED_VALUE, CART_START_OVER_VALUE,
     CART_CLEAR_AND_ADD_VALUE, CART_KEEP_VALUE, CART_UPI_PAID_VALUE, CART_UPI_NOT_PAID_VALUE,
+    CART_COMPLETE_MEAL_VALUE,
 }
 
 _CONFLICT_OPTIONS = [
@@ -45,6 +51,7 @@ _CONFLICT_OPTIONS = [
 ]
 
 _NEXT_STEP_OPTIONS = [
+    {"value": CART_COMPLETE_MEAL_VALUE, "label": "Complete the meal (side + drink)"},
     {"value": CART_ADD_MORE_VALUE, "label": "Add more from this restaurant"},
     {"value": CART_PROCEED_VALUE, "label": "Proceed"},
     {"value": CART_START_OVER_VALUE, "label": "Browse other restaurants"},
@@ -60,11 +67,13 @@ def is_cart_request(text: str) -> bool:
     t = (text or "").strip()
     if t in _NEXT_STEP_SENTINELS:
         return True
-    return bool(_CART_TOPIC_RE.search(t) or _COUPON_APPLY_RE.search(t))
+    return bool(_CART_TOPIC_RE.search(t) or _COUPON_APPLY_RE.search(t) or _COMPLETE_MEAL_RE.search(t))
 
 
 def _classify_cart_action(text: str) -> tuple[str, Any]:
     t = (text or "").strip()
+    if t == CART_COMPLETE_MEAL_VALUE or _COMPLETE_MEAL_RE.search(t):
+        return "complete_meal", None
     if t == CART_ADD_MORE_VALUE:
         return "suggest_more", None
     if t == CART_PROCEED_VALUE:

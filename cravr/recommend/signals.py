@@ -28,6 +28,11 @@ WEIGHTS = {
     "rating": 0.8,
     "recent_item": -3.0,       # had exactly this in the last day: outweighs every other boost
     "recent_restaurant": -0.4,
+    # Learned taste profile (userPreference/taste.py)
+    "liked_item": 0.8,
+    "liked_restaurant": 0.5,
+    "disliked_item": -2.5,
+    "over_typical_price": -0.3,
 }
 
 _MONTH_DAY_RE = re.compile(r"^\s*(?P<md>[A-Za-z]+\s+\d{1,2}),?\s*(?P<clock>\d{1,2}:\d{2}\s*[AaPp][Mm])?")
@@ -129,9 +134,24 @@ def practical_score(dish: dict[str, Any], signals: dict[str, Any] | None) -> flo
 
     eta = dish.get("eta_min")
     if isinstance(eta, (int, float)) and eta > 0:
-        score += WEIGHTS["eta"] * _clamp((60 - eta) / 40)  # <=20 min full credit, 60+ none
+        eta_weight = WEIGHTS["eta"] * (1.8 if signals.get("speed_sensitive") else 1)
+        score += eta_weight * _clamp((60 - eta) / 40)  # <=20 min full credit, 60+ none
     if dish.get("offer"):
-        score += WEIGHTS["offer"]
+        score += WEIGHTS["offer"] * (1.5 if signals.get("price_sensitive") else 1)
+
+    liked_items = signals.get("liked_items") or {}
+    liked_restaurants = signals.get("liked_restaurants") or {}
+    score += WEIGHTS["liked_item"] * _clamp(liked_items.get(item, 0) / 2)
+    score += WEIGHTS["liked_restaurant"] * _clamp(liked_restaurants.get(restaurant, 0) / 3)
+    if item and item in (signals.get("disliked_items") or {}):
+        score += WEIGHTS["disliked_item"]
+    typical = signals.get("typical_price_inr")
+    try:
+        price = float(dish.get("price_inr") or 0)
+    except (TypeError, ValueError):
+        price = 0
+    if typical and price > 1.5 * float(typical):
+        score += WEIGHTS["over_typical_price"] * (2 if signals.get("price_sensitive") else 1)
     rating = _rating(dish)
     if rating:
         score += WEIGHTS["rating"] * _clamp((rating - 3.5) / 1.3)

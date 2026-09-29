@@ -6,7 +6,10 @@ from typing import Any
 from .. import food_mcp
 from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
-from ..profile_utils import merge_profile
+from ..clock import now_ist
+from ..profile_utils import latest_user_text, merge_profile
+from .signals import detect_occasion
+from .weather import current_weather
 from ..state import CravrState
 
 
@@ -49,6 +52,10 @@ def context_discovery_node(state: CravrState) -> dict:
     }
 
     profile = merge_profile(existing_profile, extracted)
+    # Feature 5: ambient context -- weather at the address and the occasion (weekend
+    # night, match night). Both are best-effort and never asked about.
+    profile["weather"] = current_weather(profile.get("delivery_area"))
+    profile["occasion"] = detect_occasion(now_ist(), latest_user_text(state.get("messages") or []))
     profile["important_missing_information"] = []
     profile["clarification_questions"] = []
 

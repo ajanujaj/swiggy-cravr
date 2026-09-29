@@ -1,5 +1,6 @@
 import os
 os.environ.setdefault("CRAVR_DISHES_FIRST", "0")  # question-flow tests; see conftest.py
+os.environ.setdefault("CRAVR_WEATHER", "0")
 import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch

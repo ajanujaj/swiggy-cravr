@@ -313,6 +313,14 @@ def intent_discovery_node(state: CravrState) -> dict:
 
     profile = _derive(merged, now)
     profile.pop("opening_picks", None)  # never carried over from an earlier turn
+    # Feature 5: how they say they feel ("hungover", "just back from the gym") -- this turn only.
+    from ..context.signals import detect_mood
+
+    mood = detect_mood(latest_user_text(state.get("messages")))
+    if mood:
+        profile["mood"] = mood
+    else:
+        profile.pop("mood", None)
     debug("intent_agent", f"merged+derived profile={profile}")
 
     if _should_open_with_dishes(state, profile):

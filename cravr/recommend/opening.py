@@ -67,10 +67,11 @@ def _key(dish: dict[str, Any]) -> tuple[str, str]:
 
 
 def _diet_ok(dish: dict[str, Any], dietary_type: str | None) -> bool:
-    if not dietary_type:
+    # Only "Veg" rules dishes out -- a non-veg eater still eats their usual paneer wrap.
+    if dietary_type != "Veg":
         return True
     have = str(dish.get("dietary_type") or "")
-    return not have or have == dietary_type
+    return not have or have == "Veg"
 
 
 # ---------------------------------------------------------------- searching
@@ -96,9 +97,26 @@ def _search(query: str | None, mock_filters: dict[str, Any], address_id: str | N
         return _enrich_with_restaurant_info(dishes, address_id)
 
     filters = dict(mock_filters)
-    if dietary_type:
+    if dietary_type == "Veg":
         filters["dietary_type"] = dietary_type
     return _call_recommendation_tool(filters, address_id=address_id)
+
+
+def _search_first(queries: list[str], mock_filters: dict[str, Any], address_id: str | None,
+                  dietary_type: str | None) -> list[dict[str, Any]]:
+    for query in queries or [None]:
+        found = _search(query, mock_filters, address_id, dietary_type)
+        if found or not using_real_food_mcp():
+            return found
+    return []
+
+
+def _theme_reason(th: dict[str, Any], weather: dict[str, Any] | None) -> str:
+    if th["kind"] == "weather" and weather and weather.get("temp_c") is not None:
+        return f"{weather['label']} out ({round(weather['temp_c'])}°C) — just right for it"
+    if th["kind"] == "mood":
+        return "Picked for how you're feeling"
+    return f"{th['label']} tonight" if th["kind"] == "occasion" else th["label"]
 
 
 # ---------------------------------------------------------------- the cards
@@ -252,19 +270,30 @@ def _dietary_type(state: dict[str, Any]) -> str | None:
 def _build(state: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
     address_id = (state.get("context_profile") or {}).get("address_id")
     history_profile = state.get("history_profile") or {}
-    signals = history_signals(history_profile, now)
+    from ..userPreference.taste import taste_signals
+
+    signals = {**history_signals(history_profile, now), **taste_signals(state.get("preference_profile"))}
     dietary_type = _dietary_type(state)
     window = current_meal_window(now)
 
     new_query, new_mock = _new_query(history_profile)
     time_queries = _time_query(window.name, now)
 
+    # Feature 5: a mood, the weather or the occasion replaces the plain time-of-day card.
+    from ..context.signals import theme as context_theme
+
+    context = state.get("context_profile") or {}
+    th = context_theme((state.get("intent_profile") or {}).get("mood"), context.get("weather"),
+                       context.get("occasion"))
+    if th:
+        time_queries = th["queries"]
+
     # The two searches are independent -- run them side by side.
     with ThreadPoolExecutor(max_workers=3) as pool:
         usual_future = pool.submit(_usual_pick, history_profile, signals, address_id)
         new_future = pool.submit(_search, new_query, new_mock, address_id, dietary_type) \
             if (new_query or new_mock) else None
-        time_future = pool.submit(_search, time_queries[0], _MOCK_TIME_FILTERS.get(window.name, {}),
+        time_future = pool.submit(_search_first, time_queries[:2], _MOCK_TIME_FILTERS.get(window.name, {}),
                                   address_id, dietary_type)
         usual = usual_future.result()
         new_candidates = new_future.result() if new_future else []
@@ -289,8 +318,12 @@ def _build(state: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
 
     now_pick = _best(time_candidates, signals, skip, dietary_type, never_ordered=False)
     if now_pick:
-        now_pick["badge"] = f"Good for {WINDOW_PHRASE.get(window.name, 'right now')}"
-        now_pick["reason"] = f"It's {now.strftime('%-I:%M %p')}: a good fit for {WINDOW_PHRASE.get(window.name, 'now')}"
+        if th:
+            now_pick["badge"] = th["label"]
+            now_pick["reason"] = _theme_reason(th, context.get("weather"))
+        else:
+            now_pick["badge"] = f"Good for {WINDOW_PHRASE.get(window.name, 'right now')}"
+            now_pick["reason"] = f"It's {now.strftime('%-I:%M %p')}: a good fit for {WINDOW_PHRASE.get(window.name, 'now')}"
         picks.append(now_pick)
         skip.add(_key(now_pick))
 

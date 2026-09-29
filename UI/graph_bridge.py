@@ -83,6 +83,8 @@ async def process_result(result: dict[str, Any] | None) -> None:
         allow_quantity = rec_state.get("offer_kind") == "dish"
     elif source == "cart_agent":
         options = (result.get("cart_state") or {}).get("options") or None
+    elif source == "group_agent":
+        options = (result.get("group_state") or {}).get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
 

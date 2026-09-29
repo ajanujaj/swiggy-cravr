@@ -122,3 +122,20 @@ Command-line chat: `python -m cravr.run`.
 | `CRAVR_MCP_URL` | MCP server URL. Mock server by default; Swiggy's `https://mcp.swiggy.com/food` for real data. |
 | `CRAVR_DEBUG` | Print per-node traces to stderr. |
 | `CRAVR_TEST_MODE` | Fake checkout (no real order, no money). |
+| `CRAVR_DISHES_FIRST` | `0` turns off the opening cards (usual / something new / right now) and goes straight to questions. |
+| `CRAVR_WEATHER` | `0` turns off the Open-Meteo weather lookup. `CRAVR_WEATHER_CITY` overrides the city parsed from the address. |
+| `CRAVR_PUBLIC_URL` | Base URL for group-order poll links (defaults to the `SWIGGY_REDIRECT_URI` host, then `http://localhost:8001`). |
+| `CRAVR_PREFS_PATH` / `CRAVR_GROUPS_PATH` | Where the learned taste profile and group polls are stored (JSON; defaults under `mcp_server/data/`). |
+
+## Features added in the "undecided user" work
+
+| Feature | Where |
+|---|---|
+| Dishes-first opening cards | `recommend/opening.py` |
+| Ranking on history, delivery time, offers, open status | `recommend/signals.py`, `food_mcp/restaurants.py` |
+| Learned taste profile (likes, dislikes, inferred diet, typical price) | `userPreference/taste.py` |
+| Learning from "no" (asks why, fixes that, remembers it) | `recommend/feedback.py` |
+| A reason on every card | `recommend/reasons.py` |
+| Complete the meal (side + drink, same restaurant) | `cart/pairing.py` |
+| Weather, mood and occasion themes | `context/weather.py`, `context/signals.py` |
+| Group mode with a poll link | `group/` (poll page served by `group/web.py`) |

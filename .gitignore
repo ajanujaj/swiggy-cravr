@@ -17,3 +17,4 @@ mcp_server/data/swiggy_client.json
 chainlit.db
 mcp_server/data/user_preferences.json
 logger.txt
+mcp_server/data/groups.json
