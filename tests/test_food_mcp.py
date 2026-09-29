@@ -66,6 +66,61 @@ class SearchDishesCravingRelevanceTests(unittest.TestCase):
         self.assertNotIn("Cheesy Aloo Bunto Sandwich", names)
 
 
+NAAN_SEARCH_TEXT = (
+    'Found 3 menu items for "Naan":\n'
+    "1. Paneer Naan \u2014 \u20b9200 | Veg | Qureshi's kabab corner (restaurantId: 3001) (ID: 184895900)\n"
+    "2. Garlic Naan \u2014 \u20b949 | Veg | Street Foods By Punjab Grill (restaurantId: 3002) (ID: 184895901)\n"
+    "3. Butter Naan \u2014 \u20b960 | Veg | Santa Banta Da Dhaba (restaurantId: 3003) (ID: 184895902)\n"
+)
+
+PALAK_PANEER_SEARCH_TEXT = (
+    'Found 2 menu items for "Palak Paneer":\n'
+    "1. Palak Paneer \u2014 \u20b9385 | Veg | 5.0\u2605 | Ambersar By Enoki (restaurantId: 3004) (ID: 184895903)\n"
+    "2. Palak Paneer & Roti Meal \u2014 \u20b9450 | Veg | Ambersar By Enoki (restaurantId: 3004) (ID: 184895904)\n"
+)
+
+
+class SearchDishesCravingSecondaryTests(unittest.TestCase):
+    """Live regression, 2026-09-28: "Palak Paneer" -> "Naan" only ever
+    searched for "Naan" (craving), silently dropping the actual dish asked
+    for. craving_secondary triggers a second, separate search_menu call
+    (never one compound query -- that was tried live and made things
+    worse, see RecommendAgent's _build_recommendation_filters), and its
+    relevant results get merged into the primary ones."""
+
+    @staticmethod
+    def _fake_call(name, arguments):
+        query = arguments.get("query", "")
+        if query == "Naan":
+            return NAAN_SEARCH_TEXT
+        if query == "Palak Paneer":
+            return PALAK_PANEER_SEARCH_TEXT
+        return ""
+
+    def test_a_secondary_term_is_searched_separately_and_merged_in(self):
+        from unittest.mock import patch
+
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=self._fake_call):
+            results = search_dishes(
+                {"craving": "Naan", "craving_secondary": "Palak Paneer", "course": "main"},
+                "addr1",
+            )
+
+        names = {r["item_name"] for r in results}
+        self.assertIn("Palak Paneer", names)
+        self.assertIn("Palak Paneer & Roti Meal", names)
+        self.assertIn("Garlic Naan", names)
+        self.assertIn("Paneer Naan", names)
+
+    def test_no_secondary_term_means_no_extra_search_call(self):
+        from unittest.mock import patch
+
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=self._fake_call) as mock_call:
+            search_dishes({"craving": "Naan", "course": "main"}, "addr1")
+
+        self.assertEqual(mock_call.call_count, 1)
+
+
 class ParseDetailedSearchMenuItemsTests(unittest.TestCase):
     def test_parses_every_item_in_the_real_response(self):
         parsed = _parse_detailed_search_menu_items(DETAILED_RESPONSE_TEXT)

@@ -211,26 +211,41 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
 
     if intent_profile.get("craving"):
         craving = str(intent_profile["craving"])
+        filters["craving"] = craving
         craving_tag = intent_profile.get("craving_tag")
-        # craving_tag ("what round 1 said") and craving ("what round 2 said")
-        # can each name a genuinely different, real dish -- round 1 isn't
-        # always a vague category needing narrowing; it can already BE a
-        # specific one (e.g. "Palak Paneer"), with round 2's pick a pairing
-        # or side (e.g. "Naan"), not a narrower version of it. Using craving
-        # alone then silently drops round 1's dish entirely (live
-        # regression, 2026-09-28: "Palak Paneer" -> "Naan" searched for
-        # "Naan" only, "giving only Naan"). Combine them unless craving_tag
-        # is one of CRAVING_TAG_CUES' generic mood tags (nothing to search
-        # for on its own, e.g. "comfort-food") or already says the same
-        # thing as craving (avoid a redundant, duplicated query).
+        # craving_tag ("what round 1 said") can already BE a specific,
+        # multi-word dish name (e.g. "Palak Paneer"), with round 2's pick a
+        # pairing/side (e.g. "Naan"), not a narrower version of it -- using
+        # craving alone then searches for the side only, silently dropping
+        # the dish actually asked for (live regression, 2026-09-28: "Palak
+        # Paneer" -> "Naan" searched for "Naan" only, "giving only Naan").
+        # A single combined search string doesn't fix this either -- tried
+        # live and confirmed worse: "Palak Paneer Naan" ranked "Paneer
+        # Naan" (a different, unrelated dish that just happens to share two
+        # of the three words) above genuine Palak Paneer options, because
+        # Swiggy's free-text search doesn't reliably weigh multi-concept
+        # queries. So both are searched separately instead (see
+        # search.py's craving_secondary handling) and ranking picks the
+        # better match -- see _rank_candidates' craving-relevance term.
+        #
+        # Only promote craving_tag to a secondary search when it reads as
+        # an already-specific dish: 2+ words rules out a single vague
+        # category word like "sandwich" (round 2 narrowing that down to
+        # "Grilled Cheese" must still win outright, not get diluted by
+        # re-admitting every other kind of sandwich), and it must not be a
+        # cuisine name (that's a restaurant-level filter, not a dish, and
+        # search_menu returns poor results for a bare cuisine query -- see
+        # the "North Indian" -> 272-unfiltered-options regression) or one
+        # of CRAVING_TAG_CUES' generic mood tags (nothing to search for on
+        # its own, e.g. "comfort-food") or already the same dish as craving.
         if (
             craving_tag
+            and len(str(craving_tag).split()) >= 2
             and str(craving_tag) not in CRAVING_TAG_CUES
-            and str(craving_tag).strip().lower() not in craving.lower()
-            and craving.lower() not in str(craving_tag).strip().lower()
+            and str(craving_tag).strip().lower() not in KNOWN_CUISINE_WORDS
+            and str(craving_tag).strip().lower() != craving.strip().lower()
         ):
-            craving = f"{craving_tag} {craving}"
-        filters["craving"] = craving
+            filters["craving_secondary"] = str(craving_tag)
 
     cuisine = intent_profile.get("cuisine")
     if cuisine:
@@ -339,12 +354,39 @@ def _filter_variants(filters: dict[str, Any]) -> list[dict[str, Any]]:
     return variants
 
 
+def _craving_match_score(item_name: str, *phrases: str | None) -> int:
+    """+2 for each given phrase the item's name matches exactly, +1 for
+    each it merely contains as a substring -- across every phrase passed,
+    not just one. Used to rank a merged pool of results pulled from two
+    separate searches (craving + craving_secondary -- see
+    _build_recommendation_filters) so a dish genuinely named after what was
+    asked for outranks one that only shares a single stray word with one
+    of the two phrases (live regression, 2026-09-28: without this, a
+    same-tier boolean relevance check let "Paneer Naan" -- matches only
+    "Naan" -- rank ahead of "Palak Paneer" -- matches "Palak Paneer"
+    exactly -- since both merely "passed" the relevance filter with no
+    notion of how well)."""
+    name = (item_name or "").strip().lower()
+    score = 0
+    for phrase in phrases:
+        phrase_l = str(phrase or "").strip().lower()
+        if not phrase_l:
+            continue
+        if name == phrase_l:
+            score += 2
+        elif phrase_l in name:
+            score += 1
+    return score
+
+
 def _rank_candidates(
     recommendations: list[dict[str, Any]],
     desired_tags: list[str],
     desired_cuisine: str | None,
     desired_course: str | None,
     history: dict[str, Any],
+    desired_craving: str | None = None,
+    desired_craving_secondary: str | None = None,
 ) -> list[dict[str, Any]]:
     wanted_tags = {t.strip().lower() for t in desired_tags if t}
     cuisine = (desired_cuisine or "").strip().lower()
@@ -352,7 +394,7 @@ def _rank_candidates(
 
     past_cuisines = {str(c).strip().lower() for c in (history or {}).get("top_cuisines") or []}
 
-    def sort_key(item: dict[str, Any]) -> tuple[int, int, int, int, float]:
+    def sort_key(item: dict[str, Any]) -> tuple[int, int, int, int, int, float]:
         item_tags = {t.strip().lower() for t in str(item.get("tags") or "").split(";") if t.strip()}
         item_cuisine = str(item.get("cuisine") or "").strip().lower()
         item_course = str(item.get("course") or "").strip().lower()
@@ -361,6 +403,9 @@ def _rank_candidates(
         except (TypeError, ValueError):
             rating = 0.0
         return (
+            _craving_match_score(
+                str(item.get("item_name") or ""), desired_craving, desired_craving_secondary
+            ),
             1 if preferred_course and item_course == preferred_course else 0,
             len(wanted_tags & item_tags),
             1 if cuisine and cuisine in item_cuisine else 0,
@@ -438,7 +483,9 @@ def fetch_recommendations(
         debug("recommendation_agent", f"attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
             ranked = _rank_candidates(
-                recommendations, desired_tags, desired_cuisine, desired_course, history
+                recommendations, desired_tags, desired_cuisine, desired_course, history,
+                desired_craving=filters.get("craving"),
+                desired_craving_secondary=filters.get("craving_secondary"),
             )
             relaxed = sorted(set(filters) - set(variant))
             if variant.get("course") != desired_course:
@@ -475,7 +522,11 @@ def widen_recommendations(
         ]
         debug("recommendation_agent", f"widen attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
-            return _rank_candidates(recommendations, desired_tags, desired_cuisine, desired_course, history)
+            return _rank_candidates(
+                recommendations, desired_tags, desired_cuisine, desired_course, history,
+                desired_craving=filters.get("craving"),
+                desired_craving_secondary=filters.get("craving_secondary"),
+            )
 
     debug("recommendation_agent", "widen found nothing beyond the original match")
     return []

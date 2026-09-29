@@ -7,7 +7,9 @@ from cravr.graph import FEEDBACK, NEW_REQUEST, _route_entry, app
 from cravr.recommend.RecommendAgent import (
     ONLY_MATCH_OPTIONS,
     _build_recommendation_filters,
+    _craving_match_score,
     _dish_pick_options,
+    _rank_candidates,
     build_recommendation_brief,
     _filter_variants,
     _looks_like_acceptance,
@@ -76,29 +78,59 @@ class RecommendationFilterTests(unittest.TestCase):
     def test_an_empty_profile_still_asks_for_a_meal(self):
         self.assertEqual(_build_recommendation_filters({}), {"course": "main"})
 
-    def test_a_specific_round1_dish_is_not_dropped_by_a_round2_side_pick(self):
+    def test_a_specific_round1_dish_becomes_a_secondary_search_term(self):
         # Live regression, 2026-09-28: round 1 ("category") had already
         # named a specific, complete dish ("Palak Paneer"), and round 2
         # ("craving_or_cuisine") picked a pairing/side ("Naan"), not a
         # narrower version of it. craving alone ("Naan") searched for Naan
-        # only, silently dropping Palak Paneer -- "giving only Naan".
+        # only, silently dropping Palak Paneer -- "giving only Naan". A
+        # single combined search string ("Palak Paneer Naan") was tried
+        # live and made things worse: it ranked "Paneer Naan" -- a
+        # different, unrelated dish -- above genuine Palak Paneer options.
+        # So craving stays a single clean term and craving_tag becomes a
+        # SEPARATE search (craving_secondary, see search.py), not glued on.
         filters = _build_recommendation_filters(
             {"craving_tag": "Palak Paneer", "craving": "Naan"}
         )
-        self.assertIn("Palak Paneer", filters["craving"])
-        self.assertIn("Naan", filters["craving"])
+        self.assertEqual(filters["craving"], "Naan")
+        self.assertEqual(filters["craving_secondary"], "Palak Paneer")
 
-    def test_a_generic_mood_tag_is_not_folded_into_the_craving(self):
+    def test_a_single_word_category_is_not_promoted_to_a_secondary_search(self):
+        # "sandwich" is a vague category, not a specific dish -- round 2
+        # narrowing it down to "Grilled Cheese" must win outright, not get
+        # diluted by a secondary search re-admitting every other kind of
+        # sandwich (this is exactly the over-broad-options bug already
+        # fixed once in search.py's _matches_craving).
+        filters = _build_recommendation_filters(
+            {"craving_tag": "sandwich", "craving": "Grilled Cheese"}
+        )
+        self.assertEqual(filters["craving"], "Grilled Cheese")
+        self.assertNotIn("craving_secondary", filters)
+
+    def test_a_cuisine_name_is_not_promoted_to_a_secondary_search(self):
+        # A cuisine name isn't a dish -- search_menu returns poor results
+        # for a bare cuisine query (this is the "North Indian" -> 272
+        # unfiltered options bug), so it must not become craving_secondary
+        # even though it's two words.
+        filters = _build_recommendation_filters(
+            {"craving_tag": "North Indian", "craving": "Palak Paneer"}
+        )
+        self.assertEqual(filters["craving"], "Palak Paneer")
+        self.assertNotIn("craving_secondary", filters)
+
+    def test_a_generic_mood_tag_is_not_promoted_to_a_secondary_search(self):
         filters = _build_recommendation_filters(
             {"craving_tag": "comfort-food", "craving": "Grilled Cheese"}
         )
         self.assertEqual(filters["craving"], "Grilled Cheese")
+        self.assertNotIn("craving_secondary", filters)
 
     def test_a_craving_tag_repeating_the_craving_is_not_duplicated(self):
         filters = _build_recommendation_filters(
             {"craving_tag": "Palak Paneer", "craving": "Palak Paneer"}
         )
         self.assertEqual(filters["craving"], "Palak Paneer")
+        self.assertNotIn("craving_secondary", filters)
 
 
 class FilterRelaxationTests(unittest.TestCase):
@@ -159,6 +191,67 @@ class FilterRelaxationTests(unittest.TestCase):
             results = fetch_recommendations(build_recommendation_brief({"taste_preference": ["spicy"]}, history))
 
         self.assertEqual(results[0]["item_name"], "Masala Dosa")
+
+
+class CravingMatchScoreTests(unittest.TestCase):
+    def test_an_exact_match_outscores_a_partial_one(self):
+        self.assertGreater(
+            _craving_match_score("Palak Paneer", "Palak Paneer", "Naan"),
+            _craving_match_score("Paneer Naan", "Palak Paneer", "Naan"),
+        )
+
+    def test_matching_both_phrases_outscores_matching_one(self):
+        self.assertGreater(
+            _craving_match_score("Grilled Cheese Sandwich", "Grilled Cheese", "sandwich"),
+            _craving_match_score("Veg Achaari Sandwich", "Grilled Cheese", "sandwich"),
+        )
+
+    def test_no_match_scores_zero(self):
+        self.assertEqual(_craving_match_score("Butter Chicken", "Palak Paneer", "Naan"), 0)
+
+    def test_a_missing_phrase_is_skipped_without_erroring(self):
+        self.assertEqual(_craving_match_score("Naan", "Naan", None), 2)
+
+
+class RankCandidatesCravingRelevanceTests(unittest.TestCase):
+    """Live regression, 2026-09-28: round 1 gave a specific dish ("Palak
+    Paneer") and round 2 picked a side ("Naan"), so both get searched
+    separately (search.py) and merged into one pool. Without a relevance
+    score to rank that merged pool by, "Paneer Naan" (only related to the
+    side) tied with "Palak Paneer" (the actual dish asked for) on every
+    other ranking criterion and could out-rank it on rating alone."""
+
+    def test_the_dish_that_actually_matches_wins_over_a_look_alike(self):
+        candidates = [
+            {"item_name": "Paneer Naan", "rating": 4.9, "course": "main"},
+            {"item_name": "Palak Paneer", "rating": 4.2, "course": "main"},
+        ]
+        ranked = _rank_candidates(
+            candidates, [], None, "main", {},
+            desired_craving="Naan", desired_craving_secondary="Palak Paneer",
+        )
+        self.assertEqual(ranked[0]["item_name"], "Palak Paneer")
+
+    def test_a_generic_side_match_does_not_dilute_an_exact_narrowing_pick(self):
+        # No secondary term here (single-word categories like "sandwich"
+        # never become craving_secondary -- see _build_recommendation_filters),
+        # so this just confirms plain craving relevance still sorts first.
+        candidates = [
+            {"item_name": "Veg Achaari Sandwich", "rating": 4.9, "course": "main"},
+            {"item_name": "Grilled Cheese", "rating": 4.2, "course": "main"},
+        ]
+        ranked = _rank_candidates(
+            candidates, [], None, "main", {}, desired_craving="Grilled Cheese",
+        )
+        self.assertEqual(ranked[0]["item_name"], "Grilled Cheese")
+
+    def test_no_craving_terms_falls_back_to_existing_ranking_unchanged(self):
+        candidates = [
+            {"item_name": "A", "rating": 4.0, "course": "main"},
+            {"item_name": "B", "rating": 4.9, "course": "main"},
+        ]
+        ranked = _rank_candidates(candidates, [], None, "main", {})
+        self.assertEqual(ranked[0]["item_name"], "B")
 
 
 class CourseTests(unittest.TestCase):

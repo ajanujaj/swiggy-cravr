@@ -202,17 +202,52 @@ def search_menu_items(
     }
 
 
+def _search_menu_relevant(
+    query: str, address_id: str | None, veg_only: bool, local_filters: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """search_menu_items for `query`, cut down to items that pass
+    _apply_filters (dietary/price/cuisine) AND actually relate to `query`
+    by name (_matches_craving) -- search_menu is Swiggy's own free-text
+    search, not an exact-name lookup, so it can return dishes that don't
+    contain the craving at all, and _apply_filters alone never checks
+    relevance."""
+    result = search_menu_items(query, address_id, veg_only=veg_only)
+    if not result["items"]:
+        return []
+    filtered = _apply_filters(result["items"], local_filters)
+    return [d for d in filtered if _matches_craving(str(d.get("item_name") or ""), query)]
+
+
 def search_dishes(filters: dict[str, Any], address_id: str | None, limit_restaurants: int = 5) -> list[dict[str, Any]]:
     craving = filters.get("craving")
     if craving:
         veg_only = filters.get("dietary_type") == "Veg"
-        result = search_menu_items(str(craving), address_id, veg_only=veg_only)
-        if result["items"]:
-            local_filters = {k: v for k, v in filters.items() if k != "dietary_type"}
-            filtered = _apply_filters(result["items"], local_filters)
-            filtered = [d for d in filtered if _matches_craving(str(d.get("item_name") or ""), str(craving))]
-            if filtered:
-                return filtered
+        local_filters = {k: v for k, v in filters.items() if k != "dietary_type"}
+        filtered = _search_menu_relevant(str(craving), address_id, veg_only, local_filters)
+
+        # craving_tag can independently name a real, different dish from
+        # craving (round 1 "Palak Paneer" + round 2 "Naan" -- a side, not a
+        # narrower version of it). Searching craving alone never looks for
+        # round 1's dish at all. A single combined search string doesn't
+        # work either -- confirmed live: "Palak Paneer Naan" ranked
+        # "Paneer Naan" (an unrelated dish sharing two of three words)
+        # above genuine Palak Paneer options. So both are searched
+        # separately and merged here; _rank_candidates scores the merged
+        # pool by how well each dish matches either phrase (see
+        # RecommendAgent's _craving_match_score), so the genuinely-named
+        # dish wins regardless of which search turned it up.
+        craving_secondary = filters.get("craving_secondary")
+        if craving_secondary:
+            secondary_filtered = _search_menu_relevant(
+                str(craving_secondary), address_id, veg_only, local_filters
+            )
+            seen_ids = {str(d.get("menu_item_id")) for d in filtered}
+            filtered = filtered + [
+                d for d in secondary_filtered if str(d.get("menu_item_id")) not in seen_ids
+            ]
+
+        if filtered:
+            return filtered
         debug("food_mcp", f"search_menu found nothing usable for {craving!r} -- falling back to search_restaurants")
 
     query = filters.get("cuisine") or filters.get("tags") or filters.get("dietary_type") or "restaurants"
