@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -26,7 +28,60 @@ about the same field get visibly different, time-appropriate choices rather
 than the same generic list. Never include a catch-all choice like "other" or
 "something else" -- that is added separately. Never invent facts about the
 user; base choices only on the question and the given context.
+
+The user orders delivery on Swiggy in India. Suggest dishes and categories
+that are commonly delivered in Indian cities (the given delivery area, if
+any) -- not niche items few restaurants deliver, such as charcuterie boards
+or tapas, unless the user asked for them. When `recent_orders` or
+`favourite_restaurants` are given, make at least one choice come straight
+from them (a dish they have ordered before), and keep the rest in a similar
+spirit and price range.
 """.strip()
+
+# Options shown with an interrupt must be the SAME options when the graph
+# resumes: LangGraph re-runs the node from the top on resume, so asking the
+# LLM again produced a different list (a typed "3" could then resolve to a
+# different choice than the one on screen, and each resume cost an extra
+# LLM call). Keyed by thread id + caller's key; callers clear their entries
+# once the node finishes.
+_OPTION_CACHE: dict[tuple, Any] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _current_thread_id() -> str | None:
+    try:
+        from langgraph.config import get_config
+
+        return (get_config().get("configurable") or {}).get("thread_id")
+    except Exception:
+        return None  # called outside a graph run (tests, scripts) -- no caching
+
+
+def stable(key: tuple, build: Callable[[], Any]) -> Any:
+    """Return the value built for `key` in this thread, building it only once."""
+    thread_id = _current_thread_id()
+    if thread_id is None:
+        return build()
+    full_key = (thread_id, *key)
+    with _CACHE_LOCK:
+        if full_key in _OPTION_CACHE:
+            debug("options", f"reusing options shown earlier for {key!r}")
+            return _OPTION_CACHE[full_key]
+    value = build()
+    with _CACHE_LOCK:
+        _OPTION_CACHE.setdefault(full_key, value)
+        return _OPTION_CACHE[full_key]
+
+
+def clear_stable(prefix: tuple) -> None:
+    """Forget this thread's cached entries whose key starts with `prefix`."""
+    thread_id = _current_thread_id()
+    if thread_id is None:
+        return
+    full_prefix = (thread_id, *prefix)
+    with _CACHE_LOCK:
+        for key in [k for k in _OPTION_CACHE if k[: len(full_prefix)] == full_prefix]:
+            del _OPTION_CACHE[key]
 
 
 def suggest_options(

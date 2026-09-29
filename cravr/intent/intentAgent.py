@@ -28,7 +28,7 @@ from .meal_utils import (
     MAX_INTENT_CLARIFICATION_ROUNDS,
 )
 
-from ..options import OTHER_VALUE, resolve_option_choice, suggest_options
+from ..options import OTHER_VALUE, clear_stable, resolve_option_choice, stable, suggest_options
 from .prompt import INTENT_DISCOVERY_PROMPT
 
 
@@ -129,12 +129,14 @@ _CATEGORY_OPTION_FALLBACK = [
     "Healthy", "Comfort food", "Something sweet", "High protein", "Budget-friendly",
 ]
 
+# India-first: these show when the LLM is unreachable, so they must be dishes
+# most Swiggy areas actually deliver.
 _TYPE_OPTION_FALLBACKS_BY_CATEGORY = {
-    "comfort-food": ["Butter chicken", "Mac and cheese", "Biryani", "Pizza", "Noodles"],
-    "lightweight": ["Salad", "Soup", "Grilled chicken", "Poke bowl", "Sushi"],
-    "high-protein": ["Grilled chicken", "Paneer bowl", "Egg curry", "Sushi", "Protein bowl"],
-    "low-calorie": ["Salad", "Soup", "Grilled fish", "Sushi", "Steamed veggies"],
-    "dessert": ["Cake", "Ice cream", "Brownie", "Pastry", "Gulab jamun"],
+    "comfort-food": ["Butter chicken", "Biryani", "Rajma chawal", "Pizza", "Hakka noodles"],
+    "lightweight": ["Salad", "Soup", "Idli", "Poha", "Grilled chicken"],
+    "high-protein": ["Grilled chicken", "Paneer tikka", "Egg curry", "Chicken tikka", "Protein bowl"],
+    "low-calorie": ["Salad", "Soup", "Grilled fish", "Idli", "Sprouts chaat"],
+    "dessert": ["Gulab jamun", "Ice cream", "Brownie", "Cake", "Rasmalai"],
 }
 _DEFAULT_CRAVING_OPTION_FALLBACK = [
     "A dish in mind", "A cuisine", "Spicy or sweet",
@@ -142,42 +144,85 @@ _DEFAULT_CRAVING_OPTION_FALLBACK = [
 ]
 
 
-def _question_for(
-    field: str, now: datetime | None = None, profile: dict | None = None
-) -> tuple[str, list[dict]]:
+def _user_grounding(state: dict | None) -> dict:
+    """What we know about this user's real ordering, so suggested options fit
+    them (a vada-pav-and-chai regular shouldn't be offered a charcuterie board)."""
+    state = state or {}
+    grounding: dict = {}
+    area = (state.get("context_profile") or {}).get("delivery_area")
+    if area:
+        grounding["delivery_area"] = area
+    orders = (state.get("history_profile") or {}).get("orders") or []
+    recent = []
+    for order in orders[:5]:
+        names = [i.get("name") for i in (order.get("items") or []) if i.get("name")]
+        if not names and order.get("item_name"):
+            names = [order["item_name"]]
+        if order.get("restaurant_name") or names:
+            recent.append({"restaurant": order.get("restaurant_name"), "items": names[:4]})
+    if recent:
+        grounding["recent_orders"] = recent
+        counts: dict[str, int] = {}
+        for entry in recent:
+            if entry["restaurant"]:
+                counts[entry["restaurant"]] = counts.get(entry["restaurant"], 0) + 1
+        grounding["favourite_restaurants"] = sorted(counts, key=counts.get, reverse=True)[:3]
+    prefs = (state.get("preference_profile") or {}).get("preferences") or {}
+    if isinstance(prefs, dict) and prefs.get("dietary_preference"):
+        grounding["dietary_preference"] = prefs["dietary_preference"]
+    return grounding
+
+
+def _question_text(field: str, profile: dict | None = None) -> str:
     if field == "category":
-        question = "What are you in the mood for?"
+        return "What are you in the mood for?"
+    if field == "craving_or_cuisine":
+        category = (profile or {}).get("craving_tag")
+        category_label = category.replace("-", " ") if category else None
+        if category_label:
+            return (
+                f"Great — {category_label}! What sounds good — a specific dish, a cuisine, "
+                "or something else?"
+            )
+        return (
+            "What are you in the mood for — a dish, a cuisine, or just a flavour "
+            "like spicy or sweet?"
+        )
+    return f"Could you tell me a bit more about {field.replace('_', ' ')}?"
+
+
+def _question_for(
+    field: str, now: datetime | None = None, profile: dict | None = None,
+    state: dict | None = None,
+) -> tuple[str, list[dict]]:
+    profile = profile or {}
+    question = _question_text(field, profile)
+    grounding = _user_grounding(state)
+    if field == "category":
         options = suggest_options(
             question,
             context={
-                "meal_time": (profile or {}).get("meal_time"),
-                "hunger_level": (profile or {}).get("hunger_level"),
+                "meal_time": profile.get("meal_time"),
+                "hunger_level": profile.get("hunger_level"),
+                **grounding,
             },
             fallback=_CATEGORY_OPTION_FALLBACK,
         )
         return question, options
     if field == "craving_or_cuisine":
-        category = (profile or {}).get("craving_tag")
-        category_label = category.replace("-", " ") if category else None
-        question = (
-            f"Great — {category_label}! What sounds good — a specific dish, a cuisine, "
-            "or something else?"
-            if category_label else
-            "What are you in the mood for — a dish, a cuisine, or just a flavour "
-            "like spicy or sweet?"
-        )
+        category = profile.get("craving_tag")
         options = suggest_options(
             question,
             context={
                 "category": category,
-                "meal_time": (profile or {}).get("meal_time"),
-                "hunger_level": (profile or {}).get("hunger_level"),
+                "meal_time": profile.get("meal_time"),
+                "hunger_level": profile.get("hunger_level"),
+                **grounding,
             },
             fallback=_TYPE_OPTION_FALLBACKS_BY_CATEGORY.get(category, _DEFAULT_CRAVING_OPTION_FALLBACK),
         )
         return question, options
-    question = f"Could you tell me a bit more about {field.replace('_', ' ')}?"
-    return question, suggest_options(question, context=profile or {}, fallback=[])
+    return question, suggest_options(question, context={**profile, **grounding}, fallback=[])
 
 
 def _apply_answer(profile: dict, field: str, answer: str, now: datetime | None = None) -> dict:
@@ -254,6 +299,8 @@ def intent_discovery_node(state: CravrState) -> dict:
 
     transcript: list = []
     asked: list[str] = []
+    # Unchanged across interrupt replays within one user turn; changes on the next turn.
+    turn_marker = len(state.get("messages") or [])
 
     for round_number in range(1, MAX_INTENT_CLARIFICATION_ROUNDS + 1):
         pending = [f for f in _missing_fields(profile) if f not in asked]
@@ -261,7 +308,11 @@ def intent_discovery_node(state: CravrState) -> dict:
             break
 
         field = pending[0]
-        question, options = _question_for(field, now, profile)
+        # Same question + options on every replay of this node (see options.stable).
+        question, options = stable(
+            ("intent", turn_marker, round_number, field),
+            lambda: _question_for(field, now, profile, state),
+        )
         debug("intent_agent", f"asking (round {round_number}) about {field!r}: {question!r}")
 
         raw_answer = interrupt({
@@ -299,9 +350,9 @@ def intent_discovery_node(state: CravrState) -> dict:
     if still_missing:
         debug("intent_agent", f"proceeding with gaps remaining: {still_missing}")
     profile["important_missing_information"] = still_missing
-    profile["clarification_questions"] = [
-        _question_for(field, now, profile)[0] for field in still_missing
-    ]
+    # Text only -- building options here cost an LLM call per field for nothing.
+    profile["clarification_questions"] = [_question_text(field, profile) for field in still_missing]
+    clear_stable(("intent", turn_marker))
 
     updates: dict = {"intent_profile": profile}
     if transcript:

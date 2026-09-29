@@ -3,5 +3,12 @@ from .preference import (
     fetch_user_preferences,
     user_preference_node,
 )
+from .store import load_preferences, save_preferences
 
-__all__ = ["fetch_order_history", "fetch_user_preferences", "user_preference_node"]
+__all__ = [
+    "fetch_order_history",
+    "fetch_user_preferences",
+    "load_preferences",
+    "save_preferences",
+    "user_preference_node",
+]

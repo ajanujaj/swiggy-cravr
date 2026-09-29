@@ -258,6 +258,31 @@ def _course_preference(intent_profile: dict[str, Any]) -> str:
     return "main"
 
 
+BUDGET_FRIENDLY_MAX_INR = 200
+_BUDGET_CUES = ("budget", "cheap", "pocket", "affordable", "value")
+
+
+def _is_budget_category(craving_tag: Any) -> bool:
+    text = str(craving_tag or "").strip().lower()
+    return bool(text) and any(cue in text for cue in _BUDGET_CUES)
+
+
+def _free_text_category(craving_tag: Any) -> str | None:
+    """The first-round answer when it names food, not a mood tag, cuisine or budget."""
+    text = str(craving_tag or "").strip()
+    lowered = text.lower()
+    if (
+        len(lowered) < 2
+        or lowered.isdigit()
+        or text in CRAVING_TAG_CUES
+        or lowered in KNOWN_TAGS
+        or lowered in KNOWN_CUISINE_WORDS
+        or _is_budget_category(lowered)
+    ):
+        return None
+    return text
+
+
 def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, Any]:
     filters: dict[str, Any] = {}
 
@@ -283,8 +308,17 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
             and str(craving_tag).strip().lower() != craving.strip().lower()
         ):
             filters["craving_secondary"] = str(craving_tag)
+    else:
+        # No craving, but the first answer was free text ("Small wrap", "Keto") rather
+        # than a known mood tag -- that's the only thing the user told us, so search for
+        # it instead of dropping it (it used to fall through to a generic "restaurants" search).
+        free_text = _free_text_category(intent_profile.get("craving_tag"))
+        if free_text:
+            filters["craving"] = free_text
 
     cuisine = intent_profile.get("cuisine")
+    if not cuisine and str(intent_profile.get("craving_tag") or "").strip().lower() in KNOWN_CUISINE_WORDS:
+        cuisine = intent_profile["craving_tag"]
     if cuisine:
         filters["cuisine"] = str(cuisine)
 
@@ -297,6 +331,8 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
             break
 
     budget = intent_profile.get("budget_inr")
+    if budget is None and _is_budget_category(intent_profile.get("craving_tag")):
+        budget = BUDGET_FRIENDLY_MAX_INR
     if budget is not None:
         try:
             filters["max_price_inr"] = int(budget)
@@ -311,11 +347,21 @@ def _summarise_history(history_profile: dict[str, Any]) -> dict[str, Any]:
     cuisines = Counter(
         str(o.get("cuisine")).strip() for o in orders if o.get("cuisine")
     )
-    items = Counter(str(o.get("item_name")).strip() for o in orders if o.get("item_name"))
+    restaurants = Counter(
+        str(o.get("restaurant_name")).strip() for o in orders if o.get("restaurant_name")
+    )
+    # Real Swiggy orders carry every item in `items`; mock orders only `item_name`.
+    items: Counter = Counter()
+    for o in orders:
+        names = {str(i.get("name")).strip() for i in (o.get("items") or []) if i.get("name")}
+        if not names and o.get("item_name"):
+            names = {str(o["item_name"]).strip()}
+        items.update(names)
 
     return {
         "order_count": len(orders),
         "top_cuisines": [name for name, _count in cuisines.most_common(2)],
+        "top_restaurants": [name for name, _count in restaurants.most_common(3)],
         "repeat_items": [name for name, count in items.most_common(3) if count > 1],
     }
 
@@ -338,6 +384,8 @@ def _brief_summary(filters: dict[str, Any], history: dict[str, Any]) -> str:
     parts = [intent]
     if history.get("top_cuisines"):
         parts.append("usually orders " + " and ".join(history["top_cuisines"]))
+    if history.get("top_restaurants"):
+        parts.append("often orders from " + ", ".join(history["top_restaurants"]))
     if history.get("repeat_items"):
         parts.append("re-orders " + ", ".join(history["repeat_items"]))
 
@@ -419,6 +467,7 @@ def _rank_candidates(
     preferred_course = (desired_course or "").split(",")[0].strip().lower()
 
     past_cuisines = {str(c).strip().lower() for c in (history or {}).get("top_cuisines") or []}
+    past_restaurants = {str(r).strip().lower() for r in (history or {}).get("top_restaurants") or []}
 
     def sort_key(item: dict[str, Any]) -> tuple[int, int, int, int, int, float]:
         item_tags = {t.strip().lower() for t in str(item.get("tags") or "").split(";") if t.strip()}
@@ -435,7 +484,8 @@ def _rank_candidates(
             1 if preferred_course and item_course == preferred_course else 0,
             len(wanted_tags & item_tags),
             1 if cuisine and cuisine in item_cuisine else 0,
-            1 if item_cuisine in past_cuisines else 0,
+            1 if (item_cuisine in past_cuisines
+                  or str(item.get("restaurant_name") or "").strip().lower() in past_restaurants) else 0,
             rating,
         )
 

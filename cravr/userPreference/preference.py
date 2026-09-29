@@ -8,6 +8,7 @@ from ..client import MOCK_MCP_URL, call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
 from ..profile_utils import merge_profile
 from ..state import CravrState
+from .store import load_preferences
 
 
 def _call_mcp_tool(tool_name: str, user_id: str | None, *, mcp_url: str | None = None) -> dict[str, Any]:
@@ -42,7 +43,17 @@ def fetch_order_history(address_id: str | None = None, *, user_id: str | None = 
     return _call_mcp_tool("order_history", user_id)
 
 def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
-    return _call_mcp_tool("user_preferences", user_id, mcp_url=MOCK_MCP_URL)
+    """Saved preferences. Real Swiggy has no preference tool, so Cravr's own
+    store is the source there. With the mock server, its `user_preferences`
+    tool is tried first and the store is the fallback when it's unreachable."""
+    if using_real_food_mcp():
+        return load_preferences(user_id)
+
+    result = _call_mcp_tool("user_preferences", user_id, mcp_url=MOCK_MCP_URL)
+    if result.get("status") == "error":
+        debug("preference_agent", "mock user_preferences unavailable -- using Cravr's own store")
+        return load_preferences(user_id)
+    return result
 
 
 def user_preference_node(state: CravrState) -> dict:
