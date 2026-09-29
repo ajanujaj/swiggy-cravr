@@ -406,7 +406,20 @@ def _add_item_with_variant(
         last_codes = result.get("error_codes")
         debug("cart_agent", f"addon-diag variant shape {label} rejected: error_codes={last_codes!r} "
               f"message={result.get('message')!r}")
-        if "INVALID_ITEM_IDS_IN_REQUEST" in (last_codes or []):
+        # INVALID_ITEM_IDS_IN_REQUEST is a generic "didn't recognise an id in
+        # this payload" code from Swiggy, not a cart-conflict-specific one --
+        # add_dish_to_cart's own non-variant path (below) only treats it as a
+        # genuine cross-restaurant conflict when the existing cart actually
+        # holds some OTHER item. Do the same here: a live regression
+        # (2026-09-29, Margherita Ultimate Cheese Pizza / Pizza Hut) showed
+        # this code firing on a fresh add to an EMPTY cart -- no conflict was
+        # possible -- which was really shape V1 (variantsV2) getting
+        # rejected, and the retry gave up before ever trying V2/V3. Only
+        # short-circuit here when a same-cart-different-item conflict is
+        # actually proven; otherwise keep trying the remaining shapes.
+        if "INVALID_ITEM_IDS_IN_REQUEST" in (last_codes or []) and any(
+            str(i.get("menu_item_id")) != str(menu_item_id) for i in existing_items
+        ):
             debug("cart_agent", "addon-diag variant retry: cart-identity conflict, not a shape problem -- stopping")
             break
 

@@ -1828,3 +1828,92 @@ class ExistingCartItemsHelperTests(unittest.TestCase):
         from cravr.cart.parsing import _existing_cart_items
         cart = {"status": "empty", "items": [], "message": "Cart is empty."}
         self.assertEqual(_existing_cart_items(cart), [])
+
+
+class VariantShapeRetryTests(unittest.TestCase):
+    """Regression, 2026-09-29 (logger.txt: adding 'Margherita Ultimate
+    Cheese Pizza' from Pizza Hut with a 'Medium' size variant to a
+    completely EMPTY cart). _add_item_with_variant's wire-shape retry loop
+    used to stop trying the remaining shapes (V2, V3) the instant ANY shape
+    came back with INVALID_ITEM_IDS_IN_REQUEST, treating that code as an
+    unconditional 'the cart already holds another restaurant's items'
+    conflict -- even though the cart was empty, where no such conflict is
+    even possible. That's the same generic 'Swiggy didn't recognise an id
+    in this payload' code add_dish_to_cart's own non-variant path already
+    treats as ambiguous, only trusting it as a real conflict when the
+    existing cart provably holds some OTHER item -- this mirrors that same
+    guard for the variant path, so a genuine shape mismatch (V1 rejected,
+    V2 would have worked) no longer gets given up on early."""
+
+    GROUP_ID = "66507856"
+    VARIANT_ID = "200975505"
+
+    @staticmethod
+    def _variant_groups():
+        return [{
+            "group_id": VariantShapeRetryTests.GROUP_ID, "group_name": "Choose Size",
+            "choices": [{"id": VariantShapeRetryTests.VARIANT_ID, "name": "Medium", "price_inr": 428}],
+        }]
+
+    def test_a_rejected_first_shape_still_tries_the_others_when_the_cart_is_empty(self):
+        from cravr.cart.add_flow import _add_item_with_variant
+
+        calls = []
+
+        def fake_update_cart(restaurant_id, address_id, cart_items, restaurant_name=None):
+            calls.append(cart_items)
+            if len(calls) == 1:
+                return {
+                    "status": "error", "error_codes": ["INVALID_ITEM_IDS_IN_REQUEST"],
+                    "message": "Restaurant may have removed the item(s) from their menu.",
+                }
+            return {"status": "success", "message": "Cart updated."}
+
+        with patch(
+            "cravr.cart.add_flow.food_mcp.get_cart", return_value={"status": "empty", "message": "Cart is empty."},
+        ), patch(
+            "cravr.cart.add_flow._existing_cart_items", return_value=[],
+        ), patch(
+            "cravr.cart.add_flow.food_mcp.update_cart", side_effect=fake_update_cart,
+        ), patch(
+            "cravr.cart.add_flow._ask_for_all_addons",
+            return_value=[{"id": self.VARIANT_ID, "name": "Medium", "group_id": self.GROUP_ID}],
+        ):
+            result, selected, note, existing = _add_item_with_variant(
+                "19864", "addr1", "Pizza Hut", "Margherita Ultimate Cheese Pizza",
+                "183129663", 1, self._variant_groups(),
+            )
+
+        self.assertEqual(len(calls), 2, "should have kept trying past the first rejected shape")
+        self.assertEqual(result["status"], "success")
+
+    def test_a_rejected_first_shape_still_stops_on_a_genuine_cross_restaurant_conflict(self):
+        from cravr.cart.add_flow import _add_item_with_variant
+
+        calls = []
+
+        def fake_update_cart(restaurant_id, address_id, cart_items, restaurant_name=None):
+            calls.append(cart_items)
+            return {
+                "status": "error", "error_codes": ["INVALID_ITEM_IDS_IN_REQUEST"],
+                "message": "one or more items in your cart are no longer available",
+            }
+
+        with patch(
+            "cravr.cart.add_flow.food_mcp.get_cart",
+            return_value={"status": "text", "message": "Items (1):\n  - Other Dish — \u20b9200 (ID: 999)"},
+        ), patch(
+            "cravr.cart.add_flow._existing_cart_items", return_value=[{"menu_item_id": "999", "quantity": 1}],
+        ), patch(
+            "cravr.cart.add_flow.food_mcp.update_cart", side_effect=fake_update_cart,
+        ), patch(
+            "cravr.cart.add_flow._ask_for_all_addons",
+            return_value=[{"id": self.VARIANT_ID, "name": "Medium", "group_id": self.GROUP_ID}],
+        ):
+            result, selected, note, existing = _add_item_with_variant(
+                "19864", "addr1", "Pizza Hut", "Margherita Ultimate Cheese Pizza",
+                "183129663", 1, self._variant_groups(),
+            )
+
+        self.assertEqual(len(calls), 1, "a genuine cross-restaurant conflict should still stop after the first shape")
+        self.assertNotEqual(result["status"], "success")
