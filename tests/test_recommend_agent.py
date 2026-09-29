@@ -9,8 +9,11 @@ from cravr.recommend.RecommendAgent import (
     _NO_SELECTION_VALUE,
     _build_recommendation_filters,
     _craving_match_score,
+    _dish_multiselect_options,
     _dish_pick_options,
+    _handle_dish_multiselect,
     _offer_category_batch,
+    _offer_dish_batch,
     _rank_candidates,
     _resolve_multiple_choices,
     _widen_within_restaurant,
@@ -844,13 +847,16 @@ class CategoryBrowsingTests(unittest.TestCase):
         self.assertEqual(names, ["Butter Naan", "Garlic Naan"])
         self.assertNotEqual(result["recommendation_state"].get("satisfied"), True)
 
-    def test_a_category_with_a_single_dish_offers_it_with_the_only_match_prompt(self):
+    def test_a_category_with_a_single_dish_still_offers_it_as_a_multiselect_pick(self):
         state = self._category_offer_state("Rice")
         result = recommendation_agent_node(state)
 
         names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
         self.assertEqual(names, ["Jeera Rice"])
-        self.assertEqual(result["recommendation_state"]["options"], ONLY_MATCH_OPTIONS)
+        self.assertEqual(result["recommendation_state"]["offer_kind"], "dish")
+        self.assertEqual(
+            result["recommendation_state"]["options"], _dish_multiselect_options([self.CATEGORIES[1]["items"][0]]),
+        )
 
     def test_picking_a_dish_within_a_category_adds_it_to_the_cart_normally(self):
         state = self._category_offer_state("Breads")
@@ -862,14 +868,132 @@ class CategoryBrowsingTests(unittest.TestCase):
             "recommendation_state": dish_offer["recommendation_state"],
             "context_profile": {"address_id": "addr1"},
         }
+        mock_result = {
+            "messages": [AIMessage(content="**Your cart:**\n\n- Butter Naan x1 \u2014 \u20b960", name="cart_agent")],
+            "cart_state": {"restaurant": {"id": "336078", "name": "Punjabi Angithi (Vegorama Group)"}},
+        }
         with patch(
-            "cravr.recommend.RecommendAgent.add_dish_to_cart",
-            return_value={"messages": [], "cart_state": {}},
+            "cravr.recommend.RecommendAgent.add_dish_to_cart", return_value=mock_result,
         ) as mock_add:
-            recommendation_agent_node(pick_state)
+            result = recommendation_agent_node(pick_state)
 
         mock_add.assert_called_once()
         self.assertEqual(mock_add.call_args[0][0]["item_name"], "Butter Naan")
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertIn("Added Butter Naan to your cart.", result["messages"][0].content)
+
+
+class DishMultiSelectTests(unittest.TestCase):
+    """The dishes shown after picking one or more categories are ALSO a
+    multi-select (OptionChips.jsx's `multi` mode -- see UI/graph_bridge.py
+    routing offer_kind == "dish" to components.send_multiselect_message):
+    the user can check several dishes and add them all to the cart in one
+    go, instead of one at a time across several separate round trips (live
+    regression, 2026-09-29: picking 5 categories in one go still took 4
+    more round trips to get everything from them into the cart). See
+    RecommendAgent._offer_dish_batch and _handle_dish_multiselect."""
+
+    RESTAURANT_SCOPE = {
+        "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
+        "cart_item_id": "63356710", "existing_ids": ["63356710"],
+    }
+    DISHES = [
+        {"item_name": "Butter Naan", "menu_item_id": "10", "price_inr": 60, "restaurant_id": "336078"},
+        {"item_name": "Garlic Naan", "menu_item_id": "11", "price_inr": 70, "restaurant_id": "336078"},
+        {"item_name": "Jeera Rice", "menu_item_id": "12", "price_inr": 180, "restaurant_id": "336078"},
+    ]
+
+    def _dish_offer_state(self, user_text, dishes=None, restaurant_scope=None):
+        scope = self.RESTAURANT_SCOPE if restaurant_scope is None else restaurant_scope
+        offer = _offer_dish_batch(
+            "Here's what's under Breads:", dishes if dishes is not None else self.DISHES,
+            dict(scope) if scope else scope,
+        )
+        return {
+            "messages": [{"role": "user", "content": user_text}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": offer["recommendation_state"],
+            "context_profile": {"address_id": "addr1"},
+        }
+
+    def _success(self, item_name, price):
+        return {
+            "messages": [AIMessage(
+                content=f"**Your cart:**\n\n- {item_name} x1 \u2014 \u20b9{price}", name="cart_agent",
+            )],
+            "cart_state": {"restaurant": {"id": "336078", "name": "Punjabi Angithi (Vegorama Group)"}},
+        }
+
+    def test_offer_dish_batch_shows_every_item_uncapped_as_a_multiselect(self):
+        offer = _offer_dish_batch("Here's what's under Breads and Rice:", self.DISHES, self.RESTAURANT_SCOPE)
+        rec_state = offer["recommendation_state"]
+
+        self.assertEqual(rec_state["offer_kind"], "dish")
+        self.assertEqual(len(rec_state["last_recommendations"]), 3)
+        self.assertEqual(rec_state["alternates"], [])
+        self.assertEqual(rec_state["options"], _dish_multiselect_options(self.DISHES))
+
+    def test_dish_multiselect_options_fold_price_into_the_label(self):
+        options = _dish_multiselect_options(self.DISHES)
+        self.assertEqual(options[0]["label"], "Butter Naan \u2014 \u20b960")
+
+    def test_picking_two_dishes_adds_both_in_one_go(self):
+        state = self._dish_offer_state("1,3")
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), self._success("Jeera Rice", 180)],
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(mock_add.call_count, 2)
+        picked_names = [call.args[0]["item_name"] for call in mock_add.call_args_list]
+        self.assertEqual(picked_names, ["Butter Naan", "Jeera Rice"])
+        self.assertIn("Added Butter Naan and Jeera Rice to your cart.", result["messages"][0].content)
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+
+    def test_a_dish_that_fails_partway_through_stops_the_batch_and_notes_what_already_landed(self):
+        state = self._dish_offer_state("1,2,3")
+        failure = {"messages": [AIMessage(content="Couldn't add that to your cart: rejected", name="cart_agent")],
+                   "cart_state": {}}
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), failure],
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(mock_add.call_count, 2)  # stopped before the third dish
+        self.assertIn("Added Butter Naan first.", result["messages"][0].content)
+        self.assertIn("Couldn't add that to your cart", result["messages"][0].content)
+
+    def test_skipping_every_dish_within_a_restaurant_declines_gracefully(self):
+        state = self._dish_offer_state(_NO_SELECTION_VALUE)
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart") as mock_add:
+            result = recommendation_agent_node(state)
+
+        mock_add.assert_not_called()
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("this restaurant", result["messages"][0].content.lower())
+
+    def test_saying_yes_to_a_single_dish_offer_adds_it(self):
+        state = self._dish_offer_state("yes", dishes=self.DISHES[:1])
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            return_value=self._success("Butter Naan", 60),
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        mock_add.assert_called_once()
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+
+    def test_handle_dish_multiselect_without_an_address_does_not_touch_the_cart(self):
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart") as mock_add:
+            result = _handle_dish_multiselect(self.DISHES[:2], None, None)
+
+        mock_add.assert_not_called()
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("Butter Naan", result["messages"][0].content)
+        self.assertIn("Garlic Naan", result["messages"][0].content)
 
 
 class MultiSelectCategoryTests(unittest.TestCase):

@@ -135,6 +135,21 @@ def _dish_pick_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
     ]
 
 
+def _dish_multiselect_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Like _dish_pick_options, but with the price folded into each chip's
+    label -- multi-select chips (OptionChips.jsx) only ever show a label,
+    none of DishCards' price/rating fields, so this is the only place that
+    information survives once _offer_dish_batch stops rendering as
+    DishCards."""
+    options = []
+    for i, dish in enumerate(dishes, start=1):
+        name = dish.get("item_name") or f"Option {i}"
+        price = dish.get("price_inr")
+        label = f"{name} — ₹{price:.0f}" if isinstance(price, (int, float)) and price else name
+        options.append({"value": str(i), "label": label})
+    return options
+
+
 ONLY_MATCH_OPTIONS = [
     {"value": "1", "label": "Yes, I'll take it"},
     {"value": "2", "label": "Widen the search"},
@@ -613,23 +628,30 @@ def _offer_dish_batch(
     lead_in: str, items: list[dict[str, Any]], restaurant_scope: dict[str, Any] | None = None,
     filters: dict[str, Any] | None = None,
 ) -> dict:
-    """Offer a restaurant-scoped batch of dishes (e.g. everything under one
-    menu category) the same way a fresh catalog search would, but carrying
+    """Offer every dish under the category/categories just picked (see
+    _handle_category_pick) as a multi-select -- OptionChips' multi mode,
+    the same UI pattern _offer_category_batch uses -- so the user can check
+    as many as they want and add them all to the cart in one go (see
+    _handle_dish_multiselect), instead of one at a time across several
+    separate round trips (live regression, 2026-09-29: picking 5 categories
+    in one go still took 4 more separate "add more" round trips afterwards
+    to actually get everything from them into the cart). Shows every item
+    at once, not capped to DISPLAY_COUNT, for the same reason
+    _offer_category_batch does -- the whole point is to let the user see
+    everything on offer and grab what they want in one pass. Carries
     restaurant_scope forward so a decline widens within this restaurant --
     see _widen_within_restaurant -- rather than falling back to a stale,
     unrelated catalog-wide search."""
-    batch, rest = items[:DISPLAY_COUNT], items[DISPLAY_COUNT:]
-    if len(batch) == 1:
-        content = _build_recommendation_text(batch)
-    elif lead_in:
-        content = f"{lead_in}\n{_numbered(batch)}\n{PICK_PROMPT}"
-    else:
-        content = _build_recommendation_text(batch)
+    content = (
+        f"{lead_in}\n{_numbered(items)}\nPick as many as you like, then hit submit."
+        if lead_in else _numbered(items)
+    )
     return _reply(
         content,
         awaiting_feedback=True, satisfied=False,
-        last_recommendations=batch, alternates=rest, filters=filters or {},
-        options=ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch),
+        last_recommendations=items, alternates=[], filters=filters or {},
+        offer_kind="dish",
+        options=_dish_multiselect_options(items),
         restaurant_scope=restaurant_scope,
     )
 
@@ -679,6 +701,77 @@ def _handle_category_pick(
 
     restaurant_scope["current_category"] = labels
     return _offer_dish_batch(f"Here's what's under {_join_labels(labels)}:", items, restaurant_scope)
+
+
+def _handle_dish_multiselect(
+    dishes: list[dict[str, Any]], address_id: str | None, state: CravrState | None,
+) -> dict:
+    """The user picked one or more dishes from _offer_dish_batch's
+    multi-select -- add all of them to the cart in one go and report a
+    single combined summary, instead of only ever adding one dish per turn
+    (live regression, 2026-09-29: picking 5 categories' worth of dishes
+    still needed 4 separate turns to get them all into the cart). Each dish
+    goes through add_dish_to_cart exactly as a single pick always has --
+    every dish reaching here came from _menu_categories, which already
+    guarantees none of them need an add-on/variant choice -- and each call
+    re-reads the cart fresh, so it merges correctly on top of whatever the
+    previous call in this loop just added. Stops at the first dish that
+    doesn't land cleanly (a cart-restaurant conflict, or Swiggy rejecting
+    the add) and surfaces that result directly, noting whatever already
+    made it in first so nothing looks silently dropped."""
+    if not dishes:
+        return _reply("Nothing was picked to add.", awaiting_feedback=False, satisfied=False)
+
+    if not address_id:
+        names = _join_labels([_describe(d) for d in dishes])
+        return _reply(
+            f"Great choices — {names} — but I don't have a delivery address yet, so I "
+            "couldn't add them to your cart.",
+            awaiting_feedback=False, satisfied=False,
+        )
+
+    known_restaurant_id = _current_restaurant_id(state) if state is not None else None
+    known_restaurant_name = _current_restaurant_name(state) if state is not None else None
+
+    added: list[str] = []
+    result: dict[str, Any] = {}
+    for dish in dishes:
+        result = add_dish_to_cart(
+            dish, address_id,
+            known_restaurant_id=known_restaurant_id, known_restaurant_name=known_restaurant_name,
+        )
+        cart_state = result.get("cart_state") or {}
+        # add_dish_to_cart only ever stamps cart_state["restaurant"] on its
+        # success path (see its final lines) -- never on an error/conflict
+        # reply -- so this is the same signal it already uses internally.
+        if "restaurant" not in cart_state:
+            if added:
+                prior_note = f"Added {_join_labels(added)} first. "
+                messages = result.get("messages") or []
+                original = getattr(messages[0], "content", "") if messages else ""
+                result = {**result, "messages": [AIMessage(content=prior_note + original, name="cart_agent")]}
+            result["recommendation_state"] = {"awaiting_feedback": False, "satisfied": False}
+            return result
+        added.append(dish.get("item_name") or "that dish")
+        restaurant = cart_state["restaurant"]
+        known_restaurant_id = known_restaurant_id or restaurant.get("id")
+        known_restaurant_name = known_restaurant_name or restaurant.get("name")
+
+    # The LAST loop iteration already rendered the full, up-to-date cart
+    # (every dish just added, since each add_dish_to_cart call re-reads it
+    # fresh) -- just swap its message for one naming everything added this
+    # round instead of only the last dish.
+    messages = result.get("messages") or []
+    body = getattr(messages[0], "content", "") if messages else ""
+    lead_in = f"Added {_join_labels(added)} to your cart."
+    content = f"{lead_in}\n\n{body}".strip() if body else lead_in
+    return {
+        **result,
+        "messages": [AIMessage(content=content, name="cart_agent")],
+        "recommendation_state": {
+            "awaiting_feedback": False, "satisfied": True, "last_recommendations": dishes,
+        },
+    }
 
 
 def _widen_within_restaurant(
@@ -860,9 +953,10 @@ def recommendation_agent_node(state: CravrState) -> dict:
 
     if awaiting_feedback and not satisfied:
         is_category_offer = recommendation_state.get("offer_kind") == "category"
-        if is_category_offer:
+        is_dish_multiselect_offer = recommendation_state.get("offer_kind") == "dish"
+        if is_category_offer or is_dish_multiselect_offer:
             if user_input.strip() == _NO_SELECTION_VALUE:
-                debug("recommendation_agent", "user skipped every category option")
+                debug("recommendation_agent", "user skipped every option in the multi-select")
                 restaurant_scope = recommendation_state.get("restaurant_scope")
                 if restaurant_scope and restaurant_scope.get("restaurant_id"):
                     return _reply(
@@ -877,13 +971,20 @@ def recommendation_agent_node(state: CravrState) -> dict:
                 )
             chosen_many = _resolve_multiple_choices(user_input, offered)
             if chosen_many:
+                if is_category_offer:
+                    debug(
+                        "recommendation_agent",
+                        f"user picked {len(chosen_many)} categor"
+                        f"{'y' if len(chosen_many) == 1 else 'ies'}: "
+                        f"{[c.get('category') for c in chosen_many]}",
+                    )
+                    return _handle_category_pick(chosen_many, recommendation_state, address_id)
                 debug(
                     "recommendation_agent",
-                    f"user picked {len(chosen_many)} categor"
-                    f"{'y' if len(chosen_many) == 1 else 'ies'}: "
-                    f"{[c.get('category') for c in chosen_many]}",
+                    f"user picked {len(chosen_many)} dish(es): "
+                    f"{[d.get('item_name') for d in chosen_many]}",
                 )
-                return _handle_category_pick(chosen_many, recommendation_state, address_id)
+                return _handle_dish_multiselect(chosen_many, address_id, state)
         else:
             chosen = _resolve_choice(user_input, offered)
             if chosen:
@@ -938,6 +1039,8 @@ def recommendation_agent_node(state: CravrState) -> dict:
             if len(offered) == 1:
                 if is_category_offer:
                     return _handle_category_pick([offered[0]], recommendation_state, address_id)
+                if is_dish_multiselect_offer:
+                    return _handle_dish_multiselect([offered[0]], address_id, state)
                 return _reply_with_pick(
                     offered[0], address_id, state=state,
                     awaiting_feedback=False, satisfied=True, last_recommendations=offered,

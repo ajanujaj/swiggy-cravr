@@ -69,25 +69,27 @@ async def process_result(result: dict[str, Any] | None) -> None:
 
     dishes = None
     options = None
-    is_category_offer = False
+    is_multiselect_offer = False
     if source == "recommendation_agent":
         rec_state = result.get("recommendation_state") or {}
         dishes = rec_state.get("last_recommendations") or None
         options = rec_state.get("options") or None
         # A restaurant's menu categories (Breads, Rice, ...) offered by
-        # RecommendAgent._offer_category_batch -- render as a multi-select
-        # (OptionChips.jsx's `multi` mode) so the user can check several at
-        # once, rather than as single-pick dish cards. A category offer's
-        # recommendation_state always carries offer_kind == "category";
-        # anything else (a plain dish batch, the dishes shown after picking
-        # categories, ...) never sets it, so this only fires here.
-        is_category_offer = rec_state.get("offer_kind") == "category"
+        # RecommendAgent._offer_category_batch, or the dishes under
+        # whichever categories got picked (_offer_dish_batch) -- both
+        # render as a multi-select (OptionChips.jsx's `multi` mode) so the
+        # user can check several at once and, for dishes, add them all to
+        # the cart in one go, rather than as single-pick dish cards. Either
+        # offer's recommendation_state carries offer_kind == "category" or
+        # "dish"; a plain catalog-wide dish batch never sets it, so this
+        # only fires for these two.
+        is_multiselect_offer = rec_state.get("offer_kind") in ("category", "dish")
     elif source == "cart_agent":
         options = (result.get("cart_state") or {}).get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
 
-    if is_category_offer and options:
+    if is_multiselect_offer and options:
         await components.send_multiselect_message(content, options)
     elif dishes:
         await components.send_dish_cards(content, dishes, options)
