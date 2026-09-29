@@ -267,6 +267,45 @@ def _wire_addon(addon: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
+def _carry_forward_customizations(address_id: str, keep_ids: set[str]) -> dict[str, dict[str, Any]]:
+    """A cart-payload rebuild resends every item in the cart, not just the one
+    being added -- update_cart replaces Swiggy's cart state with whatever
+    `cartItems` it's given. Without this, every item OTHER than the one
+    currently being added goes out bare (menu_item_id + quantity only),
+    silently stripping its addons/variant off the live cart. (Regression,
+    2026-09-29: add a Falafel Wrap with add-ons, then add a dessert -- the
+    wrap's add-ons vanished from the final order.) Look up each of those
+    other items' already-selected addons/variants (from the cart itself, via
+    get_cart_item_details) so they can be resent as-is instead of dropped.
+    """
+    if not keep_ids:
+        return {}
+    details = food_mcp.get_cart_item_details(address_id)
+    carry: dict[str, dict[str, Any]] = {}
+    for mid in keep_ids:
+        detail = details.get(str(mid)) or {}
+        extra: dict[str, Any] = {}
+        addons = [
+            a for a in (detail.get("addons") or [])
+            if isinstance(a, dict) and (a.get("id") is not None or a.get("choice_id") is not None)
+        ]
+        if addons:
+            extra["addons"] = [_wire_addon(a) for a in addons]
+        variants = [
+            v for v in (detail.get("variants") or [])
+            if isinstance(v, dict) and v.get("variation_id") is not None
+        ]
+        if variants:
+            extra["variants"] = [
+                {"variation_id": v.get("variation_id"), "group_id": v.get("group_id"), "name": v.get("name")}
+                for v in variants
+            ]
+        if extra:
+            carry[str(mid)] = extra
+            debug("cart_agent", f"carrying forward existing customization for cart item {mid}: {extra!r}")
+    return carry
+
+
 def _map_to_valid_addons(
     selected: list[dict[str, Any]], valid_groups: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -378,6 +417,9 @@ def _add_item_with_variant(
           f"parsed_items={existing_items!r}")
     merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
     merged[str(menu_item_id)] = merged.get(str(menu_item_id), 0) + quantity
+    carry_forward = _carry_forward_customizations(
+        address_id, {mid for mid in merged if mid != str(menu_item_id)},
+    )
 
     def build_payload(
         target_addons: list[dict[str, Any]], variant_entry: tuple[str, list[dict[str, Any]]] | None = None,
@@ -389,6 +431,8 @@ def _add_item_with_variant(
                 entry["addons"] = target_addons
                 if variant_entry:
                     entry[variant_entry[0]] = variant_entry[1]
+            elif mid in carry_forward:
+                entry.update(carry_forward[mid])
             items.append(entry)
         return items
 
@@ -590,12 +634,17 @@ def add_dish_to_cart(
         merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
         target_quantity = merged.get(str(menu_item_id), 0) + quantity
         merged[str(menu_item_id)] = target_quantity
+        carry_forward = _carry_forward_customizations(
+            address_id, {mid for mid in merged if mid != str(menu_item_id)},
+        )
         def _build_payload(target_addons: list[dict[str, Any]]) -> list[dict[str, Any]]:
             items = []
             for mid, qty in merged.items():
                 entry: dict[str, Any] = {"menu_item_id": mid, "quantity": qty}
                 if attempt_addon_only and mid == str(menu_item_id):
                     entry["addons"] = target_addons
+                elif mid in carry_forward:
+                    entry.update(carry_forward[mid])
                 items.append(entry)
             return items
     else:

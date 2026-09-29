@@ -1917,3 +1917,120 @@ class VariantShapeRetryTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1, "a genuine cross-restaurant conflict should still stop after the first shape")
         self.assertNotEqual(result["status"], "success")
+
+
+class CarryForwardCustomizationTests(unittest.TestCase):
+    """Regression, 2026-09-29 (user report: add a Falafel Wrap -> add its
+    add-ons -> "Add more from this restaurant" -> add a dessert -> the final
+    order has the main dish and the dessert, but the Falafel Wrap's add-ons
+    are gone). Every add_dish_to_cart / _add_item_with_variant call rebuilds
+    the *entire* cartItems payload sent to update_cart -- Swiggy replaces
+    cart state wholesale with whatever's sent, so any pre-existing item that
+    went out bare (menu_item_id + quantity only) silently lost its
+    addons/variant. These tests pin down that a second add's payload still
+    carries the first item's customization forward instead of dropping it."""
+
+    _FALAFEL_ID = "204299705"
+    _FALAFEL_DETAILS = {
+        _FALAFEL_ID: {
+            "addons": [{"id": "500", "name": "Double Smashed Falafel (+5 Pc)", "group_id": "77"}],
+            "variants": [], "valid_addons": [],
+        },
+    }
+
+    def test_carry_forward_customizations_wires_addons_and_variants_from_the_cart(self):
+        from cravr.cart.add_flow import _carry_forward_customizations
+
+        item_details = {
+            self._FALAFEL_ID: {
+                "addons": [{"id": "500", "name": "Double Smashed Falafel (+5 Pc)", "group_id": "77"}],
+                "variants": [{"name": "Large", "variation_id": "900", "group_id": "88"}],
+            },
+            "111": {"addons": [], "variants": []},
+        }
+        with patch("cravr.cart.add_flow.food_mcp.get_cart_item_details", return_value=item_details):
+            carry = _carry_forward_customizations("addr1", {self._FALAFEL_ID, "111", "999"})
+
+        self.assertEqual(
+            carry,
+            {
+                self._FALAFEL_ID: {
+                    "addons": [{"choice_id": 500, "group_id": 77, "name": "Double Smashed Falafel (+5 Pc)"}],
+                    "variants": [{"variation_id": "900", "group_id": "88", "name": "Large"}],
+                },
+            },
+        )
+
+    def test_carry_forward_customizations_skips_the_lookup_when_theres_nothing_to_keep(self):
+        from cravr.cart.add_flow import _carry_forward_customizations
+
+        with patch("cravr.cart.add_flow.food_mcp.get_cart_item_details") as mock_details:
+            carry = _carry_forward_customizations("addr1", set())
+
+        mock_details.assert_not_called()
+        self.assertEqual(carry, {})
+
+    def test_adding_a_plain_second_dish_keeps_the_first_items_addons_in_the_payload(self):
+        from cravr.cart.add_flow import add_dish_to_cart
+
+        existing_cart = {
+            "status": "success", "message": None,
+            "items": [{"menu_item_id": self._FALAFEL_ID, "quantity": 1, "item_name": "Falafel Wrap"}],
+        }
+        dessert = {
+            "item_name": "Chocolate Cake", "menu_item_id": "300000001",
+            "restaurant_id": "R1", "restaurant_name": "Test Restaurant",
+        }
+
+        with patch("cravr.cart.add_flow.food_mcp.get_cart", return_value=existing_cart),              patch("cravr.cart.add_flow.food_mcp.get_cart_item_details", return_value=self._FALAFEL_DETAILS),              patch("cravr.cart.add_flow.food_mcp.update_cart",
+                   return_value={"status": "success", "message": "Cart updated."}) as mock_update:
+            add_dish_to_cart(dessert, "addr1", quantity=1, lead_in="")
+
+        sent = mock_update.call_args.args[2]
+        falafel_entry = next(e for e in sent if e["menu_item_id"] == self._FALAFEL_ID)
+        self.assertEqual(
+            falafel_entry,
+            {
+                "menu_item_id": self._FALAFEL_ID, "quantity": 1,
+                "addons": [{"choice_id": 500, "group_id": 77, "name": "Double Smashed Falafel (+5 Pc)"}],
+            },
+            sent,
+        )
+        dessert_entry = next(e for e in sent if e["menu_item_id"] == "300000001")
+        self.assertNotIn("addons", dessert_entry, dessert_entry)
+
+    def test_variant_path_also_carries_forward_another_items_addons(self):
+        from cravr.cart.add_flow import _add_item_with_variant
+
+        existing_cart = {
+            "status": "success", "message": None,
+            "items": [{"menu_item_id": self._FALAFEL_ID, "quantity": 1, "item_name": "Falafel Wrap"}],
+        }
+        variant_groups = [{
+            "group_id": "66507856", "group_name": "Choose Size",
+            "choices": [{"id": "200975505", "name": "Medium", "price_inr": 428}],
+        }]
+        calls = []
+
+        def fake_update_cart(restaurant_id, address_id, cart_items, restaurant_name=None):
+            calls.append(cart_items)
+            return {"status": "success", "message": "Cart updated."}
+
+        with patch("cravr.cart.add_flow.food_mcp.get_cart", return_value=existing_cart),              patch("cravr.cart.add_flow.food_mcp.get_cart_item_details", return_value=self._FALAFEL_DETAILS),              patch("cravr.cart.add_flow.food_mcp.update_cart", side_effect=fake_update_cart),              patch(
+                "cravr.cart.add_flow._ask_for_all_addons",
+                return_value=[{"id": "200975505", "name": "Medium", "group_id": "66507856"}],
+             ):
+            result, selected, note, existing = _add_item_with_variant(
+                "R1", "addr1", "Test Restaurant", "New Pizza", "300000002", 1, variant_groups,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(calls, "update_cart was never called")
+        first_payload = calls[0]
+        falafel_entry = next(e for e in first_payload if e["menu_item_id"] == self._FALAFEL_ID)
+        self.assertEqual(
+            falafel_entry.get("addons"),
+            [{"choice_id": 500, "group_id": 77, "name": "Double Smashed Falafel (+5 Pc)"}],
+            first_payload,
+        )
+
