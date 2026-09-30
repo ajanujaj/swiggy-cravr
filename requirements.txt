@@ -9,3 +9,4 @@ httpx
 chainlit==2.11.1
 fastapi
 uvicorn
+psycopg[binary]

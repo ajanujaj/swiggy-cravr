@@ -8,7 +8,7 @@ from .add_flow import add_dish_to_cart
 from .checkout import cancel_upi_payment, resume_upi_payment, run_checkout
 from .display import _cart_reply, _show_cart_with_next_steps
 from .pairing import complete_the_meal
-from .flows import _clear_cart_and_add_pending, _start_over_new_restaurant, _suggest_more_from_restaurant
+from .flows import _clear_cart_and_add_pending, _remove_out_of_stock, _start_over_new_restaurant, _suggest_more_from_restaurant
 from .restaurant_context import _current_restaurant_id, _current_restaurant_name
 from .routing import _classify_cart_action, _log_action
 
@@ -68,6 +68,9 @@ def cart_agent_node(state: CravrState) -> dict:
             known_restaurant_id=_current_restaurant_id(state),
             known_restaurant_name=_current_restaurant_name(state),
         )
+
+    if action == "remove_out_of_stock":
+        return _remove_out_of_stock(state, address_id)
 
     if action == "complete_meal":
         return complete_the_meal(state, address_id)

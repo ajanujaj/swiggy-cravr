@@ -129,3 +129,42 @@ def _clear_cart_and_add_pending(state: CravrState, address_id: str) -> dict:
         lead_in="Cart cleared.",
         preselected_addons=cart_state.get("pending_addons"),
     )
+
+
+def _remove_out_of_stock(state: CravrState, address_id: str) -> dict:
+    """Drop the items Swiggy says can't be ordered as they are, keeping every other
+    item with its own add-ons/variants."""
+    from .add_flow import _carry_forward_customizations
+    from .display import _show_cart_with_next_steps
+
+    cart = food_mcp.get_cart(address_id)
+    bad = [i for i in cart.get("items") or [] if i.get("in_stock") is False]
+    if not bad:
+        if cart.get("out_of_stock"):  # text-only cart: we know the names but not the ids
+            return _cart_reply(
+                f"Swiggy says {', '.join(cart['out_of_stock'])} is out of stock, but I can't tell which "
+                "cart line that is -- remove it in the Swiggy app, or clear the cart and start again."
+            )
+        return _show_cart_with_next_steps(address_id, lead_in="Everything in your cart is in stock.", cart=cart)
+
+    removed = ", ".join(str(i.get("item_name") or i.get("menu_item_id")) for i in bad)
+    keep = [i for i in cart.get("items") or [] if i.get("in_stock") is not False]
+    if not keep:
+        flushed = food_mcp.flush_cart()
+        if flushed.get("status") != "success":
+            return _cart_reply(f"Couldn't remove {removed}: {flushed.get('message', 'unknown error')}")
+        return _cart_reply(f"Removed {removed}. Your cart's empty now -- tell me what you'd like instead.")
+
+    restaurant_id = _current_restaurant_id(state)
+    if not restaurant_id:
+        return _cart_reply(f"I couldn't tell which restaurant this cart is from, so remove {removed} in the Swiggy app.")
+    keep_ids = {str(i["menu_item_id"]) for i in keep}
+    carry = _carry_forward_customizations(address_id, keep_ids, cart=cart)
+    payload = [{"menu_item_id": str(i["menu_item_id"]), "quantity": i.get("quantity", 1),
+                **carry.get(str(i["menu_item_id"]), {})} for i in keep]
+    result = food_mcp.update_cart(restaurant_id, address_id, payload,
+                                  restaurant_name=_current_restaurant_name(state))
+    debug("cart_agent", f"remove_out_of_stock: removed={removed!r} -> {result.get('status')!r}")
+    if result.get("status") != "success":
+        return _cart_reply(f"Couldn't remove {removed}: {result.get('message', 'unknown error')}")
+    return _show_cart_with_next_steps(address_id, lead_in=f"Removed {removed}.", cart=result.get("cart"))

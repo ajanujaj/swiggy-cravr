@@ -127,7 +127,7 @@ class RejectionReasonTests(TempStores):
         self.assertEqual(cap, 304)  # 80% of the median offered price
         names = [d["item_name"] for d in reply["recommendation_state"]["last_recommendations"]]
         self.assertEqual(sorted(names), ["Dal Rice", "Veg Thali"])  # shown & over-cap dishes gone
-        self.assertEqual(store.load_preferences(None)["preferences"]["rejection_reasons"], {"too_pricey": 1})
+        self.assertEqual(store.load_preferences("addr")["preferences"]["rejection_reasons"], {"too_pricey": 1})
 
     def test_too_heavy_drops_heavy_dishes_and_prefers_light_ones(self):
         held = [dish("Double Cheese Burger"), dish("Grilled Chicken Salad"), dish("Veg Biryani"),

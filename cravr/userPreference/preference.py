@@ -42,17 +42,19 @@ def fetch_order_history(address_id: str | None = None, *, user_id: str | None = 
         return food_mcp.get_order_history(address_id=address_id)
     return _call_mcp_tool("order_history", user_id)
 
-def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
+def fetch_user_preferences(user_id: str | None, address_id: str | None = None) -> dict[str, Any]:
     """Saved preferences. Real Swiggy has no preference tool, so Cravr's own
-    store is the source there. With the mock server, its `user_preferences`
-    tool is tried first and the store is the fallback when it's unreachable."""
+    store is the source there, keyed by the delivery address_id. With the mock
+    server, its `user_preferences` tool (keyed by user_id) is tried first and
+    the store is the fallback when it's unreachable."""
+    owner = address_id or user_id
     if using_real_food_mcp():
-        return load_preferences(user_id)
+        return load_preferences(owner)
 
     result = _call_mcp_tool("user_preferences", user_id, mcp_url=MOCK_MCP_URL)
     if result.get("status") == "error":
         debug("preference_agent", "mock user_preferences unavailable -- using Cravr's own store")
-        return load_preferences(user_id)
+        return load_preferences(owner)
     return result
 
 
@@ -72,7 +74,7 @@ def user_preference_node(state: CravrState) -> dict:
                 if location_result.get(key)
             }
 
-    preference_profile = fetch_user_preferences(user_id)
+    preference_profile = fetch_user_preferences(user_id, address_id)
     history_profile = fetch_order_history(address_id, user_id=user_id)
     debug(
         "preference_agent",

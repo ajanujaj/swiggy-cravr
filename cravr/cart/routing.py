@@ -26,6 +26,7 @@ _VIEW_RE = re.compile(
 )
 _COUPON_LIST_RE = re.compile(r"\bcoupons?\b|\boffers?\b|\bdiscounts?\b|\bdeals?\b", re.IGNORECASE)
 _QTY_RE = re.compile(r"\b(\d+)\b")
+_REMOVE_OOS_RE = re.compile(r"\bremove (the )?out[ -]of[ -]stock\b", re.IGNORECASE)
 _COMPLETE_MEAL_RE = re.compile(
     r"\bcomplete (the |my )?meal\b|\b(add|suggest) (a )?(side|drink)s?\b|\bsomething to drink\b",
     re.IGNORECASE,
@@ -39,10 +40,11 @@ CART_KEEP_VALUE = "__cart_keep__"
 CART_UPI_PAID_VALUE = "__cart_upi_paid__"
 CART_UPI_NOT_PAID_VALUE = "__cart_upi_not_paid__"
 CART_COMPLETE_MEAL_VALUE = "__cart_complete_meal__"
+CART_REMOVE_OOS_VALUE = "__cart_remove_oos__"
 _NEXT_STEP_SENTINELS = {
     CART_ADD_MORE_VALUE, CART_PROCEED_VALUE, CART_START_OVER_VALUE,
     CART_CLEAR_AND_ADD_VALUE, CART_KEEP_VALUE, CART_UPI_PAID_VALUE, CART_UPI_NOT_PAID_VALUE,
-    CART_COMPLETE_MEAL_VALUE,
+    CART_COMPLETE_MEAL_VALUE, CART_REMOVE_OOS_VALUE,
 }
 
 _CONFLICT_OPTIONS = [
@@ -67,11 +69,14 @@ def is_cart_request(text: str) -> bool:
     t = (text or "").strip()
     if t in _NEXT_STEP_SENTINELS:
         return True
-    return bool(_CART_TOPIC_RE.search(t) or _COUPON_APPLY_RE.search(t) or _COMPLETE_MEAL_RE.search(t))
+    return bool(_CART_TOPIC_RE.search(t) or _COUPON_APPLY_RE.search(t) or _COMPLETE_MEAL_RE.search(t)
+                or _REMOVE_OOS_RE.search(t))
 
 
 def _classify_cart_action(text: str) -> tuple[str, Any]:
     t = (text or "").strip()
+    if t == CART_REMOVE_OOS_VALUE or _REMOVE_OOS_RE.search(t):
+        return "remove_out_of_stock", None
     if t == CART_COMPLETE_MEAL_VALUE or _COMPLETE_MEAL_RE.search(t):
         return "complete_meal", None
     if t == CART_ADD_MORE_VALUE:

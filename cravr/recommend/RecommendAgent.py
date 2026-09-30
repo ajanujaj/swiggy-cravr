@@ -895,8 +895,9 @@ def _reply_with_pick(
     chosen: dict[str, Any], address_id: str | None, state: CravrState | None = None, **rec_state: Any
 ) -> dict:
     lead_in = f"Great — {_describe(chosen)} it is."
-    record_pick((state or {}).get("user_id"), chosen)  # feature 1: learn from every pick
+    owner = address_id or (state or {}).get("user_id")  # profile key: the delivery address_id
     if not address_id:
+        record_pick(owner, chosen)  # feature 1: learn from every pick
         return _reply(
             f"{lead_in} I don't have a delivery address yet, so I couldn't add it to your cart.",
             **rec_state,
@@ -907,6 +908,10 @@ def _reply_with_pick(
         chosen, address_id, lead_in=lead_in,
         known_restaurant_id=known_restaurant_id, known_restaurant_name=known_restaurant_name,
     )
+    # Saved only after the add flow returns: it can pause for add-on/variant questions,
+    # and LangGraph re-runs this node from the top on every resume -- saving before the
+    # pause counted one pick once per question (and inferred a diet from one burger).
+    record_pick(owner, chosen)
     result["recommendation_state"] = rec_state
     return result
 
@@ -919,7 +924,7 @@ def _handle_rejection(
     when enough of them pass, otherwise from a fresh search."""
     offered = rec_state.get("last_recommendations") or []
     alternates = rec_state.get("alternates") or []
-    record_rejection(state.get("user_id"), offered, reason)
+    record_rejection(address_id or state.get("user_id"), offered, reason)
 
     adjustments = feedback.adjustments_for(reason, offered, rec_state.get("adjustments"))
     shown = {str(n).strip().lower() for n in rec_state.get("shown_items") or []}
@@ -1035,8 +1040,14 @@ def recommendation_agent_node(state: CravrState) -> dict:
         and opening_token
         and recommendation_state.get("opening_token") == opening_token
     )
-    if brief.get("opening_picks") and not showing_this_opening:
-        return _offer_opening(brief["opening_picks"], brief_filters, opening_token)
+    mid_restaurant_browse = recommendation_state.get("offer_kind") in ("category", "dish")
+    if brief.get("opening_picks") and not showing_this_opening and not mid_restaurant_browse:
+        reply = _offer_opening(brief["opening_picks"], brief_filters, opening_token)
+        # Shown once: drop the cards from the brief so later taps that reuse this brief
+        # ("Add more from this restaurant", "Complete the meal", "more") don't restart
+        # the conversation with the opening again. The token stays so a pick still matches.
+        reply["recommendation_brief"] = {k: v for k, v in brief.items() if k != "opening_picks"}
+        return reply
     if recommendation_state.get("offer_kind") == OPENING_KIND and not showing_this_opening:
         # They passed on the opening cards and told us what they want -- a fresh search.
         awaiting_feedback = False

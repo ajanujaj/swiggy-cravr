@@ -125,6 +125,7 @@ Command-line chat: `python -m cravr.run`.
 | `CRAVR_DISHES_FIRST` | `0` turns off the opening cards (usual / something new / right now) and goes straight to questions. |
 | `CRAVR_WEATHER` | `0` turns off the Open-Meteo weather lookup. `CRAVR_WEATHER_CITY` overrides the city parsed from the address. |
 | `CRAVR_PUBLIC_URL` | Base URL for group-order poll links (defaults to the `SWIGGY_REDIRECT_URI` host, then `http://localhost:8001`). |
+| `DATABASE_URL` | Postgres URL (e.g. Render Postgres) for taste profiles and group polls, so they survive redeploys. `sqlite:///file.db` also works. Unset = JSON files. |
 | `CRAVR_PREFS_PATH` / `CRAVR_GROUPS_PATH` | Where the learned taste profile and group polls are stored (JSON; defaults under `mcp_server/data/`). |
 
 ## Features added in the "undecided user" work

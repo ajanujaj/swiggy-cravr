@@ -20,6 +20,13 @@ services:
         sync: false
       - key: SWIGGY_SCOPES
         sync: false
+      # Taste profiles + group polls. Point at a Render Postgres "Internal Database URL";
+      # without it they live in a JSON file that Render wipes on every redeploy.
+      - key: DATABASE_URL
+        sync: false
+      # Public base URL for group-order poll links, e.g. https://cravr-app.onrender.com
+      - key: CRAVR_PUBLIC_URL
+        sync: false
 
   - type: web
     name: cravr-mock-mcp

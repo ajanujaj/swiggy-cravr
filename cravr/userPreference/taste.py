@@ -11,7 +11,8 @@ user's preference store next to their explicit settings:
 
 From those it derives soft defaults: `dietary_preference` once the last
 few picks are all one diet (never overriding one the user set), and
-`typical_price_inr` (median pick price). `taste_signals()` turns the
+`typical_price_inr` (median pick price). `owner` is the profile key --
+the delivery address_id (see store.profile_owner). `taste_signals()` turns the
 profile into ranking inputs for signals.practical_score.
 """
 
@@ -38,14 +39,14 @@ def _bump(counts: dict | None, key: str, by: int = 1) -> dict:
     return counts
 
 
-def _prefs(user_id: str | None) -> dict[str, Any]:
-    return dict(load_preferences(user_id).get("preferences") or {})
+def _prefs(owner: str | None) -> dict[str, Any]:
+    return dict(load_preferences(owner).get("preferences") or {})
 
 
-def record_pick(user_id: str | None, dish: dict[str, Any]) -> dict[str, Any]:
+def record_pick(owner: str | None, dish: dict[str, Any]) -> dict[str, Any]:
     """A dish the user chose. Never raises -- learning must not break ordering."""
     try:
-        prefs = _prefs(user_id)
+        prefs = _prefs(owner)
         item, restaurant = _norm(dish.get("item_name")), _norm(dish.get("restaurant_name"))
         update: dict[str, Any] = {
             "liked_items": _bump(prefs.get("liked_items"), item),
@@ -76,18 +77,18 @@ def record_pick(user_id: str | None, dish: dict[str, Any]) -> dict[str, Any]:
             prices = (list(prefs.get("picked_prices") or []) + [price])[-_PRICE_MEMORY:]
             update["picked_prices"] = prices
             update["typical_price_inr"] = round(median(prices))
-        return save_preferences(user_id, **update)
+        return save_preferences(owner, **update)
     except Exception as exc:
         debug("taste", f"record_pick failed ({exc})")
         return {}
 
 
 def record_rejection(
-    user_id: str | None, dishes: list[dict[str, Any]], reason: str | None = None,
+    owner: str | None, dishes: list[dict[str, Any]], reason: str | None = None,
 ) -> dict[str, Any]:
     """Dishes the user turned down, and why (if known). Never raises."""
     try:
-        prefs = _prefs(user_id)
+        prefs = _prefs(owner)
         update: dict[str, Any] = {}
         if reason:
             update["rejection_reasons"] = _bump(prefs.get("rejection_reasons"), reason)
@@ -98,7 +99,7 @@ def record_rejection(
             for dish in dishes:
                 disliked = _bump(disliked, _norm(dish.get("item_name")))
             update["disliked_items"] = disliked
-        return save_preferences(user_id, **update) if update else prefs
+        return save_preferences(owner, **update) if update else prefs
     except Exception as exc:
         debug("taste", f"record_rejection failed ({exc})")
         return {}

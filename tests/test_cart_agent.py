@@ -306,7 +306,9 @@ class RealTextResponseRegressionTests(unittest.TestCase):
                 return self.REAL_GET_CART_RAW
             raise AssertionError(f"unexpected tool {tool_name}")
 
-        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync):
+        # The pizza is already in the real cart, so the duplicate question is asked first.
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync), \
+             patch("cravr.cart.add_flow.interrupt", return_value="__dup_replace__"):
             result = CartAgent.add_dish_to_cart(
                 dish, "d3n3lphv42g4rgmuvu70__AbKqwgSYhkE5YttayIYiXs", quantity=1,
                 lead_in="Great — Italian Meat Lover Pizza from Timpano - The Pasta Shop (₹400.0) it is.",
@@ -337,7 +339,7 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         sent_ids = {entry["menu_item_id"] for entry in sent_cart_items}
         self.assertEqual(sent_ids, {"179082816", "179082813"}, sent_cart_items)
 
-    def test_add_dish_to_cart_bumps_quantity_when_the_same_item_is_added_again(self):
+    def test_add_dish_to_cart_bumps_quantity_when_the_user_asks_for_one_more(self):
         existing_cart_text = (
             "Items (1):\n  - Italian Meat Lover Pizza — ₹260 (ID: 179082816)\n\n"
             "TO PAY: ₹398"
@@ -348,9 +350,11 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         with patch("cravr.cart.CartAgent.food_mcp.get_cart",
                    return_value={"status": "text", "message": existing_cart_text}), \
              patch("cravr.cart.CartAgent.food_mcp.update_cart",
-                   return_value={"status": "success", "message": "Cart updated."}) as mock_update:
+                   return_value={"status": "success", "message": "Cart updated."}) as mock_update, \
+             patch("cravr.cart.add_flow.interrupt", return_value="__dup_one_more__") as ask:
             CartAgent.add_dish_to_cart(dish, "addr1", quantity=1, lead_in="")
 
+        self.assertEqual(ask.call_args[0][0]["field"], "duplicate_item")
         sent_cart_items = mock_update.call_args.args[2]
         self.assertEqual(sent_cart_items, [{"menu_item_id": "179082816", "quantity": 2}])
 
@@ -509,7 +513,8 @@ class RealTextResponseRegressionTests(unittest.TestCase):
         with patch("cravr.cart.CartAgent.food_mcp.get_cart",
                    return_value={"status": "text", "message": "Items (1):\n  - Bowl — ₹200 (ID: 111)\n\nTO PAY: ₹200"}), \
              patch("cravr.cart.CartAgent.food_mcp.update_cart",
-                   return_value={"status": "success", "message": "Cart updated."}):
+                   return_value={"status": "success", "message": "Cart updated."}), \
+             patch("cravr.cart.add_flow.interrupt", return_value="__dup_one_more__"):  # Bowl already in cart
             result = CartAgent.add_dish_to_cart(dish, "addr1", quantity=1)
 
         self.assertEqual(
@@ -773,7 +778,9 @@ class CartNextStepTests(unittest.TestCase):
             raise AssertionError(tool_name)
 
         state = _state("2", address_id="addr1", recommendation_state=suggestions_state)
-        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync):
+        # The faked cart already lists the Brownie, so the duplicate question comes up.
+        with patch("cravr.food_mcp.call_tool_sync", side_effect=fake_call_tool_sync), \
+             patch("cravr.cart.add_flow.interrupt", return_value="__dup_replace__"):
             result = recommendation_agent_node(state)
 
         content = result["messages"][0].content
@@ -1434,8 +1441,9 @@ class VariantThenAddonFlowTests(unittest.TestCase):
             landed_message = (
                 "Items (1):\n- Classic Margherita Pizza — ₹1085 (ID: 152977469)\n\nTO PAY: ₹1245"
             )
+            # The cart is read once before the questions and remembered across their
+            # resumes (it used to be re-read on every resume).
             mock_get_cart.side_effect = [
-                {"status": "empty", "message": "Cart is empty."},
                 {"status": "empty", "message": "Cart is empty."},
                 {"status": "text", "message": landed_message},
                 {"status": "text", "message": landed_message},

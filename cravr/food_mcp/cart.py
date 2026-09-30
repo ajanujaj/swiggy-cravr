@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..debug_utils import debug
@@ -32,6 +33,49 @@ def _strip_widget_disclaimer(text: str) -> str:
     return text.split("\n\n", 1)[0].strip()
 
 
+def _in_stock(value: Any) -> bool:
+    return str(value).strip().lower() not in ("0", "false", "none")
+
+
+def parse_cart_data(raw: dict[str, Any], address_id: str) -> dict[str, Any]:
+    """The cart from a structured get_food_cart / update_food_cart response.
+    Both return the whole cart, so an update's response can stand in for a
+    fresh get (one Swiggy call instead of two). Each item keeps its add-ons,
+    variants and stock flag; `out_of_stock` lists the items Swiggy can't
+    deliver as they are (Swiggy says to tell the user before they pay)."""
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    items = [
+        {
+            "menu_item_id": _first(it, "menu_item_id", "id", default=""),
+            "item_name": _first(it, "name", "item_name", default=""),
+            "quantity": _first(it, "quantity", default=1),
+            "total": _first(it, "total", default=0),
+            "final_price": _first(it, "final_price", "total", default=0),
+            "in_stock": _in_stock(it.get("in_stock", 1)),
+            "addons": [a for a in it.get("addons") or [] if isinstance(a, dict)],
+            "variants": [v for v in it.get("variants") or [] if isinstance(v, dict)],
+        }
+        for it in (data.get("items") or []) if isinstance(it, dict)
+    ]
+    pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
+    offers = data.get("offers") if isinstance(data.get("offers"), dict) else {}
+    restaurant = data.get("restaurant") if isinstance(data.get("restaurant"), dict) else None
+    return {
+        "status": "success" if items else "empty",
+        "cart_id": data.get("cart_id"),
+        "restaurant": restaurant,
+        "items": items,
+        "item_count": data.get("item_count", len(items)),
+        "pricing": pricing,
+        "coupon_applied": offers.get("coupon_applied") if (offers.get("coupon_discount") or 0) > 0 else None,
+        "coupon_discount": offers.get("coupon_discount", 0),
+        "address_id": raw.get("addressId", address_id),
+        "out_of_stock": [i["item_name"] or str(i["menu_item_id"]) for i in items if not i["in_stock"]],
+        "status_message": raw.get("statusMessage"),
+        "message": None,
+    }
+
+
 def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, Any]:
     arguments: dict[str, Any] = {"addressId": address_id}
     if restaurant_name:
@@ -49,7 +93,9 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
 
     if isinstance(raw, str):
         message = _strip_widget_disclaimer(raw)
+        out_of_stock = [m.strip() for m in re.findall(r"-\s*(.+?)\s+(?:x\d+\s+)?—[^\n]*OUT OF STOCK", raw)]
         result = {
+            "out_of_stock": out_of_stock,
             "status": "empty" if "cart is empty" in message.lower() else "text",
             "cart_id": None, "restaurant": None, "items": [], "item_count": 0,
             "pricing": {}, "coupon_applied": None, "coupon_discount": 0,
@@ -65,35 +111,8 @@ def get_cart(address_id: str, restaurant_name: str | None = None) -> dict[str, A
     if not isinstance(raw, dict):
         return {"status": "error", "message": "Unexpected get_food_cart response"}
 
-    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
-    items = [
-        {
-            "menu_item_id": _first(it, "menu_item_id", "id", default=""),
-            "item_name": _first(it, "name", "item_name", default=""),
-            "quantity": _first(it, "quantity", default=1),
-            "total": _first(it, "total", default=0),
-            "final_price": _first(it, "final_price", "total", default=0),
-            "in_stock": it.get("in_stock", True),
-        }
-        for it in (data.get("items") or []) if isinstance(it, dict)
-    ]
-    pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
-    offers = data.get("offers") if isinstance(data.get("offers"), dict) else {}
-    restaurant = data.get("restaurant") if isinstance(data.get("restaurant"), dict) else None
-
-    result = {
-        "status": "success" if items else "empty",
-        "cart_id": data.get("cart_id"),
-        "restaurant": restaurant,
-        "items": items,
-        "item_count": data.get("item_count", len(items)),
-        "pricing": pricing,
-        "coupon_applied": offers.get("coupon_applied") if (offers.get("coupon_discount") or 0) > 0 else None,
-        "coupon_discount": offers.get("coupon_discount", 0),
-        "address_id": raw.get("addressId", address_id),
-        "message": None,
-    }
-    debug("food_mcp", f"get_food_cart parsed (json mode): status={result['status']!r} item_count={len(items)}")
+    result = parse_cart_data(raw, address_id)
+    debug("food_mcp", f"get_food_cart parsed (json mode): status={result['status']!r} item_count={len(result['items'])}")
     return result
 
 
@@ -208,7 +227,10 @@ def update_cart(
                 "error_codes": error_codes,
             }
         debug("food_mcp", f"update_food_cart parsed (text mode): message={message!r}")
-        return {"status": "success", "message": message}
+        result = {"status": "success", "message": message}
+        if isinstance(structured, dict) and isinstance(structured.get("data"), dict):
+            result["cart"] = parse_cart_data(structured, address_id)
+        return result
 
     error = _check_success(raw)
     if error or explicit_failure:
@@ -220,6 +242,10 @@ def update_cart(
         )
         return {"status": "error", "message": final_message, "error_codes": error_codes}
     result = {"status": "success", "message": raw.get("message") if isinstance(raw, dict) else None}
+    for source in (structured, raw):
+        if isinstance(source, dict) and isinstance(source.get("data"), dict):
+            result["cart"] = parse_cart_data(source, address_id)
+            break
     debug("food_mcp", f"update_food_cart parsed (json mode): {result!r}")
     return result
 

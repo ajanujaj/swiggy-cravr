@@ -6,6 +6,7 @@ from typing import Any
 from langgraph.types import interrupt
 
 from .. import food_mcp
+from ..options import clear_stable, stable
 from ..debug_utils import debug
 from .display import _cart_reply, _show_cart_with_next_steps
 from .guards import _customization_refusal, _requires_customization
@@ -22,7 +23,23 @@ _NONE_REPLY_PHRASES = {
 }
 
 
+# The add flow pauses for questions (duplicate item, add-ons, variants) and
+# LangGraph re-runs it from the top on every resume. Lookups made before a pause
+# are remembered for the conversation thread (options.stable) so a resume doesn't
+# repeat them -- the add-on lookup alone is a ~3 s `search_menu` call.
+_ADD_FLOW_CACHE = "add_flow"
+
+
 def _fetch_customization(
+    item_name: str, menu_item_id: str, address_id: str, restaurant_id: str,
+) -> dict[str, list[dict[str, Any]]]:
+    return stable(
+        (_ADD_FLOW_CACHE, "customization", str(restaurant_id), str(menu_item_id)),
+        lambda: _lookup_customization(item_name, menu_item_id, address_id, restaurant_id),
+    )
+
+
+def _lookup_customization(
     item_name: str, menu_item_id: str, address_id: str, restaurant_id: str,
 ) -> dict[str, list[dict[str, Any]]]:
     empty: dict[str, list[dict[str, Any]]] = {"addon_groups": [], "variant_groups": []}
@@ -267,10 +284,31 @@ def _wire_addon(addon: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
-def _carry_forward_customizations(address_id: str, keep_ids: set[str]) -> dict[str, dict[str, Any]]:
+def _details_from_cart(cart: dict[str, Any] | None) -> dict[str, dict[str, Any]] | None:
+    """Per-item add-ons/variants from a cart we already have -- no extra Swiggy call.
+    None when the cart came back as text (no item details), so callers fall back."""
+    items = (cart or {}).get("items") or []
+    if not items or not all("addons" in i for i in items):
+        return None
+    details = {}
+    for item in items:
+        variants = []
+        for v in item.get("variants") or []:
+            vid = v.get("variation_id", v.get("variationId", v.get("id")))
+            if vid is not None:
+                variants.append({"variation_id": vid, "group_id": v.get("group_id", v.get("groupId")), "name": v.get("name")})
+        details[str(item.get("menu_item_id"))] = {"addons": item.get("addons") or [], "variants": variants}
+    return details
+
+
+def _carry_forward_customizations(
+    address_id: str, keep_ids: set[str], cart: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
     if not keep_ids:
         return {}
-    details = food_mcp.get_cart_item_details(address_id)
+    details = _details_from_cart(cart)
+    if details is None:
+        details = food_mcp.get_cart_item_details(address_id)
     carry: dict[str, dict[str, Any]] = {}
     for mid in keep_ids:
         detail = details.get(str(mid)) or {}
@@ -394,6 +432,7 @@ def _addon_groups_matching_variant(
 def _add_item_with_variant(
     restaurant_id: str, address_id: str, restaurant_name: str | None,
     item_name: str, menu_item_id: str, quantity: int, variant_groups: list[dict[str, Any]],
+    existing_cart: dict[str, Any] | None = None, replace_existing: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, list[dict[str, Any]]]:
     variant_choices = [{**g, "min_addons": 1, "max_addons": 1} for g in variant_groups]
     selected_variants = _ask_for_all_addons(item_name, variant_choices, field_prefix="variant_groups")
@@ -401,14 +440,15 @@ def _add_item_with_variant(
         debug("cart_agent", f"addon-diag no variant selected for {item_name!r} -- can't add")
         return {"status": "error", "message": "No size/variant was chosen.", "error_codes": []}, [], "", []
 
-    existing_cart = food_mcp.get_cart(address_id)
+    if existing_cart is None:
+        existing_cart = food_mcp.get_cart(address_id)
     existing_items = _existing_cart_items(existing_cart)
     debug("cart_agent", f"variant flow -- existing cart before add: status={existing_cart.get('status')!r} "
           f"parsed_items={existing_items!r}")
     merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
-    merged[str(menu_item_id)] = merged.get(str(menu_item_id), 0) + quantity
+    merged[str(menu_item_id)] = (0 if replace_existing else merged.get(str(menu_item_id), 0)) + quantity
     carry_forward = _carry_forward_customizations(
-        address_id, {mid for mid in merged if mid != str(menu_item_id)},
+        address_id, {mid for mid in merged if mid != str(menu_item_id)}, cart=existing_cart,
     )
 
     def build_payload(
@@ -540,7 +580,60 @@ def _cart_conflict_reply(
     )
 
 
-def add_dish_to_cart(
+DUP_REPLACE_VALUE = "__dup_replace__"
+DUP_ONE_MORE_VALUE = "__dup_one_more__"
+DUP_KEEP_VALUE = "__dup_keep__"
+
+
+def _addon_names(line: dict[str, Any]) -> list[str]:
+    return [str(a.get("name")) for a in line.get("addons") or [] if a.get("name")]
+
+
+def _existing_line(cart: dict[str, Any], menu_item_id: Any) -> dict[str, Any] | None:
+    """This dish's line in the cart, with its add-ons when Swiggy sent them."""
+    for item in cart.get("items") or []:
+        if str(item.get("menu_item_id")) == str(menu_item_id):
+            return item
+    for item in _existing_cart_items(cart):  # text-mode cart: ids and quantities only
+        if str(item.get("menu_item_id")) == str(menu_item_id):
+            return {**item, "in_stock": str(menu_item_id) not in str(cart.get("out_of_stock") or "")}
+    return None
+
+
+def _ask_about_duplicate(dish: dict[str, Any], line: dict[str, Any]) -> str:
+    """The dish is already in the cart. Swiggy keeps one line per dish, so a second
+    unit can't have different add-ons -- ask instead of silently merging (which
+    used to turn one pick into x2 and overwrite the first one's add-ons)."""
+    name = dish.get("item_name") or "That dish"
+    names = _addon_names(line)
+    with_bit = f" (with {', '.join(names)})" if names else ""
+    stock_bit = "" if line.get("in_stock", True) else " It's out of stock as it is, so replacing it is the safer choice."
+    options = [
+        {"value": DUP_REPLACE_VALUE, "label": "Replace it with this one"},
+        {"value": DUP_ONE_MORE_VALUE, "label": "Add one more" + (" (same add-ons)" if names else "")},
+        {"value": DUP_KEEP_VALUE, "label": "Keep my cart as it is"},
+    ]
+    answer = str(interrupt({
+        "question": f"{name}{with_bit} is already in your cart (x{line.get('quantity', 1)}).{stock_bit} What should I do?",
+        "options": options,
+        "agent": "cart_agent",
+        "field": "duplicate_item",
+    })).strip()
+    lowered = answer.lower()
+    if answer in (DUP_REPLACE_VALUE, DUP_ONE_MORE_VALUE, DUP_KEEP_VALUE):
+        return answer
+    if lowered in ("1",) or "replace" in lowered:
+        return DUP_REPLACE_VALUE
+    if lowered in ("2",) or any(w in lowered for w in ("more", "another", "add")):
+        return DUP_ONE_MORE_VALUE
+    return DUP_KEEP_VALUE
+
+
+def _addon_id(addon: dict[str, Any]) -> str:
+    return str(addon.get("choice_id", addon.get("id")))
+
+
+def _add_dish_to_cart(
     dish: dict[str, Any], address_id: str, quantity: int = 1, lead_in: str = "",
     known_restaurant_id: str | None = None, known_restaurant_name: str | None = None,
     preselected_addons: list[dict[str, Any]] | None = None,
@@ -567,7 +660,25 @@ def add_dish_to_cart(
 
     variant_handled = False
 
-    if _requires_customization(dish.get("tags") or ""):
+    # Fetched once and reused for the duplicate check, the merge and carrying other
+    # items' add-ons forward (each extra get_food_cart was ~2 s).
+    existing_cart = stable(
+        (_ADD_FLOW_CACHE, "cart_before_add", str(menu_item_id)), lambda: food_mcp.get_cart(address_id),
+    )
+    replace_existing = False
+    one_more_same = False
+    line = _existing_line(existing_cart, menu_item_id) if preselected_addons is None else None
+    if line:
+        choice = _ask_about_duplicate(dish, line)
+        debug("cart_agent", f"{dish.get('item_name')!r} already in cart -> {choice}")
+        if choice == DUP_KEEP_VALUE:
+            return _show_cart_with_next_steps(
+                address_id, lead_in="Okay -- I've left your cart as it is.", cart=existing_cart,
+            )
+        replace_existing = choice == DUP_REPLACE_VALUE
+        one_more_same = choice == DUP_ONE_MORE_VALUE
+
+    if _requires_customization(dish.get("tags") or "") and not one_more_same:
         tags_haystack = (dish.get("tags") or "").lower()
 
         if preselected_addons is not None:
@@ -594,6 +705,7 @@ def add_dish_to_cart(
                 variant_result, selected_addons, variant_note, existing_items = _add_item_with_variant(
                     restaurant_id, address_id, dish.get("restaurant_name"),
                     str(dish.get("item_name") or ""), str(menu_item_id), quantity, variant_groups,
+                    existing_cart=existing_cart, replace_existing=replace_existing,
                 )
                 if variant_note:
                     lead_in = f"{lead_in} {variant_note}".strip()
@@ -605,16 +717,18 @@ def add_dish_to_cart(
         attempt_addon_only = True
 
     if not variant_handled:
-        existing_cart = food_mcp.get_cart(address_id)
         existing_items = _existing_cart_items(existing_cart)
         debug("cart_agent", f"existing cart before add: status={existing_cart.get('status')!r} "
-              f"parsed_items={existing_items!r}")
+              f"parsed_items={existing_items!r} replace={replace_existing} one_more={one_more_same}")
 
         merged: dict[str, int] = {str(item["menu_item_id"]): item.get("quantity", 1) for item in existing_items}
-        target_quantity = merged.get(str(menu_item_id), 0) + quantity
+        target_quantity = (0 if replace_existing else merged.get(str(menu_item_id), 0)) + quantity
         merged[str(menu_item_id)] = target_quantity
+        # "Add one more" keeps the dish's own add-ons too, so it's carried forward like the rest.
         carry_forward = _carry_forward_customizations(
-            address_id, {mid for mid in merged if mid != str(menu_item_id)},
+            address_id,
+            {mid for mid in merged if one_more_same or mid != str(menu_item_id)},
+            cart=existing_cart,
         )
         def _build_payload(target_addons: list[dict[str, Any]]) -> list[dict[str, Any]]:
             items = []
@@ -694,20 +808,30 @@ def add_dish_to_cart(
         content = f"Couldn't add that to your cart: {result.get('message', 'unknown error')}"
         return _cart_reply(f"{lead_in} {content}".strip())
 
+    # The update's own response carries the whole cart -- verify and display from it
+    # instead of two more get_food_cart calls.
+    updated_cart = result.get("cart") if isinstance(result.get("cart"), dict) else None
     if attempt_addon_only:
-        verify_cart = food_mcp.get_cart(address_id)
-        verify_items = _existing_cart_items(verify_cart)
-        landed = next(
-            (i for i in verify_items if str(i.get("menu_item_id")) == str(menu_item_id)), None,
-        )
+        verify_cart = updated_cart or food_mcp.get_cart(address_id)
+        landed = _existing_line(verify_cart, menu_item_id)
         debug(
             "cart_agent",
-            f"addon-only attempt verify -> landed={landed!r} target_quantity={target_quantity} "
-            f"all_items={verify_items!r}",
+            f"verify -> landed={landed!r} target_quantity={target_quantity}",
         )
-        if not landed or landed.get("quantity", 0) < target_quantity:
+        if not landed or int(landed.get("quantity") or 0) < target_quantity:
             return _cart_reply(_customization_refusal(dish.get("item_name")))
-        debug("cart_agent", "addon-only attempt VERIFIED -- explicit empty addons selection worked live")
+        wanted = {_addon_id(a): a.get("name") for a in selected_addons}
+        if "addons" in landed:
+            kept = {_addon_id(a) for a in landed.get("addons") or []}
+            dropped = [str(name or aid) for aid, name in wanted.items() if aid not in kept]
+            if dropped:
+                debug("cart_agent", f"verify -> quantity OK but Swiggy dropped add-ons {dropped!r}")
+                lead_in = (f"{lead_in} Swiggy didn't keep {', '.join(dropped)} on it -- "
+                           "you can add that in the Swiggy app.").strip()
+            else:
+                debug("cart_agent", f"verify OK -- quantity {target_quantity} and all {len(wanted)} add-on(s) landed")
+        else:
+            debug("cart_agent", "verify -> quantity OK (text-only cart, add-ons can't be checked)")
 
     update_message = result.get("message")
     looks_like_full_dump = bool(update_message) and (
@@ -719,7 +843,7 @@ def add_dish_to_cart(
         prefix = f"{lead_in} {update_message}".strip()
     else:
         prefix = lead_in
-    outcome = _show_cart_with_next_steps(address_id, lead_in=prefix)
+    outcome = _show_cart_with_next_steps(address_id, lead_in=prefix, cart=updated_cart)
     cart_state = outcome.get("cart_state") or {}
     if cart_state.get("status") in ("text", "success"):
         outcome["cart_state"] = {
@@ -727,3 +851,12 @@ def add_dish_to_cart(
             "restaurant": {"id": restaurant_id, "name": dish.get("restaurant_name")},
         }
     return outcome
+
+
+def add_dish_to_cart(*args: Any, **kwargs: Any) -> dict:
+    """Add a dish (asking about duplicates, add-ons and variants as needed).
+    Lookups remembered across this add's pauses are forgotten once it finishes,
+    so the next add starts from the live cart."""
+    result = _add_dish_to_cart(*args, **kwargs)
+    clear_stable((_ADD_FLOW_CACHE,))
+    return result

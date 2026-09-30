@@ -59,6 +59,16 @@ def run_checkout(address_id: str) -> dict:
         return _cart_reply(f"Couldn't load your cart: {cart.get('message', 'unknown error')}")
     if cart.get("status") == "empty" or not cart.get("items"):
         return _cart_reply("Your cart's empty -- add something first, then come back to check out.")
+    if cart.get("out_of_stock"):
+        # Swiggy: "they cannot order these as-is" -- stop before the payment question.
+        from .display import REMOVE_OOS_OPTION
+        from .routing import _NEXT_STEP_OPTIONS
+
+        return _cart_reply(
+            f"⚠️ {', '.join(cart['out_of_stock'])} is out of stock, so Swiggy won't accept this order yet. "
+            "Remove it (or swap it for something else) and then check out.",
+            **{**cart, "options": [REMOVE_OOS_OPTION] + [o for o in _NEXT_STEP_OPTIONS if "proceed" not in o["value"]]},
+        )
 
     address = food_mcp.get_saved_address()
     item_details = food_mcp.get_cart_item_details(address_id)
