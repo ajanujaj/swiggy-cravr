@@ -1,4 +1,3 @@
-
 INTENT_DISCOVERY_PROMPT = """
 You are Cravr's Intent Discovery agent. Analyze the user's food-ordering message(s).
 You are not a conversational assistant: do not recommend food and do not ask a

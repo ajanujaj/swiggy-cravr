@@ -1,35 +1,32 @@
-"""Recommendation agent: uses the MCP recommendation tool and a human-in-the-loop feedback cycle."""
-
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import re
 from collections import Counter
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage
 
+from .. import food_mcp
+from ..cart.CartAgent import add_dish_to_cart, _current_restaurant_id, _current_restaurant_name
+from ..cart.guards import _menu_categories
+from ..client import call_tool_sync, using_real_food_mcp
+from .signals import attach_restaurant_info, history_signals, practical_score
+from ..userPreference.taste import record_pick, record_rejection, taste_signals
+from . import feedback
+from .reasons import with_reasons
+from .opening import OPENING_KIND, SOMETHING_ELSE_LABEL, SOMETHING_ELSE_VALUE
 from ..debug_utils import debug
 from ..intent import KNOWN_CUISINE_WORDS, NON_VEG_ANSWERS, VEG_ANSWERS, extract_tastes
-from ..llm import get_llm
+from ..intent.meal_utils import CRAVING_TAG_CUES
 from ..profile_utils import latest_user_text
 from ..state import CravrState
 
-
-DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
-
-# The only values the menu's `dietary_type` column actually holds. The MCP tool
-# compares with `==`, so anything outside this set silently matches zero rows --
-# which is exactly what "vegetarian" (vs. the stored "Veg") was doing.
 DIETARY_TYPE_BY_PREFERENCE = {
     "veg": "Veg",
     "vegetarian": "Veg",
     "pure veg": "Veg",
     "veggie": "Veg",
-    # No pure-vegan dietary_type exists in the menu; "Veg" plus the `vegan`
-    # tag is the closest faithful filter.
     "vegan": "Veg",
     "non-veg": "Non-Veg",
     "non veg": "Non-Veg",
@@ -40,8 +37,6 @@ DIETARY_TYPE_BY_PREFERENCE = {
     "meat": "Non-Veg",
 }
 
-# The closed tag vocabulary in menu.csv. Anything outside it can only ever
-# match zero rows, so it must not be sent as a `tags` filter.
 KNOWN_TAGS = {
     "breakfast", "comfort-food", "dessert", "gluten-free", "high-fiber",
     "high-protein", "lightweight", "low-calorie", "low-carb", "mild",
@@ -49,9 +44,6 @@ KNOWN_TAGS = {
     "sweet", "tangy", "vegan", "vegan-option", "vegetarian",
 }
 
-# What the user is actually after, matched against menu.csv's `course` column.
-# Ordering matters: the first hit wins, so beverage/dessert cues are checked
-# before the generic meal default.
 BEVERAGE_CUES = ("coffee", "tea", "chai", "drink", "beverage", "juice", "smoothie",
                  "latte", "cappuccino", "espresso", "shake", "lassi")
 DESSERT_CUES = ("dessert", "sweet dish", "pudding", "cake", "brownie", "ice cream",
@@ -59,11 +51,8 @@ DESSERT_CUES = ("dessert", "sweet dish", "pudding", "cake", "brownie", "ice crea
 SIDE_CUES = ("side", "starter", "appetizer", "appetiser", "snack", "small plate",
              "nibble", "finger food")
 
-# Anything the user could plausibly eat as a meal. Sides are included as a
-# fallback rather than a first choice -- see `_course_preference`.
 MEAL_COURSES = "main,side"
 
-# How many dishes to put in front of the user at once.
 DISPLAY_COUNT = 3
 
 ACCEPTANCE_TOKENS = ("yes", "yep", "yeah", "sure", "ok", "okay", "perfect",
@@ -71,9 +60,6 @@ ACCEPTANCE_TOKENS = ("yes", "yep", "yeah", "sure", "ok", "okay", "perfect",
                      "go ahead", "that works", "book it", "accept")
 REJECTION_TOKENS = ("no", "nope", "nah", "not that", "different", "another",
                     "change", "new one", "something else", "skip", "reject")
-# "show me more" is its own intent, distinct from rejection: the user isn't
-# unhappy with what we offered, they just want to see the rest. Both serve the
-# next batch, but only this one is honest about running out.
 MORE_TOKENS = ("more", "other", "others", "else", "next", "alternatives",
                "alternative", "rest", "again")
 
@@ -89,11 +75,6 @@ def _extract_latest_user_input(messages: Any) -> str:
 
 
 def _mentions(user_input: str, tokens: tuple[str, ...]) -> bool:
-    """Whole-word/phrase match.
-
-    Plain substring matching made "I want noodles" read as a rejection (it
-    contains "no") and "not good" read as an acceptance (it contains "good").
-    """
     normalized = (user_input or "").strip().lower()
     if not normalized:
         return False
@@ -118,6 +99,10 @@ def _describe(dish: dict[str, Any]) -> str:
         details.append(f"₹{dish['price_inr']}")
     if dish.get("rating") is not None:
         details.append(f"rating {dish['rating']}")
+    if dish.get("eta_min"):
+        details.append(f"{dish['eta_min']} min")
+    if dish.get("offer"):
+        details.append(str(dish["offer"]))
     detail_text = ", ".join(d for d in details if d)
     return (
         f"{dish.get('item_name') or 'a dish'} from {dish.get('restaurant_name') or 'the restaurant'}"
@@ -126,12 +111,6 @@ def _describe(dish: dict[str, Any]) -> str:
 
 
 def _build_recommendation_text(recommendations: list[dict[str, Any]]) -> str:
-    """Offer up to three numbered options rather than a single take-it-or-leave-it.
-
-    One suggestion forces a yes/no on a stranger's taste; three lets the user
-    choose. If fewer than three matched, we show what there is instead of
-    padding with dishes that don't fit.
-    """
     if not recommendations:
         return (
             "I could not find a matching food suggestion right now. "
@@ -151,53 +130,44 @@ def _build_recommendation_text(recommendations: list[dict[str, Any]]) -> str:
 
 PICK_PROMPT = "Pick one by number or name, ask for more, or tell me what to change."
 
-# Numbered so the single-match confirmation costs one keystroke too, same as
-# the multi-dish list above -- "Want it, or shall I widen the search?" used
-# to be a plain yes/no the user had to type out in full.
 ONLY_MATCH_PROMPT = "    1. Yes, I'll take it\n    2. Widen the search"
 
 
 def _numbered(dishes: list[dict[str, Any]]) -> str:
-    return "\n".join(f"  {i}. {_describe(d)}" for i, d in enumerate(dishes, start=1))
+    return "\n".join(
+        f"  {i}. {_describe(d)}" + (f" — {d['reason']}" if d.get("reason") else "")
+        for i, d in enumerate(dishes, start=1)
+    )
 
 
 def _dish_pick_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Tappable buttons for a numbered dish list, matching `_numbered`'s order.
-
-    Values are the bare position ("1", "2", ...) -- the same thing a typed
-    digit already resolves to via `_resolve_choice` -- so tapping a button
-    and typing the number take the exact same path through `is_pure_feedback`
-    / `recommendation_agent_node`. Labels use the dish name so the button
-    itself says what you're picking, not just a number.
-    """
     return [
         {"value": str(i), "label": d.get("item_name") or f"Option {i}"}
         for i, d in enumerate(dishes, start=1)
     ]
 
 
-# Matches `ONLY_MATCH_PROMPT`'s two lines exactly -- kept as a single source
-# of truth so the buttons the UI renders can never drift out of sync with
-# the text describing them.
+def _dish_multiselect_options(dishes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    options = []
+    for i, dish in enumerate(dishes, start=1):
+        name = dish.get("item_name") or f"Option {i}"
+        price = dish.get("price_inr")
+        label = f"{name} — ₹{price:.0f}" if isinstance(price, (int, float)) and price else name
+        options.append({"value": str(i), "label": label})
+    return options
+
+
 ONLY_MATCH_OPTIONS = [
     {"value": "1", "label": "Yes, I'll take it"},
     {"value": "2", "label": "Widen the search"},
 ]
 
 
-# Ordinals are matched before cardinals, and that ordering is load-bearing:
-# in "the third one", the word "one" is a filler noun, not a choice. Checking
-# cardinals first would silently select option 1 for "no, the second one".
 ORDINAL_WORDS = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3}
 CARDINAL_WORDS = {"one": 1, "two": 2, "three": 3}
 
 
 def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Work out which of the offered dishes the user meant.
-
-    Handles "2", "the second one", "#3" and "the biryani". Checked before the
-    generic yes/no parsing, so "no, the second one" selects rather than rejects.
-    """
     normalized = (user_input or "").strip().lower()
     if not normalized or not options:
         return None
@@ -206,9 +176,6 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
         if position <= len(options) and re.search(rf"(?<!\w){re.escape(word)}(?!\w)", normalized):
             return options[position - 1]
 
-    # Bare cardinals only count as a pick when they ARE the message ("two") or
-    # follow an explicit marker ("number two"). Embedded in a sentence they're
-    # almost always filler -- "the third one", "the thai one".
     for word, position in CARDINAL_WORDS.items():
         if position > len(options):
             continue
@@ -217,12 +184,14 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
         ):
             return options[position - 1]
 
-    match = re.search(r"(?<!\d)([1-9])(?!\d)", normalized)
-    if match and int(match.group(1)) <= len(options):
+    match = re.search(r"(?<!\d)(\d{1,3})(?!\d)", normalized)
+    if match and 1 <= int(match.group(1)) <= len(options):
         return options[int(match.group(1)) - 1]
 
-    # Name match: require a reasonably distinctive word so that a stray "rice"
-    # or "veg" doesn't silently pick a dish the user didn't mean.
+    for dish in options:
+        if str(dish.get("item_name") or "").strip().lower() == normalized:
+            return dish
+
     for dish in options:
         words = [w for w in re.findall(r"\w+", str(dish.get("item_name") or "").lower()) if len(w) >= 5]
         if any(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", normalized) for w in words):
@@ -231,13 +200,54 @@ def _resolve_choice(user_input: str, options: list[dict[str, Any]]) -> dict[str,
     return None
 
 
-def _course_preference(intent_profile: dict[str, Any]) -> str:
-    """Infer which `course` the user is asking for.
+_NO_SELECTION_VALUE = "__no_addon__"
 
-    Defaults to "main" rather than leaving the field open. Without it the tool
-    happily answers "I want something spicy" with a ₹70 Filter Coffee or a
-    portion of Garlic Naan -- technically matching, useless as dinner.
-    """
+# A multi-select token can carry an optional quantity marker so a single
+# turn can say "2 of these, 1 of that" instead of everything defaulting to
+# one. Three shapes are recognised, tried in this order:
+#   "3:2"              -- chip-submitted (OptionChips.jsx's quantity
+#                          stepper encodes a >1 pick as "value:qty")
+#   "Falafel Wrap x2"   -- typed suffix, also covers "3x2" (index 3, qty 2)
+#   "2x Falafel Wrap"   -- typed prefix (guarded so it never also matches
+#                          the "3x2" suffix shape -- the remainder after
+#                          the marker must not itself be a bare number)
+# No marker at all still means quantity 1, exactly as before.
+_QTY_COLON_RE = re.compile(r"^(.*\S)\s*:\s*(\d{1,2})\s*$")
+_QTY_XSUFFIX_RE = re.compile(r"^(.*\S)\s*[x\u00d7]\s*(\d{1,2})\s*$", re.IGNORECASE)
+_QTY_XPREFIX_RE = re.compile(r"^\s*(\d{1,2})\s*[x\u00d7]\s*(\D.*\S)\s*$", re.IGNORECASE)
+
+
+def _split_quantity(token: str) -> tuple[str, int]:
+    t = (token or "").strip()
+    for pattern in (_QTY_COLON_RE, _QTY_XSUFFIX_RE):
+        m = pattern.match(t)
+        if m:
+            return m.group(1).strip(), max(1, min(20, int(m.group(2))))
+    m = _QTY_XPREFIX_RE.match(t)
+    if m:
+        return m.group(2).strip(), max(1, min(20, int(m.group(1))))
+    return t, 1
+
+
+def _resolve_multiple_choices(
+    user_input: str, options: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], int]]:
+    if not (user_input or "").strip() or not options:
+        return []
+
+    tokens = [t.strip() for t in re.split(r",|\band\b|&", user_input, flags=re.IGNORECASE) if t.strip()]
+    chosen: list[tuple[dict[str, Any], int]] = []
+    seen_ids: set[int] = set()
+    for token in tokens:
+        identifier, quantity = _split_quantity(token)
+        match = _resolve_choice(identifier, options)
+        if match is not None and id(match) not in seen_ids:
+            seen_ids.add(id(match))
+            chosen.append((match, quantity))
+    return chosen
+
+
+def _course_preference(intent_profile: dict[str, Any]) -> str:
     haystack = " ".join(
         str(value).lower()
         for value in (
@@ -253,8 +263,6 @@ def _course_preference(intent_profile: dict[str, Any]) -> str:
         return "beverage"
     if any(cue in haystack for cue in DESSERT_CUES):
         return "dessert"
-    # A sweet tooth expressed only as a taste preference is a weaker signal
-    # than the word "dessert", but still enough to include sweet courses.
     if "sweet" in [str(t).lower() for t in intent_profile.get("taste_preference") or []]:
         return "dessert,main"
     if any(cue in haystack for cue in SIDE_CUES):
@@ -262,40 +270,67 @@ def _course_preference(intent_profile: dict[str, Any]) -> str:
     return "main"
 
 
+BUDGET_FRIENDLY_MAX_INR = 200
+_BUDGET_CUES = ("budget", "cheap", "pocket", "affordable", "value")
+
+
+def _is_budget_category(craving_tag: Any) -> bool:
+    text = str(craving_tag or "").strip().lower()
+    return bool(text) and any(cue in text for cue in _BUDGET_CUES)
+
+
+def _free_text_category(craving_tag: Any) -> str | None:
+    """The first-round answer when it names food, not a mood tag, cuisine or budget."""
+    text = str(craving_tag or "").strip()
+    lowered = text.lower()
+    if (
+        len(lowered) < 2
+        or lowered.isdigit()
+        or text in CRAVING_TAG_CUES
+        or lowered in KNOWN_TAGS
+        or lowered in KNOWN_CUISINE_WORDS
+        or _is_budget_category(lowered)
+    ):
+        return None
+    return text
+
+
 def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, Any]:
-    """Build the MCP `recommendation` tool's argument dict from intent_profile.
-
-    Kept separate from `fetch_recommendations` so the filter-building logic
-    can be unit tested without a live MCP server. Only pass keys the tool
-    actually accepts (cuisine, restaurant_name, tags, dietary_type,
-    meal_type, max_price_inr) -- forwarding anything else (e.g. a free-text
-    `summary`) makes the whole call fail argument validation.
-
-    Two rules matter more than they look:
-
-    1. `cuisine` NEVER goes into `tags`. Cuisine lives in its own column and
-       is already filtered on; no menu row carries "Indian" as a *tag*, so
-       adding it there ANDed the result set down to zero every single time.
-    2. `dietary_type` must be translated into the menu's own vocabulary
-       ("Veg"/"Non-Veg"). The tool compares exactly, so the profile's
-       "vegetarian" never matched anything.
-    """
     filters: dict[str, Any] = {}
 
     tag_terms: list[str] = []
-    for term in [intent_profile.get("craving"), *(intent_profile.get("taste_preference") or [])]:
+    for term in [intent_profile.get("craving"), intent_profile.get("craving_tag"), *(intent_profile.get("taste_preference") or [])]:
         if not term:
             continue
         normalized = str(term).strip().lower()
-        # Only real tags survive; a free-text craving like "biryani" isn't a
-        # tag and would zero the result set if forwarded.
         if normalized in KNOWN_TAGS and normalized not in tag_terms:
             tag_terms.append(normalized)
     if tag_terms:
-        # Comma-separated tags are AND-matched by the MCP recommendation tool.
         filters["tags"] = ",".join(tag_terms)
 
+    if intent_profile.get("craving"):
+        craving = str(intent_profile["craving"])
+        filters["craving"] = craving
+        craving_tag = intent_profile.get("craving_tag")
+        if (
+            craving_tag
+            and len(str(craving_tag).split()) >= 2
+            and str(craving_tag) not in CRAVING_TAG_CUES
+            and str(craving_tag).strip().lower() not in KNOWN_CUISINE_WORDS
+            and str(craving_tag).strip().lower() != craving.strip().lower()
+        ):
+            filters["craving_secondary"] = str(craving_tag)
+    else:
+        # No craving, but the first answer was free text ("Small wrap", "Keto") rather
+        # than a known mood tag -- that's the only thing the user told us, so search for
+        # it instead of dropping it (it used to fall through to a generic "restaurants" search).
+        free_text = _free_text_category(intent_profile.get("craving_tag"))
+        if free_text:
+            filters["craving"] = free_text
+
     cuisine = intent_profile.get("cuisine")
+    if not cuisine and str(intent_profile.get("craving_tag") or "").strip().lower() in KNOWN_CUISINE_WORDS:
+        cuisine = intent_profile["craving_tag"]
     if cuisine:
         filters["cuisine"] = str(cuisine)
 
@@ -308,6 +343,8 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
             break
 
     budget = intent_profile.get("budget_inr")
+    if budget is None and _is_budget_category(intent_profile.get("craving_tag")):
+        budget = BUDGET_FRIENDLY_MAX_INR
     if budget is not None:
         try:
             filters["max_price_inr"] = int(budget)
@@ -318,22 +355,28 @@ def _build_recommendation_filters(intent_profile: dict[str, Any]) -> dict[str, A
 
 
 def _summarise_history(history_profile: dict[str, Any]) -> dict[str, Any]:
-    """Boil order history down to the two things that inform a recommendation.
-
-    "recent_orders=28; last_restaurant=Punjab Grill" said almost nothing --
-    one arbitrary recent row. What the dish choice can actually use is which
-    cuisines the user keeps coming back to and which items they re-order.
-    """
     orders = (history_profile or {}).get("orders") or []
     cuisines = Counter(
         str(o.get("cuisine")).strip() for o in orders if o.get("cuisine")
     )
-    items = Counter(str(o.get("item_name")).strip() for o in orders if o.get("item_name"))
+    restaurants = Counter(
+        str(o.get("restaurant_name")).strip() for o in orders if o.get("restaurant_name")
+    )
+    # Real Swiggy orders carry every item in `items`; mock orders only `item_name`.
+    items: Counter = Counter()
+    for o in orders:
+        names = {str(i.get("name")).strip() for i in (o.get("items") or []) if i.get("name")}
+        if not names and o.get("item_name"):
+            names = {str(o["item_name"]).strip()}
+        items.update(names)
 
     return {
         "order_count": len(orders),
         "top_cuisines": [name for name, _count in cuisines.most_common(2)],
+        "top_restaurants": [name for name, _count in restaurants.most_common(3)],
         "repeat_items": [name for name, count in items.most_common(3) if count > 1],
+        # Counts + recency used by signals.practical_score when ranking.
+        **history_signals(history_profile),
     }
 
 
@@ -341,7 +384,6 @@ _DIETARY_WORD = {"Veg": "vegetarian", "Non-Veg": "non-vegetarian"}
 
 
 def _brief_summary(filters: dict[str, Any], history: dict[str, Any]) -> str:
-    """One concise line covering intent + history, for logging and display."""
     course = filters.get("course", "main").split(",")[0]
     descriptors = [
         *(t for t in str(filters.get("tags") or "").split(",") if t),
@@ -356,6 +398,8 @@ def _brief_summary(filters: dict[str, Any], history: dict[str, Any]) -> str:
     parts = [intent]
     if history.get("top_cuisines"):
         parts.append("usually orders " + " and ".join(history["top_cuisines"]))
+    if history.get("top_restaurants"):
+        parts.append("often orders from " + ", ".join(history["top_restaurants"]))
     if history.get("repeat_items"):
         parts.append("re-orders " + ", ".join(history["repeat_items"]))
 
@@ -365,11 +409,8 @@ def _brief_summary(filters: dict[str, Any], history: dict[str, Any]) -> str:
 def _apply_saved_preferences(
     intent_profile: dict[str, Any], preference_profile: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """Apply durable defaults only where this request did not specify one."""
     merged = dict(intent_profile)
     preferences = _coerce_profile(preference_profile).get("preferences") or {}
-    # Support the older MCP response shape while clients migrate to one
-    # profile object per user.
     if isinstance(preferences, list):
         preferences = preferences[0] if preferences else {}
     if not isinstance(preferences, dict):
@@ -387,35 +428,18 @@ def build_recommendation_brief(
     history_profile: dict[str, Any],
     preference_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Freeze a request into everything the recommender needs, and nothing more.
-
-    Called once by decision_agent when it decides to recommend. Producing this
-    in one place means the profile-to-menu-filter translation (dietary
-    vocabulary, tag vocabulary, course inference) happens exactly once, rather
-    than being re-derived -- or worse, re-parsed out of prose -- downstream.
-    """
     effective_intent = _apply_saved_preferences(
         _coerce_profile(intent_profile), preference_profile
     )
     filters = _build_recommendation_filters(effective_intent)
-    history = _summarise_history(_coerce_profile(history_profile))
+    history = {
+        **_summarise_history(_coerce_profile(history_profile)),
+        **taste_signals(preference_profile),  # learned likes/dislikes (feature 1)
+    }
     return {"filters": filters, "history": history, "summary": _brief_summary(filters, history)}
 
 
 def _filter_variants(filters: dict[str, Any]) -> list[dict[str, Any]]:
-    """Strict filters first, then progressively looser fallbacks.
-
-    `dietary_type` and `max_price_inr` are never relaxed -- those are hard
-    constraints (a vegetarian must not be shown chicken, and a budget is a
-    budget). Cuisine goes before tags: taste is usually the thing the user
-    actually said out loud ("something spicy"), whereas cuisine is often our
-    own inference, so a spicy Thai dish beats a mild North Indian one when
-    something has to give.
-    """
-    # `course` is widened (main -> main,side) rather than dropped: giving up
-    # on it entirely is how a beverage or a dessert ends up answering "I want
-    # to eat something spicy". Widening is tried before sacrificing the
-    # user's stated taste, since a spicy side beats a mild main.
     course_steps = [filters.get("course")]
     if filters.get("course") == "main":
         course_steps.append(MEAL_COURSES)
@@ -432,51 +456,97 @@ def _filter_variants(filters: dict[str, Any]) -> list[dict[str, Any]]:
     return variants
 
 
+def _craving_match_score(item_name: str, *phrases: str | None) -> int:
+    name = (item_name or "").strip().lower()
+    score = 0
+    for phrase in phrases:
+        phrase_l = str(phrase or "").strip().lower()
+        if not phrase_l:
+            continue
+        if name == phrase_l:
+            score += 2
+        elif phrase_l in name:
+            score += 1
+    return score
+
+
+def _ranking_signals(history: dict[str, Any] | None) -> dict[str, Any]:
+    """Signals for practical_score. Briefs built before signals existed (or
+    tests) only carry top_cuisines/top_restaurants -- treat those as counts of 1."""
+    history = dict(history or {})
+    if "restaurant_counts" not in history:
+        history["restaurant_counts"] = {str(r).strip().lower(): 1 for r in history.get("top_restaurants") or []}
+    if "cuisine_counts" not in history:
+        history["cuisine_counts"] = {str(c).strip().lower(): 1 for c in history.get("top_cuisines") or []}
+    return history
+
+
 def _rank_candidates(
     recommendations: list[dict[str, Any]],
     desired_tags: list[str],
     desired_cuisine: str | None,
     desired_course: str | None,
     history: dict[str, Any],
+    desired_craving: str | None = None,
+    desired_craving_secondary: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Order results by how well they honour the *original* request.
-
-    This has to be preference-aware, not rating-only. Once a filter has been
-    relaxed the MCP tool happily returns everything that survives the hard
-    constraints, and sorting those purely by rating recommended a ₹70 Filter
-    Coffee to someone who asked for something spicy -- it simply had the best
-    rating in the set. Scoring against the dropped preferences puts the spicy
-    dishes back on top while still letting the fallback do its job.
-    """
+    """Relevance first (what they asked for), then one practical score:
+    their usual restaurants/dishes, delivery time, offer, rating, and a
+    penalty for what they ate in the last day (see signals.py)."""
     wanted_tags = {t.strip().lower() for t in desired_tags if t}
     cuisine = (desired_cuisine or "").strip().lower()
-    # The first listed course is the one actually wanted; the rest are the
-    # widened fallbacks, so they should still rank below it.
     preferred_course = (desired_course or "").split(",")[0].strip().lower()
-
-    past_cuisines = {str(c).strip().lower() for c in (history or {}).get("top_cuisines") or []}
+    signals = _ranking_signals(history)
 
     def sort_key(item: dict[str, Any]) -> tuple[int, int, int, int, float]:
         item_tags = {t.strip().lower() for t in str(item.get("tags") or "").split(";") if t.strip()}
         item_cuisine = str(item.get("cuisine") or "").strip().lower()
         item_course = str(item.get("course") or "").strip().lower()
-        try:
-            rating = float(item.get("rating") or 0)
-        except (TypeError, ValueError):
-            rating = 0.0
         return (
-            1 if preferred_course and item_course == preferred_course else 0,  # a meal, not a side
-            len(wanted_tags & item_tags),                          # asked-for taste
-            1 if cuisine and cuisine in item_cuisine else 0,       # then cuisine
-            1 if item_cuisine in past_cuisines else 0,             # then familiarity
-            rating,                                                # then quality
+            _craving_match_score(
+                str(item.get("item_name") or ""), desired_craving, desired_craving_secondary
+            ),
+            1 if preferred_course and item_course == preferred_course else 0,
+            len(wanted_tags & item_tags),
+            1 if cuisine and cuisine in item_cuisine else 0,
+            practical_score(item, signals),
         )
 
     return sorted(recommendations, key=sort_key, reverse=True)
 
-# context_profile: dict[str, Any], context_profile is currently disabled, so the recommendation tool is only driven by intent_profile and history_profile.
+
+# Restaurants looked up per search for delivery time / offer / open status.
+_ENRICH_RESTAURANTS = 5
+
+
+def _enrich_with_restaurant_info(
+    recommendations: list[dict[str, Any]], address_id: str | None,
+) -> list[dict[str, Any]]:
+    """Real Swiggy only: add delivery time, offer and open status from
+    `search_restaurants` for the first few restaurants in the result, and
+    drop dishes from restaurants that are closed."""
+    if not recommendations or not using_real_food_mcp():
+        return recommendations
+    wanted: list[tuple[str, str]] = []
+    for dish in recommendations:
+        pair = (str(dish.get("restaurant_id") or ""), str(dish.get("restaurant_name") or ""))
+        if pair[0] and pair[1] and pair not in wanted:
+            wanted.append(pair)
+        if len(wanted) >= _ENRICH_RESTAURANTS:
+            break
+    try:
+        info = food_mcp.restaurant_info(wanted, _resolve_address_id(address_id))
+    except Exception as exc:  # never lose results over missing extras
+        debug("recommendation_agent", f"restaurant info lookup failed ({exc}) -- ranking without it")
+        return recommendations
+    enriched = attach_restaurant_info(recommendations, info)
+    dropped = len(recommendations) - len(enriched)
+    if dropped:
+        debug("recommendation_agent", f"dropped {dropped} dish(es) from closed restaurants")
+    return enriched
+
+
 def _unwrap_tool_result(result: Any) -> list[dict[str, Any]]:
-    """Pull the recommendations list out of whatever shape fastmcp returns."""
     if isinstance(result, dict):
         if result.get("status") == "success":
             return result.get("recommendations") or []
@@ -501,34 +571,33 @@ def _unwrap_tool_result(result: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _call_recommendation_tool(filters: dict[str, Any]) -> list[dict[str, Any]]:
-    async def _call_tool() -> Any:
-        from fastmcp import Client
+def _resolve_address_id(address_id: str | None) -> str | None:
+    if address_id:
+        return address_id
+    return food_mcp.get_saved_address().get("address_id")
 
-        async with Client(DEFAULT_MCP_URL) as client:
-            return await client.call_tool(name="recommendation", arguments=filters)
 
+def _call_recommendation_tool(filters: dict[str, Any], address_id: str | None = None) -> list[dict[str, Any]]:
+    if using_real_food_mcp():
+        return food_mcp.search_dishes(filters, address_id=_resolve_address_id(address_id))
+
+    mock_filters = {k: v for k, v in filters.items() if k != "craving"}
     try:
-        result = asyncio.run(_call_tool())
+        result = call_tool_sync("recommendation", mock_filters)
     except Exception as exc:
-        # This used to be a bare `return []`, which made "the MCP server isn't
-        # running" indistinguishable from "no dish matched". Both surfaced to
-        # the user as the same shrug.
-        debug("recommendation_agent", f"MCP call FAILED ({type(exc).__name__}: {exc}) at {DEFAULT_MCP_URL}")
+        debug("recommendation_agent", f"MCP call FAILED ({type(exc).__name__}: {exc})")
         return []
 
     return _unwrap_tool_result(result)
 
 
-def fetch_recommendations(brief: dict[str, Any]) -> list[dict[str, Any]]:
-    """Call the MCP recommendation tool, relaxing preference filters until something matches.
-
-    Takes only the frozen brief from decision_agent -- no profiles, no
-    re-derivation.
-    """
+def fetch_recommendations(
+    brief: dict[str, Any], address_id: str | None = None, exclude_restaurant_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     brief = _coerce_profile(brief)
     filters = dict(brief.get("filters") or {})
     history = _coerce_profile(brief.get("history"))
+    exclude_ids = {str(r) for r in (exclude_restaurant_ids or ())}
     debug("recommendation_agent", f"brief summary={brief.get('summary')!r}")
     debug("recommendation_agent", f"strict filters={filters} history={history}")
 
@@ -537,11 +606,18 @@ def fetch_recommendations(brief: dict[str, Any]) -> list[dict[str, Any]]:
     desired_course = filters.get("course")
 
     for attempt, variant in enumerate(_filter_variants(filters), start=1):
-        recommendations = _call_recommendation_tool(variant)
+        recommendations = _call_recommendation_tool(variant, address_id=address_id)
+        if exclude_ids:
+            recommendations = [
+                r for r in recommendations if str(r.get("restaurant_id")) not in exclude_ids
+            ]
         debug("recommendation_agent", f"attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
+            recommendations = _enrich_with_restaurant_info(recommendations, address_id)
             ranked = _rank_candidates(
-                recommendations, desired_tags, desired_cuisine, desired_course, history
+                recommendations, desired_tags, desired_cuisine, desired_course, history,
+                desired_craving=filters.get("craving"),
+                desired_craving_secondary=filters.get("craving_secondary"),
             )
             relaxed = sorted(set(filters) - set(variant))
             if variant.get("course") != desired_course:
@@ -552,23 +628,15 @@ def fetch_recommendations(brief: dict[str, Any]) -> list[dict[str, Any]]:
                 f"(relaxed: {relaxed or 'nothing'}, ranked against tags={desired_tags} "
                 f"cuisine={desired_cuisine!r} course={desired_course!r})",
             )
-            return ranked
+            return with_reasons(ranked, _ranking_signals(history), filters)
 
     debug("recommendation_agent", "no recommendations after exhausting all filter variants")
     return []
 
 
 def widen_recommendations(
-    brief: dict[str, Any], exclude_items: set[str] | None = None
+    brief: dict[str, Any], address_id: str | None = None, exclude_items: set[str] | None = None
 ) -> list[dict[str, Any]]:
-    """Deliberately relax the search beyond the strict match.
-
-    For when `fetch_recommendations` only turned up a single result and the
-    user asked to see more rather than take it. Reuses the exact same
-    relaxation cascade (`_filter_variants`), just starting one step past the
-    strict variant that already ran -- so `dietary_type` and budget are still
-    never relaxed, only cuisine/tags/course, same as any other fallback.
-    """
     brief = _coerce_profile(brief)
     filters = dict(brief.get("filters") or {})
     history = _coerce_profile(brief.get("history"))
@@ -578,26 +646,194 @@ def widen_recommendations(
     desired_cuisine = filters.get("cuisine")
     desired_course = filters.get("course")
 
-    # [0] is the exact-match variant that produced the single result already
-    # shown; skip straight to the first relaxed one.
     for attempt, variant in enumerate(_filter_variants(filters)[1:], start=1):
-        recommendations = _call_recommendation_tool(variant)
+        recommendations = _call_recommendation_tool(variant, address_id=address_id)
         recommendations = [
             item for item in recommendations
             if str(item.get("item_name") or "").strip().lower() not in exclude
         ]
         debug("recommendation_agent", f"widen attempt {attempt} filters={variant} -> {len(recommendations)} result(s)")
         if recommendations:
-            return _rank_candidates(recommendations, desired_tags, desired_cuisine, desired_course, history)
+            recommendations = _enrich_with_restaurant_info(recommendations, address_id)
+            return with_reasons(_rank_candidates(
+                recommendations, desired_tags, desired_cuisine, desired_course, history,
+                desired_craving=filters.get("craving"),
+                desired_craving_secondary=filters.get("craving_secondary"),
+            ), _ranking_signals(history), filters)
 
     debug("recommendation_agent", "widen found nothing beyond the original match")
     return []
 
 
+def _offer_category_batch(
+    lead_in: str, categories: list[dict[str, Any]], restaurant_scope: dict[str, Any] | None = None,
+) -> dict:
+    summaries = [{"item_name": c["category"], "category": c["category"]} for c in categories]
+    lines = "\n".join(
+        f"  {i}. {c['category']} ({len(c['items'])} item{'' if len(c['items']) == 1 else 's'})"
+        for i, c in enumerate(categories, start=1)
+    )
+    content = f"{lead_in}\n{lines}\nPick as many as you like, then hit submit." if lead_in else lines
+    return _reply(
+        content,
+        awaiting_feedback=True, satisfied=False,
+        last_recommendations=summaries, alternates=[], filters={},
+        categories=[c["items"] for c in categories],
+        offer_kind="category",
+        options=_dish_pick_options(summaries),
+        restaurant_scope=restaurant_scope,
+    )
+
+
+def _offer_dish_batch(
+    lead_in: str, items: list[dict[str, Any]], restaurant_scope: dict[str, Any] | None = None,
+    filters: dict[str, Any] | None = None,
+) -> dict:
+    content = (
+        f"{lead_in}\n{_numbered(items)}\nPick as many as you like, then hit submit."
+        if lead_in else _numbered(items)
+    )
+    return _reply(
+        content,
+        awaiting_feedback=True, satisfied=False,
+        last_recommendations=items, alternates=[], filters=filters or {},
+        offer_kind="dish",
+        options=_dish_multiselect_options(items),
+        restaurant_scope=restaurant_scope,
+    )
+
+
+def _join_labels(labels: list[str]) -> str:
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} and {labels[1]}"
+    return f"{', '.join(labels[:-1])}, and {labels[-1]}"
+
+
+def _handle_category_pick(
+    chosen: list[dict[str, Any]], recommendation_state: dict[str, Any], address_id: str | None,
+) -> dict:
+    offered = recommendation_state.get("last_recommendations") or []
+    categories = recommendation_state.get("categories") or []
+    restaurant_scope = dict(recommendation_state.get("restaurant_scope") or {})
+
+    labels: list[str] = []
+    seen_ids: set[str] = set()
+    items: list[dict[str, Any]] = []
+    for pick in chosen:
+        try:
+            index = offered.index(pick)
+        except ValueError:
+            continue
+        label = pick.get("category") or pick.get("item_name") or "that category"
+        labels.append(label)
+        for item in categories[index] if 0 <= index < len(categories) else []:
+            item_id = str(item.get("menu_item_id"))
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            items.append(item)
+
+    if not items:
+        label_text = _join_labels(labels) if labels else "that category"
+        return _reply(
+            f"Couldn't find items under {label_text} right now -- try again in a moment.",
+            awaiting_feedback=False, satisfied=False,
+        )
+
+    restaurant_scope["current_category"] = labels
+    return _offer_dish_batch(f"Here's what's under {_join_labels(labels)}:", items, restaurant_scope)
+
+
+def _handle_dish_multiselect(
+    dishes: list[dict[str, Any]], address_id: str | None, state: CravrState | None,
+    quantities: dict[str, int] | None = None,
+) -> dict:
+    if not dishes:
+        return _reply("Nothing was picked to add.", awaiting_feedback=False, satisfied=False)
+
+    if not address_id:
+        names = _join_labels([_describe(d) for d in dishes])
+        return _reply(
+            f"Great choices — {names} — but I don't have a delivery address yet, so I "
+            "couldn't add them to your cart.",
+            awaiting_feedback=False, satisfied=False,
+        )
+
+    known_restaurant_id = _current_restaurant_id(state) if state is not None else None
+    known_restaurant_name = _current_restaurant_name(state) if state is not None else None
+
+    added: list[str] = []
+    result: dict[str, Any] = {}
+    for dish in dishes:
+        quantity = 1
+        if quantities:
+            quantity = max(1, int(quantities.get(str(dish.get("menu_item_id")), 1) or 1))
+        result = add_dish_to_cart(
+            dish, address_id, quantity=quantity,
+            known_restaurant_id=known_restaurant_id, known_restaurant_name=known_restaurant_name,
+        )
+        cart_state = result.get("cart_state") or {}
+        if "restaurant" not in cart_state:
+            if added:
+                prior_note = f"Added {_join_labels(added)} first. "
+                messages = result.get("messages") or []
+                original = getattr(messages[0], "content", "") if messages else ""
+                result = {**result, "messages": [AIMessage(content=prior_note + original, name="cart_agent")]}
+            result["recommendation_state"] = {"awaiting_feedback": False, "satisfied": False}
+            return result
+        label = dish.get("item_name") or "that dish"
+        added.append(f"{quantity}x {label}" if quantity > 1 else label)
+        restaurant = cart_state["restaurant"]
+        known_restaurant_id = known_restaurant_id or restaurant.get("id")
+        known_restaurant_name = known_restaurant_name or restaurant.get("name")
+
+    messages = result.get("messages") or []
+    body = getattr(messages[0], "content", "") if messages else ""
+    lead_in = f"Added {_join_labels(added)} to your cart."
+    content = f"{lead_in}\n\n{body}".strip() if body else lead_in
+    return {
+        **result,
+        "messages": [AIMessage(content=content, name="cart_agent")],
+        "recommendation_state": {
+            "awaiting_feedback": False, "satisfied": True, "last_recommendations": dishes,
+        },
+    }
+
+
+def _widen_within_restaurant(
+    restaurant_scope: dict[str, Any], offered: list[dict[str, Any]], address_id: str | None,
+) -> dict | None:
+    restaurant_id = restaurant_scope.get("restaurant_id")
+    if not restaurant_id:
+        return None
+
+    menu_items = food_mcp.get_restaurant_menu_items(
+        restaurant_id, address_id, restaurant_scope.get("restaurant_name") or ""
+    )
+    if not menu_items:
+        return None
+
+    exclude_ids = {str(i) for i in (restaurant_scope.get("existing_ids") or [])}
+    exclude_ids |= {str(d.get("menu_item_id")) for d in offered if d.get("menu_item_id")}
+    categories = _menu_categories(menu_items, exclude_ids)
+
+    current_categories = restaurant_scope.get("current_category")
+    if current_categories:
+        if isinstance(current_categories, str):
+            current_categories = [current_categories]
+        excluded = {str(c) for c in current_categories}
+        categories = [c for c in categories if c["category"] not in excluded]
+    if not categories:
+        return None
+
+    next_scope = {k: v for k, v in restaurant_scope.items() if k != "current_category"}
+    return _offer_category_batch("Here's what else this restaurant has:", categories, next_scope)
+
+
 def _carries_new_constraints(user_input: str) -> bool:
-    """True when the message changes the request rather than just reacting to it."""
     normalized = (user_input or "").strip().lower()
-    # Two or more digits is a price, not a menu position ("under 200").
     if re.search(r"\d{2,}", normalized):
         return True
     if extract_tastes(normalized):
@@ -607,10 +843,6 @@ def _carries_new_constraints(user_input: str) -> bool:
     return _mentions(normalized, VEG_ANSWERS + NON_VEG_ANSWERS)
 
 
-# The single-match confirmation offers exactly two numbered choices (see
-# `ONLY_MATCH_PROMPT`); "2" only means "widen the search" in that specific
-# context -- against a real multi-dish list "2" still means "the second
-# one", handled separately by `_resolve_choice`.
 WIDEN_TOKENS = ("widen", "broaden", "expand", "wider")
 
 
@@ -622,35 +854,26 @@ def _looks_like_decline_only_offer(user_input: str) -> bool:
 
 
 def is_pure_feedback(user_input: str, recommendation_state: dict[str, Any] | None) -> bool:
-    """True when a message only reacts to the dishes we just offered.
-
-    Used by the graph to skip intent/history/decision entirely for replies
-    like "3" or "yes". Re-running the whole pipeline for those isn't just
-    wasted LLM and MCP calls -- it feeds "3" to the extraction model, and a
-    model that reads that as budget_inr=3 would set max_price_inr=3 and
-    silently zero out every subsequent search.
-
-    Deliberately conservative: anything carrying a new constraint ("no, make
-    it non-veg", "something under 200") goes the long way round so the profile
-    actually gets updated.
-    """
     state = recommendation_state or {}
     offered = state.get("last_recommendations") or []
     if not offered or not state.get("awaiting_feedback") or state.get("satisfied"):
         return False
 
-    # An explicit pick is unambiguous even if it collides with other vocabulary.
+    if (user_input or "").strip() == _NO_SELECTION_VALUE:
+        return True
+
+    if state.get("offer_kind") == OPENING_KIND:
+        # Only a pick is a reaction to the opening cards. "Something else", "no",
+        # "more" or anything typed is a (new) request -- intent asks what they want.
+        return bool(_resolve_choice(user_input, offered))
+
     if _resolve_choice(user_input, offered):
         return True
-    # Same reasoning for the single-match confirmation's "2": there's no
-    # dish #2 to resolve above, but a bare "2" is just as unambiguous a click
-    # as a real positional pick, so it skips the new-constraints gate too --
-    # otherwise this one reply would take the full intent/context/decision
-    # round-trip just to land back on the widen branch in
-    # `recommendation_agent_node`. A typed-out "widen the search" isn't
-    # this unambiguous (it could be riding along with a real new
-    # constraint), so it still goes the long way round via that gate below.
     if len(offered) == 1 and (user_input or "").strip().rstrip(".!") == "2":
+        return True
+    # "too pricey", "something lighter", "too spicy": a reason for rejecting what's shown
+    # (feature 2). Checked before new constraints -- "too spicy" is not a request for spicy.
+    if feedback.infer_reason(user_input) and not re.search(r"\d{2,}", user_input or ""):
         return True
     if _carries_new_constraints(user_input):
         return False
@@ -668,18 +891,108 @@ def _reply(content: str, **rec_state: Any) -> dict:
     }
 
 
+def _reply_with_pick(
+    chosen: dict[str, Any], address_id: str | None, state: CravrState | None = None, **rec_state: Any
+) -> dict:
+    lead_in = f"Great — {_describe(chosen)} it is."
+    owner = address_id or (state or {}).get("user_id")  # profile key: the delivery address_id
+    if not address_id:
+        record_pick(owner, chosen)  # feature 1: learn from every pick
+        return _reply(
+            f"{lead_in} I don't have a delivery address yet, so I couldn't add it to your cart.",
+            **rec_state,
+        )
+    known_restaurant_id = _current_restaurant_id(state) if state is not None else None
+    known_restaurant_name = _current_restaurant_name(state) if state is not None else None
+    result = add_dish_to_cart(
+        chosen, address_id, lead_in=lead_in,
+        known_restaurant_id=known_restaurant_id, known_restaurant_name=known_restaurant_name,
+    )
+    # Saved only after the add flow returns: it can pause for add-on/variant questions,
+    # and LangGraph re-runs this node from the top on every resume -- saving before the
+    # pause counted one pick once per question (and inferred a diet from one burger).
+    record_pick(owner, chosen)
+    result["recommendation_state"] = rec_state
+    return result
+
+
+def _handle_rejection(
+    reason: str, state: CravrState, brief: dict[str, Any], rec_state: dict[str, Any], address_id: str | None,
+) -> dict:
+    """Fix what the user said was wrong (feature 2): tighten the search for that
+    reason, remember it, and show a new batch -- from the results already held
+    when enough of them pass, otherwise from a fresh search."""
+    offered = rec_state.get("last_recommendations") or []
+    alternates = rec_state.get("alternates") or []
+    record_rejection(address_id or state.get("user_id"), offered, reason)
+
+    adjustments = feedback.adjustments_for(reason, offered, rec_state.get("adjustments"))
+    shown = {str(n).strip().lower() for n in rec_state.get("shown_items") or []}
+    shown |= {str(d.get("item_name") or "").strip().lower() for d in offered}
+    debug("recommendation_agent", f"rejection reason={reason!r} adjustments={adjustments}")
+
+    def usable(dishes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        out = []
+        for d in dishes:
+            key = str(d.get("item_name") or "").strip().lower()
+            if key in shown or key in seen or not feedback.keeps(d, adjustments):
+                continue
+            seen.add(key)
+            out.append(d)
+        return out
+
+    new_brief = feedback.adjusted_brief(brief, adjustments)
+    candidates = usable(alternates)
+    if len(candidates) < DISPLAY_COUNT:
+        candidates = usable(candidates + fetch_recommendations(new_brief, address_id=address_id))
+
+    filters = dict(new_brief.get("filters") or {})
+    candidates = sorted(candidates, key=lambda d: feedback.preference_key(d, adjustments), reverse=True)
+    if not candidates:
+        return _reply(
+            f"{feedback.NOTHING_FOUND.get(reason, 'Nothing else fits.')} Tell me what to change "
+            "(a dish, cuisine or budget) and I'll look again.",
+            awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+            adjustments=adjustments, shown_items=sorted(shown),
+        )
+
+    batch, rest = candidates[:DISPLAY_COUNT], candidates[DISPLAY_COUNT:]
+    return _reply(
+        f"{feedback.LEAD_INS.get(reason, 'Here are some others:')}\n{_numbered(batch)}\n{PICK_PROMPT}",
+        awaiting_feedback=True, satisfied=False,
+        last_recommendations=batch, alternates=rest, filters=filters,
+        options=_dish_pick_options(batch),
+        adjustments=adjustments, shown_items=sorted(shown),
+    )
+
+
+OPENING_LEAD = "Not sure what to eat? Here are three ideas to start with:"
+OPENING_PROMPT = "Pick one, or tap Something else and I'll ask what you're in the mood for."
+
+
+def _offer_opening(picks: list[dict[str, Any]], filters: dict[str, Any], token: str | None) -> dict:
+    lines = []
+    for i, dish in enumerate(picks, start=1):
+        badge = f"{dish['badge']}: " if dish.get("badge") else ""
+        reason = f" — {dish['reason']}" if dish.get("reason") else ""
+        lines.append(f"  {i}. {badge}{_describe(dish)}{reason}")
+    options = _dish_pick_options(picks) + [{"value": SOMETHING_ELSE_VALUE, "label": SOMETHING_ELSE_LABEL}]
+    return _reply(
+        f"{OPENING_LEAD}\n" + "\n".join(lines) + f"\n{OPENING_PROMPT}",
+        awaiting_feedback=True, satisfied=False,
+        last_recommendations=picks, alternates=[], filters=filters,
+        options=options, offer_kind=OPENING_KIND, opening_token=token,
+    )
+
+
 def _serve_next_batch(
     lead_in: str,
     offered: list[dict[str, Any]],
     alternates: list[dict[str, Any]],
     filters: dict[str, Any],
+    restaurant_scope: dict[str, Any] | None = None,
 ) -> dict:
-    """Show the next slice of an already-fetched result set.
-
-    The full ranked list is kept in `alternates` precisely so "show me more"
-    doesn't mean re-running the same query and re-printing the same three
-    dishes -- which is exactly what "recommend more" used to do.
-    """
     if alternates:
         batch, rest = alternates[:DISPLAY_COUNT], alternates[DISPLAY_COUNT:]
         debug("recommendation_agent", f"serving {len(batch)} more, {len(rest)} still held back")
@@ -688,6 +1001,7 @@ def _serve_next_batch(
             awaiting_feedback=True, satisfied=False,
             last_recommendations=batch, alternates=rest, filters=filters,
             options=_dish_pick_options(batch),
+            restaurant_scope=restaurant_scope,
         )
 
     debug("recommendation_agent", "no alternates left to offer")
@@ -696,16 +1010,11 @@ def _serve_next_batch(
         "a different cuisine, a higher budget, or including sides and desserts?",
         awaiting_feedback=True, satisfied=False,
         last_recommendations=offered, alternates=[], filters=filters,
+        restaurant_scope=restaurant_scope,
     )
 
 
 def recommendation_agent_node(state: CravrState) -> dict:
-    """Recommend food via MCP and keep looping until the user is satisfied.
-
-    Reads the frozen `recommendation_brief` produced by decision_agent and
-    nothing else. The fallback below exists only so the node stays callable in
-    isolation (tests, a direct invoke); in the graph the brief is always there.
-    """
     brief = _coerce_profile(state.get("recommendation_brief"))
     if not brief:
         debug("recommendation_agent", "no brief in state — deriving one from the profiles")
@@ -715,6 +1024,7 @@ def recommendation_agent_node(state: CravrState) -> dict:
         )
 
     brief_filters = dict(brief.get("filters") or {})
+    address_id = _coerce_profile(state.get("context_profile")).get("address_id")
     recommendation_state = dict(state.get("recommendation_state") or {})
     awaiting_feedback = bool(recommendation_state.get("awaiting_feedback"))
     offered = recommendation_state.get("last_recommendations") or []
@@ -724,26 +1034,97 @@ def recommendation_agent_node(state: CravrState) -> dict:
     user_input = _extract_latest_user_input(state.get("messages") or [])
     debug("recommendation_agent", f"user_input={user_input!r} awaiting_feedback={awaiting_feedback}")
 
-    if awaiting_feedback and not satisfied:
-        # Check for an explicit pick first: "no, the second one" is a choice,
-        # not a rejection.
-        chosen = _resolve_choice(user_input, offered)
-        if chosen:
-            debug("recommendation_agent", f"user chose {chosen.get('item_name')!r}")
-            return _reply(
-                f"Great — {_describe(chosen)} it is.",
-                awaiting_feedback=False, satisfied=True, last_recommendations=[chosen],
-            )
+    opening_token = brief.get("opening_token")
+    showing_this_opening = (
+        recommendation_state.get("offer_kind") == OPENING_KIND
+        and opening_token
+        and recommendation_state.get("opening_token") == opening_token
+    )
+    mid_restaurant_browse = recommendation_state.get("offer_kind") in ("category", "dish")
+    if brief.get("opening_picks") and not showing_this_opening and not mid_restaurant_browse:
+        reply = _offer_opening(brief["opening_picks"], brief_filters, opening_token)
+        # Shown once: drop the cards from the brief so later taps that reuse this brief
+        # ("Add more from this restaurant", "Complete the meal", "more") don't restart
+        # the conversation with the opening again. The token stays so a pick still matches.
+        reply["recommendation_brief"] = {k: v for k, v in brief.items() if k != "opening_picks"}
+        return reply
+    if recommendation_state.get("offer_kind") == OPENING_KIND and not showing_this_opening:
+        # They passed on the opening cards and told us what they want -- a fresh search.
+        awaiting_feedback = False
 
-        # The single-match confirmation's own "2" (see `ONLY_MATCH_PROMPT`),
-        # or a typed-out decline/widen, actually broadens the search rather
-        # than just asking the user to spell out a change -- checked ahead of
-        # the generic rejection branch below, which only offers to change,
-        # never to search again itself.
+    if awaiting_feedback and not satisfied:
+        is_category_offer = recommendation_state.get("offer_kind") == "category"
+        is_dish_multiselect_offer = recommendation_state.get("offer_kind") == "dish"
+        if is_category_offer or is_dish_multiselect_offer:
+            if user_input.strip() == _NO_SELECTION_VALUE:
+                debug("recommendation_agent", "user skipped every option in the multi-select")
+                restaurant_scope = recommendation_state.get("restaurant_scope")
+                if restaurant_scope and restaurant_scope.get("restaurant_id"):
+                    return _reply(
+                        "No problem -- let me know if you'd like to see something else from "
+                        "this restaurant, or somewhere else entirely.",
+                        awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+                    )
+                return _reply(
+                    "No problem \u2014 tell me what you want to change, such as cuisine, budget, "
+                    "or dietary preference.",
+                    awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+                )
+            chosen_many = _resolve_multiple_choices(user_input, offered)
+            if chosen_many:
+                if is_category_offer:
+                    picked_categories = [dish for dish, _qty in chosen_many]
+                    debug(
+                        "recommendation_agent",
+                        f"user picked {len(picked_categories)} categor"
+                        f"{'y' if len(picked_categories) == 1 else 'ies'}: "
+                        f"{[c.get('category') for c in picked_categories]}",
+                    )
+                    return _handle_category_pick(picked_categories, recommendation_state, address_id)
+                picked_dishes = [dish for dish, _qty in chosen_many]
+                quantities = {str(dish.get("menu_item_id")): qty for dish, qty in chosen_many}
+                debug(
+                    "recommendation_agent",
+                    f"user picked {len(chosen_many)} dish(es): "
+                    f"{[(dish.get('item_name'), qty) for dish, qty in chosen_many]}",
+                )
+                return _handle_dish_multiselect(picked_dishes, address_id, state, quantities=quantities)
+        else:
+            chosen = _resolve_choice(user_input, offered)
+            if chosen:
+                debug("recommendation_agent", f"user chose {chosen.get('item_name')!r}")
+                return _reply_with_pick(
+                    chosen, address_id, state=state,
+                    awaiting_feedback=False, satisfied=True, last_recommendations=[chosen],
+                )
+
+        if not (is_category_offer or is_dish_multiselect_offer):
+            reason = feedback.infer_reason(user_input)
+            if not reason and recommendation_state.get("awaiting_reason") and _looks_like_rejection(user_input):
+                reason = feedback.NOT_FOR_ME
+            if reason:
+                return _handle_rejection(reason, state, brief, recommendation_state, address_id)
+
         if len(offered) == 1 and _looks_like_decline_only_offer(user_input):
-            debug("recommendation_agent", "user declined the only match — widening the search")
+            restaurant_scope = recommendation_state.get("restaurant_scope")
             already_shown = {str(d.get("item_name") or "") for d in offered}
-            widened = widen_recommendations(brief, exclude_items=already_shown)
+            if restaurant_scope and restaurant_scope.get("restaurant_id"):
+                debug(
+                    "recommendation_agent",
+                    f"user declined the only match — widening within restaurant "
+                    f"{restaurant_scope.get('restaurant_id')!r}",
+                )
+                widened_reply = _widen_within_restaurant(restaurant_scope, offered, address_id)
+                if widened_reply:
+                    return widened_reply
+                return _reply(
+                    "That's everything I can find at this restaurant beyond what's already in "
+                    "your cart -- want to browse other restaurants instead?",
+                    awaiting_feedback=False, satisfied=False, last_recommendations=offered,
+                )
+
+            debug("recommendation_agent", "user declined the only match — widening the search")
+            widened = widen_recommendations(brief, address_id=address_id, exclude_items=already_shown)
             if widened:
                 batch, rest = widened[:DISPLAY_COUNT], widened[DISPLAY_COUNT:]
                 return _reply(
@@ -760,15 +1141,21 @@ def recommendation_agent_node(state: CravrState) -> dict:
 
         if _looks_like_more_request(user_input):
             debug("recommendation_agent", "user asked for more")
-            return _serve_next_batch("Here are a few more:", offered, alternates, brief_filters)
+            return _serve_next_batch(
+                "Here are a few more:", offered, alternates, brief_filters,
+                recommendation_state.get("restaurant_scope"),
+            )
 
         if _looks_like_acceptance(user_input):
             if len(offered) == 1:
-                return _reply(
-                    f"Great — {_describe(offered[0])} it is.",
+                if is_category_offer:
+                    return _handle_category_pick([offered[0]], recommendation_state, address_id)
+                if is_dish_multiselect_offer:
+                    return _handle_dish_multiselect([offered[0]], address_id, state)
+                return _reply_with_pick(
+                    offered[0], address_id, state=state,
                     awaiting_feedback=False, satisfied=True, last_recommendations=offered,
                 )
-            # "yes" against a list of three is ambiguous; don't guess.
             return _reply(
                 f"Which one would you like — {' or '.join(str(i) for i in range(1, len(offered) + 1))}?",
                 awaiting_feedback=True, satisfied=False,
@@ -776,11 +1163,20 @@ def recommendation_agent_node(state: CravrState) -> dict:
                 options=_dish_pick_options(offered),
             )
 
+        if _looks_like_rejection(user_input) and not (is_category_offer or is_dish_multiselect_offer):
+            # A bare "no": one tap tells us what to fix (feature 2).
+            debug("recommendation_agent", "user rejected the batch -- asking why")
+            return _reply(
+                feedback.REASON_QUESTION,
+                **{**recommendation_state, "awaiting_reason": True, "options": feedback.REASON_OPTIONS},
+            )
+
         if _looks_like_rejection(user_input):
             debug("recommendation_agent", "user rejected the batch")
             if alternates:
                 return _serve_next_batch(
-                    "No problem, here are some others:", offered, alternates, brief_filters
+                    "No problem, here are some others:", offered, alternates, brief_filters,
+                    recommendation_state.get("restaurant_scope"),
                 )
             return _reply(
                 "No problem — tell me what you want to change, such as cuisine, budget, "
@@ -789,13 +1185,13 @@ def recommendation_agent_node(state: CravrState) -> dict:
             )
 
         if brief_filters == (recommendation_state.get("filters") or {}):
-            # Not a recognised reaction, but the request hasn't changed either --
-            # so re-running the search would return the identical list and we'd
-            # print the same three dishes back. Show what we're holding instead.
             debug("recommendation_agent", "unrecognised reply, filters unchanged — treating as 'more'")
-            return _serve_next_batch("Here are a few more:", offered, alternates, brief_filters)
+            return _serve_next_batch(
+                "Here are a few more:", offered, alternates, brief_filters,
+                recommendation_state.get("restaurant_scope"),
+            )
 
-    ranked = fetch_recommendations(brief)
+    ranked = fetch_recommendations(brief, address_id=address_id)
     if not ranked:
         return _reply(
             "I’m not finding a strong match right now. Tell me your cuisine, budget, "
@@ -803,8 +1199,8 @@ def recommendation_agent_node(state: CravrState) -> dict:
             awaiting_feedback=False, satisfied=False, last_recommendations=[],
         )
 
-    batch, rest = ranked[:DISPLAY_COUNT], ranked[DISPLAY_COUNT:]
-    debug("recommendation_agent", f"offering {len(batch)} of {len(ranked)} match(es)")
+    batch, rest = ranked, []
+    debug("recommendation_agent", f"offering all {len(batch)} match(es) as a scrollable list")
     return _reply(
         _build_recommendation_text(batch),
         awaiting_feedback=True, satisfied=False,

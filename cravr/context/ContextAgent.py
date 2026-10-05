@@ -1,29 +1,24 @@
-"""Context Discovery agent: turns a food-ordering request into structured context."""
-
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 from typing import Any
 
+from .. import food_mcp
+from ..client import call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
-from ..profile_utils import merge_profile
+from ..clock import now_ist
+from ..profile_utils import latest_user_text, merge_profile
+from .signals import detect_occasion
+from .weather import current_weather
 from ..state import CravrState
-
-DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
 
 
 def fetch_user_location(user_id: str | None) -> dict[str, Any]:
-    """Fetch saved delivery location without asking the user for it."""
-    async def _call_tool() -> Any:
-        from fastmcp import Client
-
-        async with Client(DEFAULT_MCP_URL) as client:
-            return await client.call_tool(name="user_location", arguments={"user_id": user_id})
+    if using_real_food_mcp():
+        return food_mcp.get_saved_address()
 
     try:
-        result = asyncio.run(_call_tool())
+        result = call_tool_sync("user_location", {"user_id": user_id})
     except Exception as exc:  # pragma: no cover - runtime/network failure
         debug("context_agent", f"MCP user_location FAILED ({type(exc).__name__}: {exc})")
         return {"status": "error", "message": f"Unable to retrieve saved location: {exc}"}
@@ -42,21 +37,25 @@ def fetch_user_location(user_id: str | None) -> dict[str, Any]:
 
 
 def context_discovery_node(state: CravrState) -> dict:
-    """Second workflow node: enrich state with saved delivery context.
-
-    Context is ambient. It must not call an LLM, fabricate live conditions,
-    or create user-facing clarification questions when location data is
-    unavailable.
-    """
     user_id = state.get("user_id")
-    location_result = fetch_user_location(user_id)
+    existing_profile = state.get("context_profile") or {}
+
+    if existing_profile.get("address_id"):
+        location_result = {"status": "success", **existing_profile}
+    else:
+        location_result = fetch_user_location(user_id)
+
     extracted = {
         key: location_result[key]
-        for key in ("location", "delivery_area")
+        for key in ("location", "delivery_area", "address_id")
         if location_result.get(key)
     }
 
-    profile = merge_profile(state.get("context_profile"), extracted)
+    profile = merge_profile(existing_profile, extracted)
+    # Feature 5: ambient context -- weather at the address and the occasion (weekend
+    # night, match night). Both are best-effort and never asked about.
+    profile["weather"] = current_weather(profile.get("delivery_area"))
+    profile["occasion"] = detect_occasion(now_ist(), latest_user_text(state.get("messages") or []))
     profile["important_missing_information"] = []
     profile["clarification_questions"] = []
 

@@ -52,18 +52,12 @@ HUNGER_BY_INTENT = {
 }
 DEFAULT_HUNGER = "medium"
 
-REQUIRED_FIELDS = ("meal_intent", "craving_or_cuisine")
-
 @dataclass(frozen=True)
 class MealWindow:
-    """One slice of the day and the meal intents plausible inside it."""
-
     name: str
     start: time
     end: time
-    # First option is the "obvious" answer for this window and is used as the
-    # fallback when the user's reply can't be matched to anything.
-    options: tuple[tuple[str, str], ...]  # (value, human label)
+    options: tuple[tuple[str, str], ...]
 
     @property
     def default_intent(self) -> str:
@@ -71,15 +65,6 @@ class MealWindow:
 
     def spans_midnight(self) -> bool:
         return self.start > self.end
-
-
-# Ordered windows covering all 24 hours. The late-night window wraps midnight,
-# which is why containment is checked with an explicit `spans_midnight` branch
-# rather than a naive `start <= t <= end`.
-#
-# The option sets encode a real asymmetry: at lunch and dinner the user might
-# want a full meal OR something small, but at 3pm "lunch" is no longer on the
-# table. Offering an impossible option is worse than offering fewer.
 
 
 MEAL_WINDOWS: tuple[MealWindow, ...] = (

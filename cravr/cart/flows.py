@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+from typing import Any
+
+from langchain_core.messages import AIMessage
+
+from .. import food_mcp
+from ..debug_utils import debug
+from ..state import CravrState
+from .display import _cart_reply
+from .guards import _menu_categories
+from .parsing import _existing_cart_items
+from .restaurant_context import _current_restaurant_id, _current_restaurant_name
+
+
+def _offer_dishes(
+    lead_in: str, batch: list[dict[str, Any]], filters: dict[str, Any],
+    cart_state: dict[str, Any] | None = None,
+    restaurant_scope: dict[str, Any] | None = None,
+) -> dict:
+    from ..recommend.RecommendAgent import ONLY_MATCH_OPTIONS, _build_recommendation_text, _dish_pick_options
+
+    body = _build_recommendation_text(batch)
+    content = f"{lead_in}\n{body}".strip() if lead_in else body
+    options = ONLY_MATCH_OPTIONS if len(batch) == 1 else _dish_pick_options(batch)
+    outcome: dict[str, Any] = {
+        "recommendation_state": {
+            "last_recommendations": batch,
+            "alternates": [],
+            "filters": filters,
+            "awaiting_feedback": True,
+            "satisfied": False,
+            "options": options,
+            "restaurant_scope": restaurant_scope,
+        },
+        "messages": [AIMessage(content=content, name="recommendation_agent")],
+    }
+    if cart_state is not None:
+        outcome["cart_state"] = cart_state
+    return outcome
+
+
+def _suggest_more_from_restaurant(state: CravrState, address_id: str) -> dict:
+    restaurant_id = _current_restaurant_id(state)
+    if not restaurant_id:
+        return _cart_reply("I've lost track of which restaurant your cart is from -- try viewing your cart first.")
+
+    cart = food_mcp.get_cart(address_id)
+    existing_items = _existing_cart_items(cart)
+    existing_ids = {str(item["menu_item_id"]) for item in existing_items}
+    cart_item_id = existing_items[0]["menu_item_id"] if existing_items else None
+
+    restaurant_name = _current_restaurant_name(state) or ""
+    menu_items = food_mcp.get_restaurant_menu_items(restaurant_id, address_id, restaurant_name)
+    debug(
+        "cart_agent",
+        f"suggest_more: restaurant_id={restaurant_id!r} menu_items={len(menu_items)} "
+        f"existing_ids={existing_ids!r} cart_item_id={cart_item_id!r}",
+    )
+    if not menu_items:
+        return _cart_reply("Couldn't load that restaurant's menu right now -- try again in a moment.")
+
+    categories = _menu_categories(menu_items, existing_ids)
+    if not categories:
+        return _cart_reply("Looks like you've already got everything worth adding from this restaurant!")
+
+    restaurant_scope = {
+        "restaurant_id": restaurant_id,
+        "restaurant_name": restaurant_name,
+        "cart_item_id": cart_item_id,
+        "existing_ids": sorted(existing_ids),
+    }
+    from ..recommend.RecommendAgent import _offer_category_batch
+
+    return _offer_category_batch(
+        "What would you like more of from this restaurant?", categories, restaurant_scope,
+    )
+
+
+def _start_over_new_restaurant(state: CravrState, address_id: str) -> dict:
+    restaurant_id = _current_restaurant_id(state)
+
+    flush_result = food_mcp.flush_cart()
+    debug("cart_agent", f"start_over: flush_cart -> {flush_result!r}")
+    if flush_result.get("status") != "success":
+        return _cart_reply(f"Couldn't clear the cart: {flush_result.get('message', 'unknown error')}")
+
+    cleared_cart_state = {"restaurant": None}
+
+    brief = state.get("recommendation_brief") or {}
+    if not brief:
+        return _cart_reply(
+            "Cart's cleared. Tell me what you're craving and I'll find some other restaurants.",
+            **cleared_cart_state,
+        )
+
+    from ..recommend.RecommendAgent import fetch_recommendations
+
+    exclude = {str(restaurant_id)} if restaurant_id else set()
+    filters = dict(brief.get("filters") or {})
+    ranked = fetch_recommendations(brief, address_id=address_id, exclude_restaurant_ids=exclude)
+    if not ranked:
+        return _cart_reply(
+            "Cart's cleared, but I couldn't find another restaurant with the same kind of food "
+            "right now -- tell me what to change and I'll look again.",
+            **cleared_cart_state,
+        )
+    return _offer_dishes(
+        "Cart's cleared. Other restaurants with what you were after:", ranked, filters,
+        cart_state=cleared_cart_state,
+    )
+
+
+def _clear_cart_and_add_pending(state: CravrState, address_id: str) -> dict:
+    from .add_flow import add_dish_to_cart
+
+    cart_state = state.get("cart_state") or {}
+    pending = cart_state.get("pending_dish")
+    if not isinstance(pending, dict):
+        return _cart_reply("I don't have a dish waiting to be added -- pick one from the options first.")
+
+    flush_result = food_mcp.flush_cart()
+    debug("cart_agent", f"clear_and_add: flush_cart -> {flush_result!r}; adding {pending.get('item_name')!r}")
+    if flush_result.get("status") != "success":
+        return _cart_reply(f"Couldn't clear the cart: {flush_result.get('message', 'unknown error')}")
+
+    return add_dish_to_cart(
+        pending, address_id, quantity=cart_state.get("pending_quantity") or 1,
+        lead_in="Cart cleared.",
+        preselected_addons=cart_state.get("pending_addons"),
+    )
+
+
+def _remove_out_of_stock(state: CravrState, address_id: str) -> dict:
+    """Drop the items Swiggy says can't be ordered as they are, keeping every other
+    item with its own add-ons/variants."""
+    from .add_flow import _carry_forward_customizations
+    from .display import _show_cart_with_next_steps
+
+    cart = food_mcp.get_cart(address_id)
+    bad = [i for i in cart.get("items") or [] if i.get("in_stock") is False]
+    if not bad:
+        if cart.get("out_of_stock"):  # text-only cart: we know the names but not the ids
+            return _cart_reply(
+                f"Swiggy says {', '.join(cart['out_of_stock'])} is out of stock, but I can't tell which "
+                "cart line that is -- remove it in the Swiggy app, or clear the cart and start again."
+            )
+        return _show_cart_with_next_steps(address_id, lead_in="Everything in your cart is in stock.", cart=cart)
+
+    removed = ", ".join(str(i.get("item_name") or i.get("menu_item_id")) for i in bad)
+    keep = [i for i in cart.get("items") or [] if i.get("in_stock") is not False]
+    if not keep:
+        flushed = food_mcp.flush_cart()
+        if flushed.get("status") != "success":
+            return _cart_reply(f"Couldn't remove {removed}: {flushed.get('message', 'unknown error')}")
+        return _cart_reply(f"Removed {removed}. Your cart's empty now -- tell me what you'd like instead.")
+
+    restaurant_id = _current_restaurant_id(state)
+    if not restaurant_id:
+        return _cart_reply(f"I couldn't tell which restaurant this cart is from, so remove {removed} in the Swiggy app.")
+    keep_ids = {str(i["menu_item_id"]) for i in keep}
+    carry = _carry_forward_customizations(address_id, keep_ids, cart=cart)
+    payload = [{"menu_item_id": str(i["menu_item_id"]), "quantity": i.get("quantity", 1),
+                **carry.get(str(i["menu_item_id"]), {})} for i in keep]
+    result = food_mcp.update_cart(restaurant_id, address_id, payload,
+                                  restaurant_name=_current_restaurant_name(state))
+    debug("cart_agent", f"remove_out_of_stock: removed={removed!r} -> {result.get('status')!r}")
+    if result.get("status") != "success":
+        return _cart_reply(f"Couldn't remove {removed}: {result.get('message', 'unknown error')}")
+    return _show_cart_with_next_steps(address_id, lead_in=f"Removed {removed}.", cart=result.get("cart"))

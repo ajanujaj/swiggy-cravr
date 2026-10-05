@@ -1,21 +1,8 @@
-"""Generic LLM-backed multiple-choice suggestions for clarification questions.
-
-Cravr exists for someone who "doesn't know what to eat" -- every place the
-graph pauses to ask something should default to letting the user tap a
-number instead of typing a sentence. `suggest_options()` is the one place
-that turns a free-text clarification question into a short, context-aware
-menu of answers; `resolve_option_choice()` is its counterpart, turning the
-reply (a digit, an option's own text, or something the menu never
-anticipated) back into a value any agent can use exactly like it would a
-plain free-text answer.
-
-Any agent that currently does `interrupt({"question": q, "options": []})`
-can switch to `suggest_options(q, ...)` to get the same treatment.
-"""
-
 from __future__ import annotations
 
 import json
+import threading
+from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -23,10 +10,6 @@ from .debug_utils import debug
 from .llm import get_llm
 from .schemas import SuggestedOptions
 
-# Sentinel returned by `resolve_option_choice` when the user picked the
-# "type your own" option rather than one of the suggested answers. Never
-# stored as a real field value -- callers must catch it and ask a follow-up
-# free-text question instead.
 OTHER_VALUE = "__other__"
 OTHER_LABEL = "Something else (type your own)"
 
@@ -45,7 +28,60 @@ about the same field get visibly different, time-appropriate choices rather
 than the same generic list. Never include a catch-all choice like "other" or
 "something else" -- that is added separately. Never invent facts about the
 user; base choices only on the question and the given context.
+
+The user orders delivery on Swiggy in India. Suggest dishes and categories
+that are commonly delivered in Indian cities (the given delivery area, if
+any) -- not niche items few restaurants deliver, such as charcuterie boards
+or tapas, unless the user asked for them. When `recent_orders` or
+`favourite_restaurants` are given, make at least one choice come straight
+from them (a dish they have ordered before), and keep the rest in a similar
+spirit and price range.
 """.strip()
+
+# Options shown with an interrupt must be the SAME options when the graph
+# resumes: LangGraph re-runs the node from the top on resume, so asking the
+# LLM again produced a different list (a typed "3" could then resolve to a
+# different choice than the one on screen, and each resume cost an extra
+# LLM call). Keyed by thread id + caller's key; callers clear their entries
+# once the node finishes.
+_OPTION_CACHE: dict[tuple, Any] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _current_thread_id() -> str | None:
+    try:
+        from langgraph.config import get_config
+
+        return (get_config().get("configurable") or {}).get("thread_id")
+    except Exception:
+        return None  # called outside a graph run (tests, scripts) -- no caching
+
+
+def stable(key: tuple, build: Callable[[], Any]) -> Any:
+    """Return the value built for `key` in this thread, building it only once."""
+    thread_id = _current_thread_id()
+    if thread_id is None:
+        return build()
+    full_key = (thread_id, *key)
+    with _CACHE_LOCK:
+        if full_key in _OPTION_CACHE:
+            debug("options", f"reusing options shown earlier for {key!r}")
+            return _OPTION_CACHE[full_key]
+    value = build()
+    with _CACHE_LOCK:
+        _OPTION_CACHE.setdefault(full_key, value)
+        return _OPTION_CACHE[full_key]
+
+
+def clear_stable(prefix: tuple) -> None:
+    """Forget this thread's cached entries whose key starts with `prefix`."""
+    thread_id = _current_thread_id()
+    if thread_id is None:
+        return
+    full_prefix = (thread_id, *prefix)
+    with _CACHE_LOCK:
+        for key in [k for k in _OPTION_CACHE if k[: len(full_prefix)] == full_prefix]:
+            del _OPTION_CACHE[key]
 
 
 def suggest_options(
@@ -55,15 +91,6 @@ def suggest_options(
     include_other: bool = True,
     max_options: int = 5,
 ) -> list[dict[str, str]]:
-    """LLM-suggested tappable answers for `question`, with a static fallback.
-
-    Returns interrupt-payload option dicts (`{"value", "label"}`). Ends with
-    an "other" escape hatch by default so a request the model/fallback list
-    didn't anticipate can still be typed out in full. Never raises: a model
-    failure (unavailable, malformed output, wrong schema) falls back to
-    `fallback` so a clarification question is never blocked on the LLM being
-    up.
-    """
     labels: list[str] = []
     try:
         structured_llm = get_llm().with_structured_output(SuggestedOptions)
@@ -84,7 +111,6 @@ def suggest_options(
     if not labels:
         labels = list(fallback or [])
 
-    # De-dupe while preserving order -- the model occasionally repeats itself.
     seen: set[str] = set()
     deduped: list[str] = []
     for label in labels:
@@ -100,12 +126,6 @@ def suggest_options(
 
 
 def resolve_option_choice(answer: str, options: list[dict]) -> str:
-    """Map a numbered or typed-out reply onto the option it picked.
-
-    Falls through to the raw answer unchanged when no options were offered,
-    or when the reply doesn't match any of them -- free text the menu didn't
-    anticipate must keep working exactly as it did before options existed.
-    """
     if not options:
         return answer
     normalized = (answer or "").strip().lower().rstrip(".!")

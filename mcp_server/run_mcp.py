@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -9,6 +10,22 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 recommendations_data = pd.read_csv(DATA_DIR / "menu.csv")
 order_history_data = pd.read_csv(DATA_DIR / "order_history.csv")
 user_data = pd.read_csv(DATA_DIR / "user.csv")
+
+recommendations_data["menu_item_id"] = "ITEM" + (recommendations_data.index + 1).astype(str).str.zfill(4)
+_restaurant_codes, _ = pd.factorize(recommendations_data["restaurant_name"])
+recommendations_data["restaurant_id"] = "REST" + pd.Series(_restaurant_codes + 1, index=recommendations_data.index).astype(str).str.zfill(3)
+
+_cart_state: dict = {
+    "restaurant_id": None,
+    "restaurant_name": None,
+    "items": [],
+    "coupon_code": None,
+    "coupon_discount": 0,
+}
+_MOCK_COUPONS = {
+    "SAVE20": {"kind": "percent", "value": 0.2, "cap": 100},
+    "FREESHIP": {"kind": "delivery", "value": 30},
+}
 
 @app.tool()
 def recommendation(
@@ -42,28 +59,20 @@ def recommendation(
     Returns:
         dict: Filtered recommendations with restaurant details
     """
-    
+
     filtered_df = recommendations_data.copy()
-    
-    # Apply filters based on provided inputs
+
     if cuisine:
         filtered_df = filtered_df[filtered_df['cuisine'].str.lower().str.contains(cuisine.lower(), na=False)]
-    
+
     if restaurant_name:
         filtered_df = filtered_df[filtered_df['restaurant_name'].str.lower().str.contains(restaurant_name.lower(), na=False)]
-    
+
     if tags:
-        # Support comma-separated tags with AND semantics (a dish must carry
-        # every requested tag), while staying backward-compatible with a
-        # single free-text tag string (e.g. a craving phrase).
         for tag in [t.strip() for t in tags.split(",") if t.strip()]:
             filtered_df = filtered_df[filtered_df['tags'].str.lower().str.contains(tag.lower(), na=False)]
 
     if dietary_type:
-        # Exact match, not substring: dietary_type is a closed set ('Veg' /
-        # 'Non-Veg'), and .str.contains('veg') would also match 'non-veg'
-        # (it contains the substring 'veg'), silently letting a vegetarian
-        # request return meat dishes.
         filtered_df = filtered_df[filtered_df['dietary_type'].str.lower() == dietary_type.lower()]
 
     if meal_type:
@@ -71,10 +80,6 @@ def recommendation(
             filtered_df['meal_type'].str.lower().str.contains(meal_type.lower(), na=False)
         ]
 
-    # `course` is OR semantics (unlike tags): "main,side" means either is
-    # acceptable, because a caller widening the course is loosening a
-    # constraint, not adding one. Guarded on column presence so older menu
-    # files without the column keep working instead of raising KeyError.
     if course and 'course' in filtered_df.columns:
         wanted_courses = {c.strip().lower() for c in course.split(",") if c.strip()}
         if wanted_courses:
@@ -82,15 +87,14 @@ def recommendation(
 
     if max_price_inr is not None:
         filtered_df = filtered_df[filtered_df['price_inr'] <= max_price_inr]
-    
-    # Sort by rating (highest first)
+
     filtered_df = filtered_df.sort_values('rating', ascending=False)
-    
+
     if filtered_df.empty:
         return {"status": "no_results", "message": "No recommendations found for the given criteria"}
-    
+
     recommendations = filtered_df.to_dict('records')
-    
+
     return {
         "status": "success",
         "count": len(recommendations),
@@ -101,10 +105,9 @@ def recommendation(
 def order_history(user_id: str) -> dict:
     """
     Get the order history for a specific user.
-    
+
     Args:
         user_id: Unique identifier for the user"""
-
 
     user_orders = order_history_data[order_history_data['user_id'] == user_id]
 
@@ -142,7 +145,7 @@ def order_history(user_id: str) -> dict:
 def user_preferences(user_id: str) -> dict:
     """
     Get the user preferences for a specific user.
-    
+
     Args:
         user_id: Unique identifier for the user
     """
@@ -185,10 +188,273 @@ def user_location(user_id: str) -> dict:
     }
 
 
+def _cart_pricing() -> dict:
+    item_total = sum(i["final_price"] * i["quantity"] for i in _cart_state["items"])
+    delivery_charge = 0 if not _cart_state["items"] else 30
+    taxes = round(item_total * 0.05, 2) if _cart_state["items"] else 0
+    discount = _cart_state.get("coupon_discount", 0)
+    to_pay = max(round(item_total + delivery_charge + taxes - discount, 2), 0)
+    return {
+        "item_total": round(item_total, 2),
+        "delivery_charge": delivery_charge,
+        "taxes_and_charges": taxes,
+        "to_pay": to_pay,
+    }
+
+
+@app.tool()
+def get_food_cart(addressId: str, restaurantName: str = None) -> dict:
+    """Mock get_food_cart -- returns the current in-memory cart."""
+    restaurant = (
+        {"id": _cart_state["restaurant_id"], "name": _cart_state["restaurant_name"]}
+        if _cart_state["restaurant_id"] else None
+    )
+    return {
+        "success": True,
+        "data": {
+            "cart_id": "MOCK-CART-1",
+            "restaurant": restaurant,
+            "items": _cart_state["items"],
+            "item_count": len(_cart_state["items"]),
+            "pricing": _cart_pricing(),
+            "offers": {
+                "coupon_applied": _cart_state.get("coupon_code"),
+                "coupon_discount": _cart_state.get("coupon_discount", 0),
+                "free_delivery_applied": False,
+            },
+        },
+        "addressId": addressId,
+    }
+
+
+@app.tool()
+def update_food_cart(restaurantId: str, addressId: str, cartItems: list, restaurantName: str = None) -> dict:
+    """Mock update_food_cart. cartItems entries: {"menu_item_id": <id>,
+    "quantity": <int>} -- matches real Swiggy's field name (confirmed via
+    its docs.md: '"menu_item_id": Food menu item identifier used by
+    update_food_cart.'); an earlier version of this mock and of
+    cart.CartAgent both used "id" instead, which the real tool silently
+    ignores (accepts the call, adds nothing). Silently ignoring an
+    unrecognised key here too, rather than falling back to it, so a
+    regression back to "id" fails the same way against the mock as it does
+    for real. quantity<=0 removes the item. Switching restaurants replaces
+    the cart -- real Swiggy carts are single-restaurant too."""
+    if _cart_state["restaurant_id"] and _cart_state["restaurant_id"] != restaurantId:
+        _cart_state["items"] = []
+        _cart_state["coupon_code"] = None
+        _cart_state["coupon_discount"] = 0
+    _cart_state["restaurant_id"] = restaurantId
+    _cart_state["restaurant_name"] = restaurantName or _cart_state["restaurant_name"]
+
+    for entry in cartItems or []:
+        item_id = (entry or {}).get("menu_item_id")
+        if not item_id:
+            continue
+        quantity = (entry or {}).get("quantity", 1)
+        existing = next((i for i in _cart_state["items"] if i["menu_item_id"] == item_id), None)
+
+        if quantity <= 0:
+            if existing:
+                _cart_state["items"].remove(existing)
+            continue
+
+        if existing:
+            existing["quantity"] = quantity
+            existing["total"] = round(existing["final_price"] * quantity, 2)
+            continue
+
+        row = recommendations_data[recommendations_data["menu_item_id"] == item_id]
+        if row.empty:
+            return {"success": False, "error": {"message": f"Unknown menu_item_id {item_id!r}"}}
+        row0 = row.iloc[0]
+        price = float(row0["price_inr"])
+        _cart_state["items"].append({
+            "menu_item_id": item_id,
+            "name": row0["item_name"],
+            "quantity": quantity,
+            "final_price": price,
+            "total": round(price * quantity, 2),
+            "in_stock": True,
+            "is_veg": str(row0.get("dietary_type", "")).lower() == "veg",
+        })
+
+    return {"success": True, "data": {}, "message": "Cart updated"}
+
+
+@app.tool()
+def apply_food_coupon(couponCode: str, addressId: str, cartId: str = None) -> dict:
+    """Mock apply_food_coupon -- static SAVE20 (20% off, capped ₹100) /
+    FREESHIP (waives delivery) catalog; anything else is rejected."""
+    item_total = sum(i["final_price"] * i["quantity"] for i in _cart_state["items"])
+    if item_total <= 0:
+        return {"success": False, "error": {"message": "Cart is empty -- nothing to apply a coupon to"}}
+
+    code = (couponCode or "").strip().upper()
+    coupon = _MOCK_COUPONS.get(code)
+    if not coupon:
+        return {"success": False, "error": {"message": f"Coupon {couponCode!r} is not valid"}}
+
+    discount = min(round(item_total * coupon["value"], 2), coupon.get("cap", item_total))         if coupon["kind"] == "percent" else coupon["value"]
+    _cart_state["coupon_code"] = code
+    _cart_state["coupon_discount"] = discount
+    return {"success": True, "data": {"coupon_discount": discount}, "message": f"{code} applied: ₹{discount} off"}
+
+
+@app.tool()
+def fetch_food_coupons(restaurantId: str, addressId: str, couponCode: str = None) -> dict:
+    """Mock fetch_food_coupons -- static SAVE20/FREESHIP catalog, COD-only
+    per the real tool's stated scope."""
+    catalog = [
+        {
+            "id": "SAVE20", "title": "SAVE20", "subtitle": "20% off, up to ₹100",
+            "description": "Get 20% off your order", "applicable": True,
+            "applicabilityStatus": "APPLICABLE", "terms": "Max discount ₹100. Valid for Cash on Delivery.",
+        },
+        {
+            "id": "FREESHIP", "title": "FREESHIP", "subtitle": "Free delivery",
+            "description": "Waives the delivery charge", "applicable": True,
+            "applicabilityStatus": "APPLICABLE", "terms": "Valid for Cash on Delivery.",
+        },
+    ]
+    if couponCode:
+        catalog = [c for c in catalog if c["id"] == couponCode.strip().upper()]
+
+    return {
+        "success": True,
+        "data": {
+            "status_message": None if catalog else "No matching coupon",
+            "coupon_sections": [{"title": "Available offers", "type": "COD", "coupons": catalog}] if catalog else [],
+            "summary": {"total": len(catalog), "applicable": len(catalog), "sections": 1 if catalog else 0},
+        },
+    }
+
+
+@app.tool()
+def flush_food_cart() -> dict:
+    """Mock flush_food_cart -- clears the in-memory cart. No parameters."""
+    _cart_state["restaurant_id"] = None
+    _cart_state["restaurant_name"] = None
+    _cart_state["items"] = []
+    _cart_state["coupon_code"] = None
+    _cart_state["coupon_discount"] = 0
+    return {"success": True, "data": {}, "message": "Cart cleared"}
+
+
+_MOCK_LAT, _MOCK_LNG = 12.9716, 77.5946
+_pending_order: dict = {}
+
+
+@app.tool()
+def get_payment_options(addressId: str = None) -> dict:
+    """Mock get_payment_options -- always offers both Cash and a UPI QR
+    method, mirroring the documented PaymentOptionsView shape closely
+    enough for food_mcp.payments.get_payment_options to parse."""
+    return {
+        "success": True,
+        "data": {
+            "cod": {"available": True, "id": "cod"},
+            "allMethods": [
+                {"id": "mock_upi_qr", "displayName": "Scan to pay (mock)", "groupName": "UPI QR",
+                 "kind": "qr", "enabled": True},
+            ],
+            "paymentAmount": _cart_pricing()["to_pay"],
+            "placeOrderToolName": "place_food_order",
+        },
+    }
+
+
+@app.tool()
+def place_food_order(
+    addressId: str, paymentMethod: str = None, intentApp: str = None,
+    generateUPIQR: bool = None, noteToRestaurant: str = None,
+) -> dict:
+    """Mock place_food_order. Cash is placed immediately (cart cleared, like
+    the real tool converting the cart into an order); UPI comes back
+    PENDING_PAYMENT with a fake paasId that check_payment_status below
+    resolves to success on its SECOND call, so the polling loop in
+    cravr/cart/checkout.py actually gets exercised (not just its
+    already-terminal fast path)."""
+    if not _cart_state["items"]:
+        return {"success": False, "error": {"message": "Cart is empty -- nothing to order"}}
+
+    order_id = f"MOCK-ORDER-{abs(hash((addressId, paymentMethod))) % 100000}"
+    pricing = _cart_pricing()
+
+    if (paymentMethod or "Cash").strip().lower() != "upi":
+        items = list(_cart_state["items"])
+        restaurant_name = _cart_state["restaurant_name"]
+        _cart_state["items"] = []
+        _cart_state["coupon_code"] = None
+        _cart_state["coupon_discount"] = 0
+        return {
+            "success": True,
+            "data": {
+                "orderId": order_id, "status": "CONFIRMED", "normalizedStatus": "success",
+                "items": items, "restaurantName": restaurant_name, "restaurantAddress": "Mock Street, Mock City",
+                "totalAmount": pricing["to_pay"], "estimatedDelivery": "35-40 mins",
+                "deliveryAddress": "Mock delivery address",
+            },
+        }
+
+    paas_id = f"MOCK-PAAS-{order_id}"
+    _pending_order.clear()
+    _pending_order.update({"order_id": order_id, "paas_id": paas_id, "poll_count": 0, "confirmed": False})
+    return {
+        "success": True,
+        "data": {
+            "orderId": order_id, "paasId": paas_id, "transactionId": paas_id,
+            "status": "PENDING_PAYMENT", "normalizedStatus": "pending",
+            "upiIntentUrl": "upi://mock-pay", "bridgeUrl": "https://mock.local/pay/" + paas_id,
+            "isQrFlow": bool(generateUPIQR), "pollingIntervalInMs": 2000, "maxTimeToPollForInMs": 20000,
+            "lat": _MOCK_LAT, "lng": _MOCK_LNG, "addressId": addressId, "cartId": "MOCK-CART-1",
+        },
+    }
+
+
+@app.tool()
+def check_payment_status(
+    paasId: str, orderId: str = None, addressId: str = None,
+    lat: float = None, lng: float = None, cartId: str = None, finalize: bool = None,
+) -> dict:
+    """Mock check_payment_status -- "pending" on the first poll, "success"
+    from the second poll onward, so a caller that only polls once still
+    sees a real (if quick) pending->success transition."""
+    if paasId != _pending_order.get("paas_id"):
+        return {"success": True, "data": {"status": "", "terminal": True, "isTerminalSuccess": False,
+                                           "isTerminalFailure": True}}
+    _pending_order["poll_count"] += 1
+    if _pending_order["poll_count"] < 2:
+        return {"success": True, "data": {"status": "pending", "terminal": False, "isTerminalSuccess": False,
+                                           "isTerminalFailure": False}}
+    return {
+        "success": True,
+        "data": {
+            "status": "success", "terminal": True, "isTerminalSuccess": True, "isTerminalFailure": False,
+            "confirmed": False, "orderStatus": "PENDING_CONFIRMATION",
+        },
+    }
+
+
+@app.tool()
+def confirm_order(orderId: str, addressId: str, lat: float = None, lng: float = None, cartId: str = None) -> dict:
+    """Mock confirm_order -- clears the cart (the order is "placed") and
+    marks the pending mock order confirmed. Idempotent, like the real tool."""
+    if orderId == _pending_order.get("order_id"):
+        _pending_order["confirmed"] = True
+    _cart_state["items"] = []
+    _cart_state["coupon_code"] = None
+    _cart_state["coupon_discount"] = 0
+    return {
+        "success": True,
+        "data": {"orderId": orderId, "orderStatus": "CONFIRMED", "result": "success"},
+        "message": "Order confirmed",
+    }
+
+
 if __name__ == "__main__":
     app.run(
         transport="streamable-http",
-        host="127.0.0.1",
-        port=8000,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
         path="/mcp",
     )

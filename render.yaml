@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: cravr-app
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TZ
+        value: Asia/Kolkata
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CRAVR_MCP_URL
+        sync: false
+      - key: CRAVR_MOCK_MCP_URL
+        sync: false
+      - key: SWIGGY_REDIRECT_URI
+        sync: false
+      - key: SWIGGY_MCP_URL
+        sync: false
+      - key: SWIGGY_SCOPES
+        sync: false
+      # Taste profiles + group polls. Point at a Render Postgres "Internal Database URL";
+      # without it they live in a JSON file that Render wipes on every redeploy.
+      - key: DATABASE_URL
+        sync: false
+      # Public base URL for group-order poll links, e.g. https://cravr-app.onrender.com
+      - key: CRAVR_PUBLIC_URL
+        sync: false
+
+  - type: web
+    name: cravr-mock-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp_server/run_mcp.py

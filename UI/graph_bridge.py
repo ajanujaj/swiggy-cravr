@@ -1,45 +1,38 @@
-"""Bridge between Streamlit session state and the compiled Cravr LangGraph app.
-
-Owns every call into `cravr.graph.app` -- starting a thread, sending a
-free-text message, and resuming an `interrupt()` -- and translates each
-result into `st.session_state.history` entries. `components.py` only reads
-what this module writes; no other UI module calls into the graph directly.
-"""
-
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from typing import Any
 
-import streamlit as st
+import chainlit as cl
 from langgraph.types import Command
 
-# UI/ lives one level below the repo root, next to the `cravr` package.
-# Adding the repo root to sys.path here (rather than relying on however
-# Streamlit resolves the launched script's directory) means `import cravr`
-# resolves the same way whether Streamlit is started from the repo root,
-# from inside UI/, or anywhere else.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from cravr.debug_utils import debug  # noqa: E402
 from cravr.graph import app as cravr_app  # noqa: E402
-from cravr.options import OTHER_VALUE  # noqa: E402
 
-DEFAULT_USER_ID = "USR-002"
+import components  # noqa: E402
+import state  # noqa: E402
+
+_ainvoke = cl.make_async(cravr_app.invoke)
+
+_BACKEND_ERROR_HINT = (
+    "\n\nMake sure the mock MCP server (`python mcp_server/run_mcp.py`) is "
+    "running and GROQ_API_KEY / groq_apikey is set."
+)
 
 
-def process_result(result: dict[str, Any] | None) -> None:
-    """Turn one `app.invoke(...)` result into a chat-history entry.
+async def _report_backend_error(exc: Exception) -> None:
+    await cl.Message(
+        content=f"Something went wrong talking to the backend: {exc}{_BACKEND_ERROR_HINT}",
+        author="Cravr",
+    ).send()
 
-    Mirrors `cravr/run.py`'s `_resume_until_complete` / `_print_assistant_reply`
-    exactly, just writing into `st.session_state.history` instead of stdout,
-    and stopping at the first interrupt instead of blocking on `input()` --
-    the next interrupt (if any) is handled the same way on the *next* user
-    action, one Streamlit rerun at a time.
-    """
+
+async def process_result(result: dict[str, Any] | None) -> None:
     if result is None:
         return
 
@@ -54,13 +47,14 @@ def process_result(result: dict[str, Any] | None) -> None:
             question, source, options = payload, "assistant", []
 
         debug("ui", f"interrupt from {source!r}: {question!r} options={[o.get('value') for o in options]}")
-        st.session_state.awaiting_interrupt = True
-        st.session_state.history.append(
-            {"role": "assistant", "content": question, "source": source, "options": options}
-        )
+        state.set_awaiting_interrupt(True)
+        if isinstance(payload, dict) and payload.get("multi_select"):
+            await components.send_multiselect_message(question, options)
+        else:
+            await components.send_option_message(question, options)
         return
 
-    st.session_state.awaiting_interrupt = False
+    state.set_awaiting_interrupt(False)
 
     messages = result.get("messages") or []
     if not messages:
@@ -68,8 +62,6 @@ def process_result(result: dict[str, Any] | None) -> None:
     last = messages[-1]
     role = getattr(last, "type", None) or getattr(last, "role", None)
     if role in ("human", "user"):
-        # Intent collection can end on the user's own last clarification --
-        # not an assistant turn, so nothing to render (same guard as run.py).
         return
 
     content = getattr(last, "content", str(last))
@@ -77,57 +69,65 @@ def process_result(result: dict[str, Any] | None) -> None:
 
     dishes = None
     options = None
+    is_multiselect_offer = False
+    allow_quantity = False
     if source == "recommendation_agent":
         rec_state = result.get("recommendation_state") or {}
         dishes = rec_state.get("last_recommendations") or None
-        # Tappable dish-pick / yes-widen buttons, built by RecommendAgent
-        # itself (see `_dish_pick_options`/`ONLY_MATCH_OPTIONS`) so they can
-        # never drift out of sync with the numbered text in `content`.
         options = rec_state.get("options") or None
+        is_multiselect_offer = rec_state.get("offer_kind") in ("category", "dish")
+        # Quantity only makes sense once you're picking actual dishes to add,
+        # not restaurant categories -- so only the "dish" offer shows
+        # OptionChips.jsx's quantity stepper (and, symmetrically, the
+        # addon-selection interrupt above never sets allow_quantity at all).
+        allow_quantity = rec_state.get("offer_kind") == "dish"
+    elif source == "cart_agent":
+        options = (result.get("cart_state") or {}).get("options") or None
+    elif source == "group_agent":
+        options = (result.get("group_state") or {}).get("options") or None
 
     debug("ui", f"reply from {source!r}: {content!r}" + (f" ({len(dishes)} dish(es))" if dishes else ""))
-    st.session_state.history.append(
-        {"role": "assistant", "content": content, "source": source, "dishes": dishes, "options": options}
-    )
+
+    if is_multiselect_offer and options:
+        await components.send_multiselect_message(content, options, allow_quantity=allow_quantity)
+    elif dishes:
+        await components.send_dish_cards(content, dishes, options)
+    else:
+        await components.send_assistant_message(content, options)
 
 
-def send(value: str, display_label: str | None = None) -> None:
-    """Send one turn to the graph: either a resume value or a fresh message."""
-    st.session_state.history.append({"role": "user", "content": display_label or value})
-    st.session_state.error = None
+async def send(value: str) -> None:
     try:
-        if st.session_state.awaiting_interrupt:
+        if state.is_awaiting_interrupt():
             debug("ui", f"resuming interrupt with {value!r}")
-            result = cravr_app.invoke(Command(resume=value), config=st.session_state.config)
+            result = await _ainvoke(Command(resume=value), config=state.get_config())
         else:
             debug("ui", f"sending new message {value!r}")
-            result = cravr_app.invoke(
+            result = await _ainvoke(
                 {"messages": [{"role": "user", "content": value}]},
-                config=st.session_state.config,
+                config=state.get_config(),
             )
-    except Exception as exc:  # noqa: BLE001 -- surface backend errors in the UI, not a stack trace
+    except Exception as exc:  # noqa: BLE001
         debug("ui", f"invoke failed: {type(exc).__name__}: {exc}")
-        st.session_state.error = str(exc)
+        await _report_backend_error(exc)
         return
-    process_result(result)
+    await process_result(result)
 
 
-def start_conversation() -> None:
-    debug("ui", f"starting conversation thread={st.session_state.config['configurable']['thread_id']!r}")
-    st.session_state.error = None
+async def start_conversation() -> None:
+    debug("ui", f"starting conversation thread={state.get_config()['configurable']['thread_id']!r}")
     try:
-        result = cravr_app.invoke(
+        result = await _ainvoke(
             {
                 "messages": [],
                 "intent_profile": {},
                 "context_profile": {},
                 "history_profile": {},
-                "user_id": DEFAULT_USER_ID,
             },
-            config=st.session_state.config,
+            config=state.get_config(),
         )
     except Exception as exc:  # noqa: BLE001
         debug("ui", f"invoke failed: {type(exc).__name__}: {exc}")
-        st.session_state.error = str(exc)
+        await _report_backend_error(exc)
         return
-    process_result(result)
+    await process_result(result)

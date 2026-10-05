@@ -1,31 +1,21 @@
-"""History discovery agent: fetches a user's order history from the MCP tool."""
-
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 from typing import Any
 
+from .. import food_mcp
+from ..client import MOCK_MCP_URL, call_tool_sync, using_real_food_mcp
 from ..debug_utils import debug
+from ..profile_utils import merge_profile
 from ..state import CravrState
+from .store import load_preferences
 
 
-DEFAULT_MCP_URL = os.getenv("CRAVR_MCP_URL", "http://127.0.0.1:8000/mcp")
-target_url = DEFAULT_MCP_URL
-
-def _call_mcp_tool(tool_name: str, user_id: str | None) -> dict[str, Any]:
-    """Call one user-scoped MCP tool and normalize FastMCP's response."""
-    async def _call_tool() -> Any:
-        from fastmcp import Client
-
-        async with Client(target_url) as client:
-            return await client.call_tool(name=tool_name, arguments={"user_id": user_id})
-
+def _call_mcp_tool(tool_name: str, user_id: str | None, *, mcp_url: str | None = None) -> dict[str, Any]:
     try:
-        result = asyncio.run(_call_tool())
+        result = call_tool_sync(tool_name, {"user_id": user_id}, mcp_url=mcp_url)
     except Exception as exc:  # pragma: no cover - exercised through runtime failures
-        debug("preference_agent", f"MCP {tool_name} FAILED ({type(exc).__name__}: {exc}) at {target_url}")
+        debug("preference_agent", f"MCP {tool_name} FAILED ({type(exc).__name__}: {exc})")
         return {"status": "error", "message": f"Unable to retrieve {tool_name}: {exc}"}
 
     if isinstance(result, dict):
@@ -47,31 +37,45 @@ def _call_mcp_tool(tool_name: str, user_id: str | None) -> dict[str, Any]:
     return {"status": "error", "message": f"Unexpected {tool_name} response format"}
 
 
-def fetch_order_history(user_id: str | None) -> dict[str, Any]:
-    """Fetch a user's recent orders from MCP."""
+def fetch_order_history(address_id: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
+    if using_real_food_mcp():
+        return food_mcp.get_order_history(address_id=address_id)
     return _call_mcp_tool("order_history", user_id)
 
-def fetch_user_preferences(user_id: str | None) -> dict[str, Any]:
-    """Fetch a user's saved preference profile from MCP."""
-    return _call_mcp_tool("user_preferences", user_id)
+def fetch_user_preferences(user_id: str | None, address_id: str | None = None) -> dict[str, Any]:
+    """Saved preferences. Real Swiggy has no preference tool, so Cravr's own
+    store is the source there, keyed by the delivery address_id. With the mock
+    server, its `user_preferences` tool (keyed by user_id) is tried first and
+    the store is the fallback when it's unreachable."""
+    owner = address_id or user_id
+    if using_real_food_mcp():
+        return load_preferences(owner)
 
+    result = _call_mcp_tool("user_preferences", user_id, mcp_url=MOCK_MCP_URL)
+    if result.get("status") == "error":
+        debug("preference_agent", "mock user_preferences unavailable -- using Cravr's own store")
+        return load_preferences(owner)
+    return result
 
-def history_discovery_node(state: CravrState) -> dict:
-    """Fetch order history for the current user and store it in state."""
-    user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
-    history_profile = fetch_order_history(user_id)
-    debug(
-        "history_agent",
-        f"user_id={user_id!r} status={history_profile.get('status')!r} "
-        f"orders={len(history_profile.get('orders') or [])}",
-    )
-    return {"history_profile": history_profile, "user_id": user_id }
 
 def user_preference_node(state: CravrState) -> dict:
-    """First workflow node: load saved profile facts and recent orders."""
     user_id = state.get("user_id") or state.get("context_profile", {}).get("user_id")
-    preference_profile = fetch_user_preferences(user_id)
-    history_profile = fetch_order_history(user_id)
+    context_profile = dict(state.get("context_profile") or {})
+    address_id = context_profile.get("address_id")
+
+    context_update: dict[str, Any] = {}
+    if using_real_food_mcp() and not address_id:
+        location_result = food_mcp.get_saved_address()
+        address_id = location_result.get("address_id")
+        if location_result.get("status") == "success":
+            context_update = {
+                key: location_result[key]
+                for key in ("location", "delivery_area", "address_id")
+                if location_result.get(key)
+            }
+
+    preference_profile = fetch_user_preferences(user_id, address_id)
+    history_profile = fetch_order_history(address_id, user_id=user_id)
     debug(
         "preference_agent",
         f"user_id={user_id!r} status={preference_profile.get('status')!r} "
@@ -79,10 +83,11 @@ def user_preference_node(state: CravrState) -> dict:
         f"history_status={history_profile.get('status')!r} "
         f"orders={len(history_profile.get('orders') or [])}",
     )
-    return {
+    result: dict[str, Any] = {
         "preference_profile": preference_profile,
         "history_profile": history_profile,
         "user_id": user_id,
     }
-
-
+    if context_update:
+        result["context_profile"] = merge_profile(context_profile, context_update)
+    return result

@@ -1,13 +1,23 @@
 import unittest
 from unittest.mock import patch
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from cravr.graph import FEEDBACK, NEW_REQUEST, _route_entry, app
 from cravr.recommend.RecommendAgent import (
     ONLY_MATCH_OPTIONS,
+    _NO_SELECTION_VALUE,
     _build_recommendation_filters,
+    _craving_match_score,
+    _dish_multiselect_options,
     _dish_pick_options,
+    _handle_dish_multiselect,
+    _offer_category_batch,
+    _offer_dish_batch,
+    _rank_candidates,
+    _resolve_multiple_choices,
+    _split_quantity,
+    _widen_within_restaurant,
     build_recommendation_brief,
     _filter_variants,
     _looks_like_acceptance,
@@ -20,28 +30,17 @@ from cravr.recommend.RecommendAgent import (
 
 
 class RecommendationFilterTests(unittest.TestCase):
-    """`summary` must never leak into the MCP tool's arguments (see
-    _build_recommendation_filters docstring) -- that was a real bug where
-    every recommendation call failed argument validation and silently
-    returned no results, regardless of how complete the profile was."""
-
     def test_summary_is_never_forwarded_as_a_filter(self):
         filters = _build_recommendation_filters({"craving": "spicy food"})
         self.assertNotIn("summary", filters)
 
     def test_free_text_craving_is_not_sent_as_a_tag(self):
-        """`tags` is AND-matched against a closed vocabulary in menu.csv;
-        "noodles" is not in it, so forwarding it guarantees zero results."""
         filters = _build_recommendation_filters(
             {"craving": "noodles", "taste_preference": ["spicy", "tangy"]}
         )
         self.assertEqual(filters["tags"], "spicy,tangy")
 
     def test_cuisine_is_never_injected_into_tags(self):
-        """The original bug: cuisine fell through to `tags` via
-        `craving or cuisine`, so every dish had to carry an "Indian" tag.
-        No menu row does -- cuisine is its own column -- so the AND-match
-        collapsed the result set to zero on every call."""
         filters = _build_recommendation_filters(
             {"cuisine": "Indian", "taste_preference": ["spicy"]}
         )
@@ -59,8 +58,6 @@ class RecommendationFilterTests(unittest.TestCase):
         self.assertEqual(filters["tags"], "spicy")
 
     def test_dietary_preference_is_translated_to_the_menu_vocabulary(self):
-        """menu.csv stores 'Veg'/'Non-Veg' and the MCP tool compares with `==`,
-        so the profile's own word 'vegetarian' matched nothing at all."""
         self.assertEqual(
             _build_recommendation_filters({"dietary_preferences": ["vegetarian"]})["dietary_type"],
             "Veg",
@@ -87,9 +84,42 @@ class RecommendationFilterTests(unittest.TestCase):
         self.assertEqual(filters["max_price_inr"], 300)
 
     def test_an_empty_profile_still_asks_for_a_meal(self):
-        """No preferences is not the same as no constraints: someone with an
-        empty profile still wants food, not a coffee or a side of naan."""
         self.assertEqual(_build_recommendation_filters({}), {"course": "main"})
+
+    def test_a_specific_round1_dish_becomes_a_secondary_search_term(self):
+        filters = _build_recommendation_filters(
+            {"craving_tag": "Palak Paneer", "craving": "Naan"}
+        )
+        self.assertEqual(filters["craving"], "Naan")
+        self.assertEqual(filters["craving_secondary"], "Palak Paneer")
+
+    def test_a_single_word_category_is_not_promoted_to_a_secondary_search(self):
+        filters = _build_recommendation_filters(
+            {"craving_tag": "sandwich", "craving": "Grilled Cheese"}
+        )
+        self.assertEqual(filters["craving"], "Grilled Cheese")
+        self.assertNotIn("craving_secondary", filters)
+
+    def test_a_cuisine_name_is_not_promoted_to_a_secondary_search(self):
+        filters = _build_recommendation_filters(
+            {"craving_tag": "North Indian", "craving": "Palak Paneer"}
+        )
+        self.assertEqual(filters["craving"], "Palak Paneer")
+        self.assertNotIn("craving_secondary", filters)
+
+    def test_a_generic_mood_tag_is_not_promoted_to_a_secondary_search(self):
+        filters = _build_recommendation_filters(
+            {"craving_tag": "comfort-food", "craving": "Grilled Cheese"}
+        )
+        self.assertEqual(filters["craving"], "Grilled Cheese")
+        self.assertNotIn("craving_secondary", filters)
+
+    def test_a_craving_tag_repeating_the_craving_is_not_duplicated(self):
+        filters = _build_recommendation_filters(
+            {"craving_tag": "Palak Paneer", "craving": "Palak Paneer"}
+        )
+        self.assertEqual(filters["craving"], "Palak Paneer")
+        self.assertNotIn("craving_secondary", filters)
 
 
 class FilterRelaxationTests(unittest.TestCase):
@@ -97,15 +127,12 @@ class FilterRelaxationTests(unittest.TestCase):
         variants = _filter_variants(
             {"tags": "spicy", "cuisine": "Indian", "dietary_type": "Veg", "max_price_inr": 1000}
         )
-        # A vegetarian must never be shown meat, and a budget is a budget.
         for variant in variants:
             self.assertEqual(variant["dietary_type"], "Veg")
             self.assertEqual(variant["max_price_inr"], 1000)
         self.assertEqual(variants[-1], {"dietary_type": "Veg", "max_price_inr": 1000})
 
     def test_cuisine_is_relaxed_before_the_stated_taste(self):
-        """Taste is usually what the user actually said ("something spicy");
-        cuisine is often our inference, so it should give way first."""
         variants = _filter_variants(
             {"tags": "spicy", "cuisine": "Indian", "dietary_type": "Veg"}
         )
@@ -123,14 +150,10 @@ class FilterRelaxationTests(unittest.TestCase):
         with patch("cravr.recommend.RecommendAgent._call_recommendation_tool", side_effect=fake_call):
             results = fetch_recommendations(build_recommendation_brief({"cuisine": "Indian", "taste_preference": ["spicy"]}, {}))
 
-        # main+cuisine, then main,side+cuisine, then cuisine dropped.
         self.assertEqual([c.get("course") for c in calls], ["main", "main,side", "main"])
         self.assertEqual(results[0]["item_name"], "Pad Thai")
 
     def test_relaxed_results_are_still_ranked_by_the_original_preference(self):
-        """The Filter Coffee bug: once `tags` was relaxed the tool returned
-        the whole menu and rating alone decided, so a 4.6 coffee beat every
-        spicy dish for a user who asked for something spicy."""
         whole_menu = [
             {"item_name": "Filter Coffee", "cuisine": "South Indian", "rating": 4.6,
              "tags": "vegetarian;breakfast;sugar-free-option;sweet"},
@@ -139,7 +162,6 @@ class FilterRelaxationTests(unittest.TestCase):
         ]
 
         def fake_call(filters):
-            # Nothing carries the tag (e.g. a stale menu), forcing relaxation.
             return [] if "tags" in filters or "cuisine" in filters else whole_menu
 
         with patch("cravr.recommend.RecommendAgent._call_recommendation_tool", side_effect=fake_call):
@@ -160,10 +182,58 @@ class FilterRelaxationTests(unittest.TestCase):
         self.assertEqual(results[0]["item_name"], "Masala Dosa")
 
 
-class CourseTests(unittest.TestCase):
-    """menu.csv's `course` column (main/side/dessert/beverage) exists so a
-    ₹70 Filter Coffee can't be the answer to "I want to eat something spicy"."""
+class CravingMatchScoreTests(unittest.TestCase):
+    def test_an_exact_match_outscores_a_partial_one(self):
+        self.assertGreater(
+            _craving_match_score("Palak Paneer", "Palak Paneer", "Naan"),
+            _craving_match_score("Paneer Naan", "Palak Paneer", "Naan"),
+        )
 
+    def test_matching_both_phrases_outscores_matching_one(self):
+        self.assertGreater(
+            _craving_match_score("Grilled Cheese Sandwich", "Grilled Cheese", "sandwich"),
+            _craving_match_score("Veg Achaari Sandwich", "Grilled Cheese", "sandwich"),
+        )
+
+    def test_no_match_scores_zero(self):
+        self.assertEqual(_craving_match_score("Butter Chicken", "Palak Paneer", "Naan"), 0)
+
+    def test_a_missing_phrase_is_skipped_without_erroring(self):
+        self.assertEqual(_craving_match_score("Naan", "Naan", None), 2)
+
+
+class RankCandidatesCravingRelevanceTests(unittest.TestCase):
+    def test_the_dish_that_actually_matches_wins_over_a_look_alike(self):
+        candidates = [
+            {"item_name": "Paneer Naan", "rating": 4.9, "course": "main"},
+            {"item_name": "Palak Paneer", "rating": 4.2, "course": "main"},
+        ]
+        ranked = _rank_candidates(
+            candidates, [], None, "main", {},
+            desired_craving="Naan", desired_craving_secondary="Palak Paneer",
+        )
+        self.assertEqual(ranked[0]["item_name"], "Palak Paneer")
+
+    def test_a_generic_side_match_does_not_dilute_an_exact_narrowing_pick(self):
+        candidates = [
+            {"item_name": "Veg Achaari Sandwich", "rating": 4.9, "course": "main"},
+            {"item_name": "Grilled Cheese", "rating": 4.2, "course": "main"},
+        ]
+        ranked = _rank_candidates(
+            candidates, [], None, "main", {}, desired_craving="Grilled Cheese",
+        )
+        self.assertEqual(ranked[0]["item_name"], "Grilled Cheese")
+
+    def test_no_craving_terms_falls_back_to_existing_ranking_unchanged(self):
+        candidates = [
+            {"item_name": "A", "rating": 4.0, "course": "main"},
+            {"item_name": "B", "rating": 4.9, "course": "main"},
+        ]
+        ranked = _rank_candidates(candidates, [], None, "main", {})
+        self.assertEqual(ranked[0]["item_name"], "B")
+
+
+class CourseTests(unittest.TestCase):
     def test_a_meal_request_defaults_to_mains(self):
         filters = _build_recommendation_filters({"taste_preference": ["spicy"]})
         self.assertEqual(filters["course"], "main")
@@ -179,7 +249,6 @@ class CourseTests(unittest.TestCase):
         )
 
     def test_a_sweet_tooth_allows_dessert_without_excluding_mains(self):
-        """"sweet" as a taste is a weaker signal than the word "dessert"."""
         self.assertEqual(
             _build_recommendation_filters({"taste_preference": ["sweet"]})["course"],
             "dessert,main",
@@ -194,7 +263,6 @@ class CourseTests(unittest.TestCase):
         variants = _filter_variants({"tags": "spicy", "cuisine": "Indian", "course": "main"})
         self.assertTrue(all("course" in v for v in variants))
         self.assertEqual({v["course"] for v in variants}, {"main", "main,side"})
-        # Widening the course is tried before sacrificing the stated taste.
         self.assertEqual(variants[1], {"tags": "spicy", "cuisine": "Indian", "course": "main,side"})
 
     def test_a_beverage_request_is_never_widened_into_food(self):
@@ -213,7 +281,6 @@ class CourseTests(unittest.TestCase):
 
 class FeedbackParsingTests(unittest.TestCase):
     def test_noodles_is_not_read_as_a_rejection(self):
-        """Substring matching made any word containing "no" a rejection."""
         self.assertFalse(_looks_like_rejection("I want noodles"))
         self.assertTrue(_looks_like_rejection("no, something else"))
 
@@ -250,8 +317,6 @@ class RecommendationAgentTests(unittest.TestCase):
         self.assertIn("Plain Idli", result["messages"][0].content)
         self.assertTrue(result["recommendation_state"]["awaiting_feedback"])
         self.assertEqual(result["recommendation_state"]["last_recommendations"], recommendations)
-        # A single match offers yes/widen buttons, not a dish-pick list --
-        # there's only one dish, nothing to pick between.
         self.assertEqual(result["recommendation_state"]["options"], ONLY_MATCH_OPTIONS)
 
     def test_confirms_when_user_accepts_recommendation(self):
@@ -287,9 +352,6 @@ class RecommendationAgentTests(unittest.TestCase):
 
 
 class BriefHandoffTests(unittest.TestCase):
-    """recommendation_agent reads the frozen brief and nothing else, so the
-    profile-to-menu-filter translation happens in exactly one place."""
-
     def test_brief_carries_filters_history_and_a_concise_summary(self):
         brief = build_recommendation_brief(
             {"cuisine": "Indian", "taste_preference": ["spicy"],
@@ -322,7 +384,6 @@ class BriefHandoffTests(unittest.TestCase):
 
         state = {
             "messages": [{"role": "user", "content": "anything"}],
-            # Deliberately contradictory: if the node reads these, we'll see it.
             "intent_profile": {"cuisine": "Mexican"},
             "history_profile": {"orders": []},
             "recommendation_brief": {"filters": {"cuisine": "Thai"}, "history": {}, "summary": "thai"},
@@ -389,7 +450,6 @@ class ThreeSuggestionTests(unittest.TestCase):
         self.assertIn("Hyderabadi Veg Biryani", result["messages"][0].content)
 
     def test_a_correction_is_a_selection_not_a_rejection(self):
-        """"no, the second one" must pick, not restart the search."""
         result = self._follow_up(self.MENU[:3], "no, the second one")
         self.assertTrue(result["recommendation_state"]["satisfied"])
         self.assertIn("Schezwan Paneer", result["messages"][0].content)
@@ -404,7 +464,6 @@ class ThreeSuggestionTests(unittest.TestCase):
         self.assertTrue(result["recommendation_state"]["satisfied"])
 
     def test_a_cardinal_inside_a_sentence_is_not_a_pick(self):
-        """"the thai one" must not silently select option 1 -- "one" is filler."""
         self.assertIsNone(_resolve_choice("the thai one", self.MENU[:3]))
         self.assertIsNotNone(_resolve_choice("two", self.MENU[:3]))
         self.assertIsNotNone(_resolve_choice("number two", self.MENU[:3]))
@@ -415,8 +474,6 @@ class ThreeSuggestionTests(unittest.TestCase):
         self.assertTrue(result["recommendation_state"]["awaiting_feedback"])
 
     def test_asking_for_more_serves_the_held_back_dishes(self):
-        """"recommend more" used to re-run the same query and reprint the same
-        three dishes, discarding the alternates already in hand."""
         for reply in ["recommend more.", "more", "any others?", "what else do you have"]:
             with self.subTest(reply=reply):
                 result = self._follow_up(self.MENU[:3], reply, alternates=self.MENU[3:])
@@ -429,12 +486,9 @@ class ThreeSuggestionTests(unittest.TestCase):
         content = result["messages"][0].content
         self.assertIn("That's everything", content)
         self.assertIn("widen", content)
-        # Never silently reprint the same three dishes.
         self.assertNotIn("1. Hyderabadi", content)
 
     def test_an_unrecognised_reply_never_reprints_the_same_list(self):
-        """Whatever the phrasing, an unchanged request must not produce the
-        identical three dishes again."""
         result = self._follow_up(self.MENU[:3], "hmm, surprise me", alternates=self.MENU[3:])
         self.assertIn("Chole Bhature", result["messages"][0].content)
 
@@ -455,14 +509,62 @@ class ThreeSuggestionTests(unittest.TestCase):
         self.assertIn("Butter Chicken", result["messages"][0].content)
 
 
-class RecommendationOptionsTests(unittest.TestCase):
-    """UI/components.py renders `recommendation_state["options"]` as tappable
-    buttons (see UI/graph_bridge.py's process_result), same treatment as a
-    clarification question's options -- these check RecommendAgent builds
-    the right buttons for each branch, kept in sync with the numbered text
-    by construction (`_dish_pick_options`/`ONLY_MATCH_OPTIONS` are the single
-    source of truth for both)."""
+class PickToCartHandoffTests(unittest.TestCase):
+    DISH = {"item_name": "Schezwan Paneer", "restaurant_name": "Dragon Bowl",
+            "menu_item_id": "ITEM1", "restaurant_id": "REST1", "cuisine": "Chinese"}
+    MENU = [
+        {"item_name": "Hyderabadi Veg Biryani", "restaurant_name": "Coastal Kitchen",
+         "cuisine": "South Indian", "price_inr": 290, "rating": 4.5, "course": "main"},
+        DISH,
+        {"item_name": "Green Curry with Rice", "restaurant_name": "Thai Basil",
+         "cuisine": "Thai", "price_inr": 360, "rating": 4.5, "course": "main"},
+    ]
 
+    def _follow_up(self, reply, address_id="addr1"):
+        state = {
+            "messages": [{"role": "user", "content": reply}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "context_profile": {"address_id": address_id} if address_id else {},
+            "recommendation_state": {"awaiting_feedback": True, "satisfied": False,
+                                     "last_recommendations": self.MENU, "alternates": []},
+        }
+        with patch("cravr.recommend.RecommendAgent.fetch_recommendations", return_value=[]):
+            return recommendation_agent_node(state)
+
+    def test_pick_with_an_address_calls_add_dish_to_cart(self):
+        cart_reply = {"cart_state": {"items": [{"item_name": "Schezwan Paneer"}]},
+                      "messages": [AIMessage(content="Great — Schezwan Paneer from Dragon Bowl it is. "
+                                              "Added Schezwan Paneer to your cart.\nHere's your cart:\n"
+                                              "  - Schezwan Paneer x1 — ₹280", name="cart_agent")]}
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart", return_value=cart_reply) as mock_add:
+            result = self._follow_up("2")
+        mock_add.assert_called_once()
+        called_dish, called_address = mock_add.call_args.args[0], mock_add.call_args.args[1]
+        self.assertEqual(called_dish["item_name"], "Schezwan Paneer")
+        self.assertEqual(called_address, "addr1")
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertEqual(result["recommendation_state"]["last_recommendations"], [self.DISH])
+        self.assertIn("Added Schezwan Paneer to your cart", result["messages"][0].content)
+        self.assertEqual(result["cart_state"], cart_reply["cart_state"])
+
+    def test_pick_without_an_address_skips_the_cart_call_gracefully(self):
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart") as mock_add:
+            result = self._follow_up("2", address_id=None)
+        mock_add.assert_not_called()
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertIn("Great — Schezwan Paneer", result["messages"][0].content)
+        self.assertIn("couldn't add it to your cart", result["messages"][0].content)
+
+    def test_a_cart_failure_still_confirms_the_pick(self):
+        failure_reply = {"cart_state": {}, "messages": [AIMessage(
+            content="Couldn't add that to your cart: timeout", name="cart_agent")]}
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart", return_value=failure_reply):
+            result = self._follow_up("2")
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertIn("Couldn't add that to your cart", result["messages"][0].content)
+
+
+class RecommendationOptionsTests(unittest.TestCase):
     MENU = ThreeSuggestionTests.MENU
 
     def _offer(self, menu=None):
@@ -508,8 +610,6 @@ class RecommendationOptionsTests(unittest.TestCase):
         self.assertEqual(result["recommendation_state"]["options"], _dish_pick_options(self.MENU[:3]))
 
     def test_confirmed_pick_has_no_more_options(self):
-        """Once a dish is chosen there's nothing left to pick -- no stale
-        buttons should linger under the confirmation message."""
         result = self._follow_up(self.MENU[:3], "2")
         self.assertTrue(result["recommendation_state"]["satisfied"])
         self.assertNotIn("options", result["recommendation_state"])
@@ -534,11 +634,540 @@ class RecommendationOptionsTests(unittest.TestCase):
         )
 
 
-class FeedbackShortcutTests(unittest.TestCase):
-    """The graph skips intent/history/decision for pure reactions, so "3"
-    is never handed to the extraction model (which could read it as a budget
-    of ₹3 and zero out every later search)."""
+class RestaurantScopedWidenTests(unittest.TestCase):
+    MENU = ThreeSuggestionTests.MENU
 
+    def _restaurant_scope(self):
+        return {
+            "restaurant_id": "336078",
+            "restaurant_name": "Punjabi Angithi (Vegorama Group)",
+            "cart_item_id": "63356710",
+            "existing_ids": ["63356710"],
+        }
+
+    def test_declining_a_restaurant_scoped_only_match_widens_within_the_same_restaurant(self):
+        offered = [{"item_name": "Soya Angithi Meal", "menu_item_id": "999", "restaurant_id": "336078"}]
+        restaurant_scope = self._restaurant_scope()
+        state = {
+            "messages": [{"role": "user", "content": "2"}],
+            "recommendation_brief": {
+                "filters": {"craving": "Naan", "craving_secondary": "Palak Paneer", "course": "main,side"},
+                "history": {}, "summary": "",
+            },
+            "recommendation_state": {
+                "awaiting_feedback": True, "satisfied": False,
+                "last_recommendations": offered, "alternates": [],
+                "restaurant_scope": restaurant_scope,
+            },
+        }
+        canned_reply = {"recommendation_state": {"awaiting_feedback": True}, "messages": []}
+        with patch(
+            "cravr.recommend.RecommendAgent._widen_within_restaurant", return_value=canned_reply
+        ) as mock_restaurant_widen, patch(
+            "cravr.recommend.RecommendAgent.widen_recommendations"
+        ) as mock_global_widen:
+            result = recommendation_agent_node(state)
+
+        mock_restaurant_widen.assert_called_once()
+        mock_global_widen.assert_not_called()
+        self.assertIs(result, canned_reply)
+
+    def test_declining_within_a_restaurant_falls_back_to_a_browse_elsewhere_message_when_nothing_is_left(self):
+        offered = [{"item_name": "Soya Angithi Meal", "menu_item_id": "999", "restaurant_id": "336078"}]
+        restaurant_scope = self._restaurant_scope()
+        state = {
+            "messages": [{"role": "user", "content": "2"}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": {
+                "awaiting_feedback": True, "satisfied": False,
+                "last_recommendations": offered, "alternates": [],
+                "restaurant_scope": restaurant_scope,
+            },
+        }
+        with patch(
+            "cravr.recommend.RecommendAgent._widen_within_restaurant", return_value=None
+        ), patch("cravr.recommend.RecommendAgent.widen_recommendations") as mock_global_widen:
+            result = recommendation_agent_node(state)
+
+        mock_global_widen.assert_not_called()
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("other restaurants", result["messages"][0].content.lower())
+
+    def test_an_ordinary_catalog_wide_decline_still_uses_the_global_widen(self):
+        offered = self.MENU[:1]
+        state = {
+            "messages": [{"role": "user", "content": "2"}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": {
+                "awaiting_feedback": True, "satisfied": False,
+                "last_recommendations": offered, "alternates": [],
+            },
+        }
+        with patch(
+            "cravr.recommend.RecommendAgent._widen_within_restaurant"
+        ) as mock_restaurant_widen, patch(
+            "cravr.recommend.RecommendAgent.widen_recommendations", return_value=self.MENU[1:4]
+        ) as mock_global_widen:
+            result = recommendation_agent_node(state)
+
+        mock_restaurant_widen.assert_not_called()
+        mock_global_widen.assert_called_once()
+        self.assertEqual(result["recommendation_state"]["last_recommendations"], self.MENU[1:4])
+
+    def test_widen_within_restaurant_pulls_the_same_restaurants_menu_and_offers_its_other_categories(self):
+        restaurant_scope = self._restaurant_scope()
+        restaurant_scope["current_category"] = ["Curries"]
+        offered = [{"item_name": "Soya Angithi Meal", "menu_item_id": "999"}]
+        menu_items = [
+            {"item_name": "Dal Makhani", "menu_item_id": "1", "tags": "Curries"},
+            {"item_name": "Garlic Naan", "menu_item_id": "2", "tags": "Breads"},
+        ]
+
+        with patch(
+            "cravr.recommend.RecommendAgent.food_mcp.get_restaurant_menu_items",
+            return_value=menu_items,
+        ) as mock_get_menu:
+            result = _widen_within_restaurant(restaurant_scope, offered, "addr1")
+
+        mock_get_menu.assert_called_once_with("336078", "addr1", "Punjabi Angithi (Vegorama Group)")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["recommendation_state"]["offer_kind"], "category")
+        category_names = [c["category"] for c in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(category_names, ["Breads"])
+        self.assertNotIn("current_category", result["recommendation_state"]["restaurant_scope"])
+
+    def test_widen_within_restaurant_with_no_restaurant_id_returns_nothing(self):
+        self.assertIsNone(_widen_within_restaurant({}, [], "addr1"))
+
+    def test_widen_within_restaurant_with_nothing_left_returns_none(self):
+        restaurant_scope = self._restaurant_scope()
+        with patch(
+            "cravr.recommend.RecommendAgent.food_mcp.get_restaurant_menu_items", return_value=[],
+        ):
+            self.assertIsNone(_widen_within_restaurant(restaurant_scope, [], "addr1"))
+
+
+class CategoryBrowsingTests(unittest.TestCase):
+    RESTAURANT_SCOPE = {
+        "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
+        "cart_item_id": "63356710", "existing_ids": ["63356710"],
+    }
+    BREADS = [
+        {"item_name": "Butter Naan", "menu_item_id": "10", "price_inr": 60},
+        {"item_name": "Garlic Naan", "menu_item_id": "11", "price_inr": 70},
+    ]
+    CATEGORIES = [
+        {"category": "Breads", "items": BREADS},
+        {"category": "Rice", "items": [{"item_name": "Jeera Rice", "menu_item_id": "12", "price_inr": 180}]},
+    ]
+
+    def _category_offer_state(self, user_text, categories=None):
+        offer = _offer_category_batch(
+            "Pick a category:", categories if categories is not None else self.CATEGORIES,
+            dict(self.RESTAURANT_SCOPE),
+        )
+        return {
+            "messages": [{"role": "user", "content": user_text}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": offer["recommendation_state"],
+            "context_profile": {"address_id": "addr1"},
+        }
+
+    def test_picking_a_category_shows_its_own_dishes(self):
+        state = self._category_offer_state("Breads")
+        result = recommendation_agent_node(state)
+
+        self.assertNotEqual(result["recommendation_state"].get("satisfied"), True)
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan"])
+        self.assertEqual(result["recommendation_state"]["restaurant_scope"]["current_category"], ["Breads"])
+
+    def test_a_single_remaining_category_is_still_browsed_not_auto_added(self):
+        state = self._category_offer_state("1", categories=self.CATEGORIES[:1])
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan"])
+        self.assertNotEqual(result["recommendation_state"].get("satisfied"), True)
+
+    def test_saying_yes_to_a_single_category_offer_browses_it_not_adds_it(self):
+        state = self._category_offer_state("yes", categories=self.CATEGORIES[:1])
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan"])
+        self.assertNotEqual(result["recommendation_state"].get("satisfied"), True)
+
+    def test_a_category_with_a_single_dish_still_offers_it_as_a_multiselect_pick(self):
+        state = self._category_offer_state("Rice")
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Jeera Rice"])
+        self.assertEqual(result["recommendation_state"]["offer_kind"], "dish")
+        self.assertEqual(
+            result["recommendation_state"]["options"], _dish_multiselect_options([self.CATEGORIES[1]["items"][0]]),
+        )
+
+    def test_picking_a_dish_within_a_category_adds_it_to_the_cart_normally(self):
+        state = self._category_offer_state("Breads")
+        dish_offer = recommendation_agent_node(state)
+
+        pick_state = {
+            "messages": [{"role": "user", "content": "1"}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": dish_offer["recommendation_state"],
+            "context_profile": {"address_id": "addr1"},
+        }
+        mock_result = {
+            "messages": [AIMessage(content="**Your cart:**\n\n- Butter Naan x1 \u2014 \u20b960", name="cart_agent")],
+            "cart_state": {"restaurant": {"id": "336078", "name": "Punjabi Angithi (Vegorama Group)"}},
+        }
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart", return_value=mock_result,
+        ) as mock_add:
+            result = recommendation_agent_node(pick_state)
+
+        mock_add.assert_called_once()
+        self.assertEqual(mock_add.call_args[0][0]["item_name"], "Butter Naan")
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertIn("Added Butter Naan to your cart.", result["messages"][0].content)
+
+
+class DishMultiSelectTests(unittest.TestCase):
+    RESTAURANT_SCOPE = {
+        "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
+        "cart_item_id": "63356710", "existing_ids": ["63356710"],
+    }
+    DISHES = [
+        {"item_name": "Butter Naan", "menu_item_id": "10", "price_inr": 60, "restaurant_id": "336078"},
+        {"item_name": "Garlic Naan", "menu_item_id": "11", "price_inr": 70, "restaurant_id": "336078"},
+        {"item_name": "Jeera Rice", "menu_item_id": "12", "price_inr": 180, "restaurant_id": "336078"},
+    ]
+
+    def _dish_offer_state(self, user_text, dishes=None, restaurant_scope=None):
+        scope = self.RESTAURANT_SCOPE if restaurant_scope is None else restaurant_scope
+        offer = _offer_dish_batch(
+            "Here's what's under Breads:", dishes if dishes is not None else self.DISHES,
+            dict(scope) if scope else scope,
+        )
+        return {
+            "messages": [{"role": "user", "content": user_text}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": offer["recommendation_state"],
+            "context_profile": {"address_id": "addr1"},
+        }
+
+    def _success(self, item_name, price):
+        return {
+            "messages": [AIMessage(
+                content=f"**Your cart:**\n\n- {item_name} x1 \u2014 \u20b9{price}", name="cart_agent",
+            )],
+            "cart_state": {"restaurant": {"id": "336078", "name": "Punjabi Angithi (Vegorama Group)"}},
+        }
+
+    def test_offer_dish_batch_shows_every_item_uncapped_as_a_multiselect(self):
+        offer = _offer_dish_batch("Here's what's under Breads and Rice:", self.DISHES, self.RESTAURANT_SCOPE)
+        rec_state = offer["recommendation_state"]
+
+        self.assertEqual(rec_state["offer_kind"], "dish")
+        self.assertEqual(len(rec_state["last_recommendations"]), 3)
+        self.assertEqual(rec_state["alternates"], [])
+        self.assertEqual(rec_state["options"], _dish_multiselect_options(self.DISHES))
+
+    def test_dish_multiselect_options_fold_price_into_the_label(self):
+        options = _dish_multiselect_options(self.DISHES)
+        self.assertEqual(options[0]["label"], "Butter Naan \u2014 \u20b960")
+
+    def test_picking_two_dishes_adds_both_in_one_go(self):
+        state = self._dish_offer_state("1,3")
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), self._success("Jeera Rice", 180)],
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(mock_add.call_count, 2)
+        picked_names = [call.args[0]["item_name"] for call in mock_add.call_args_list]
+        self.assertEqual(picked_names, ["Butter Naan", "Jeera Rice"])
+        self.assertIn("Added Butter Naan and Jeera Rice to your cart.", result["messages"][0].content)
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+
+    def test_picking_two_dishes_with_quantities_forwards_them_to_add_dish_to_cart(self):
+        # "1:2,3" is the chip-submitted shape (OptionChips.jsx's quantity
+        # stepper) -- option 1 (Butter Naan) qty 2, option 3 (Jeera Rice)
+        # defaults to qty 1.
+        state = self._dish_offer_state("1:2,3")
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), self._success("Jeera Rice", 180)],
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(mock_add.call_count, 2)
+        quantities = [call.kwargs.get("quantity") for call in mock_add.call_args_list]
+        self.assertEqual(quantities, [2, 1])
+        self.assertIn("Added 2x Butter Naan and Jeera Rice to your cart.", result["messages"][0].content)
+
+    def test_typed_quantity_suffix_also_works_from_the_dish_offer(self):
+        state = self._dish_offer_state("Butter Naan x3")
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            return_value=self._success("Butter Naan", 60),
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(mock_add.call_args.kwargs.get("quantity"), 3)
+        self.assertIn("Added 3x Butter Naan to your cart.", result["messages"][0].content)
+
+    def test_a_dish_that_fails_partway_through_stops_the_batch_and_notes_what_already_landed(self):
+        state = self._dish_offer_state("1,2,3")
+        failure = {"messages": [AIMessage(content="Couldn't add that to your cart: rejected", name="cart_agent")],
+                   "cart_state": {}}
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), failure],
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        self.assertEqual(mock_add.call_count, 2)
+        self.assertIn("Added Butter Naan first.", result["messages"][0].content)
+        self.assertIn("Couldn't add that to your cart", result["messages"][0].content)
+
+    def test_skipping_every_dish_within_a_restaurant_declines_gracefully(self):
+        state = self._dish_offer_state(_NO_SELECTION_VALUE)
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart") as mock_add:
+            result = recommendation_agent_node(state)
+
+        mock_add.assert_not_called()
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("this restaurant", result["messages"][0].content.lower())
+
+    def test_saying_yes_to_a_single_dish_offer_adds_it(self):
+        state = self._dish_offer_state("yes", dishes=self.DISHES[:1])
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            return_value=self._success("Butter Naan", 60),
+        ) as mock_add:
+            result = recommendation_agent_node(state)
+
+        mock_add.assert_called_once()
+        self.assertTrue(result["recommendation_state"]["satisfied"])
+
+    def test_handle_dish_multiselect_without_an_address_does_not_touch_the_cart(self):
+        with patch("cravr.recommend.RecommendAgent.add_dish_to_cart") as mock_add:
+            result = _handle_dish_multiselect(self.DISHES[:2], None, None)
+
+        mock_add.assert_not_called()
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("Butter Naan", result["messages"][0].content)
+        self.assertIn("Garlic Naan", result["messages"][0].content)
+
+    def test_handle_dish_multiselect_uses_the_quantities_dict_keyed_by_menu_item_id(self):
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), self._success("Garlic Naan", 70)],
+        ) as mock_add:
+            result = _handle_dish_multiselect(self.DISHES[:2], "addr1", None, quantities={"10": 4})
+
+        quantities = [call.kwargs.get("quantity") for call in mock_add.call_args_list]
+        self.assertEqual(quantities, [4, 1])
+        self.assertIn("4x Butter Naan", result["messages"][0].content)
+        self.assertIn("Garlic Naan", result["messages"][0].content)
+
+    def test_handle_dish_multiselect_with_no_quantities_dict_defaults_every_item_to_one(self):
+        with patch(
+            "cravr.recommend.RecommendAgent.add_dish_to_cart",
+            side_effect=[self._success("Butter Naan", 60), self._success("Garlic Naan", 70)],
+        ) as mock_add:
+            _handle_dish_multiselect(self.DISHES[:2], "addr1", None)
+
+        quantities = [call.kwargs.get("quantity") for call in mock_add.call_args_list]
+        self.assertEqual(quantities, [1, 1])
+
+
+class MultiSelectCategoryTests(unittest.TestCase):
+    RESTAURANT_SCOPE = {
+        "restaurant_id": "336078", "restaurant_name": "Punjabi Angithi (Vegorama Group)",
+        "cart_item_id": "63356710", "existing_ids": ["63356710"],
+    }
+    BREADS = [
+        {"item_name": "Butter Naan", "menu_item_id": "10", "price_inr": 60},
+        {"item_name": "Garlic Naan", "menu_item_id": "11", "price_inr": 70},
+    ]
+    RICE = [{"item_name": "Jeera Rice", "menu_item_id": "12", "price_inr": 180}]
+    CHINESE = [{"item_name": "Veg Manchurian", "menu_item_id": "13", "price_inr": 220}]
+    CATEGORIES = [
+        {"category": "Breads", "items": BREADS},
+        {"category": "Rice", "items": RICE},
+        {"category": "Chinese", "items": CHINESE},
+    ]
+
+    _UNSET = object()
+
+    def _category_offer_state(self, user_text, categories=None, restaurant_scope=_UNSET):
+        scope = self.RESTAURANT_SCOPE if restaurant_scope is self._UNSET else restaurant_scope
+        offer = _offer_category_batch(
+            "Pick some categories:", categories if categories is not None else self.CATEGORIES,
+            dict(scope) if scope else scope,
+        )
+        return {
+            "messages": [{"role": "user", "content": user_text}],
+            "recommendation_brief": {"filters": {}, "history": {}, "summary": ""},
+            "recommendation_state": offer["recommendation_state"],
+            "context_profile": {"address_id": "addr1"},
+        }
+
+    def test_resolve_multiple_choices_splits_comma_joined_values(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}, {"item_name": "Chinese"}]
+        chosen = _resolve_multiple_choices("1,3", options)
+        self.assertEqual([o["item_name"] for o, _qty in chosen], ["Breads", "Chinese"])
+
+    def test_resolve_multiple_choices_splits_free_typed_and(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}, {"item_name": "Chinese"}]
+        chosen = _resolve_multiple_choices("Breads and Chinese", options)
+        self.assertEqual([o["item_name"] for o, _qty in chosen], ["Breads", "Chinese"])
+
+    def test_resolve_multiple_choices_ignores_unresolvable_tokens_and_dedupes(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("1, nonsense, 1, Rice", options)
+        self.assertEqual([o["item_name"] for o, _qty in chosen], ["Breads", "Rice"])
+
+    def test_resolve_multiple_choices_with_no_input_returns_empty(self):
+        self.assertEqual(_resolve_multiple_choices("", [{"item_name": "Breads"}]), [])
+        self.assertEqual(_resolve_multiple_choices("1", []), [])
+
+    def test_resolve_multiple_choices_defaults_every_pick_to_quantity_one(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("1,2", options)
+        self.assertEqual([qty for _o, qty in chosen], [1, 1])
+
+    def test_resolve_multiple_choices_picks_up_a_chip_submitted_quantity(self):
+        # OptionChips.jsx's quantity stepper encodes a >1 pick as "value:qty".
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("1:3,2", options)
+        self.assertEqual([(o["item_name"], qty) for o, qty in chosen], [("Breads", 3), ("Rice", 1)])
+
+    def test_resolve_multiple_choices_picks_up_a_typed_quantity_suffix(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("Breads x2, Rice", options)
+        self.assertEqual([(o["item_name"], qty) for o, qty in chosen], [("Breads", 2), ("Rice", 1)])
+
+    def test_resolve_multiple_choices_picks_up_a_typed_quantity_prefix(self):
+        options = [{"item_name": "Breads"}, {"item_name": "Rice"}]
+        chosen = _resolve_multiple_choices("2x Breads", options)
+        self.assertEqual([(o["item_name"], qty) for o, qty in chosen], [("Breads", 2)])
+    def test_picking_two_categories_merges_their_dishes(self):
+        state = self._category_offer_state("1,2")
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan", "Jeera Rice"])
+        self.assertEqual(
+            result["recommendation_state"]["restaurant_scope"]["current_category"],
+            ["Breads", "Rice"],
+        )
+        self.assertIn("Breads and Rice", result["messages"][0].content)
+
+    def test_a_quantity_marker_on_a_category_pick_is_harmless(self):
+        # Categories aren't a quantity concept -- _handle_category_pick never
+        # sees the parsed quantity at all, so "1:2" behaves exactly like "1".
+        state = self._category_offer_state("1:2,2")
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan", "Jeera Rice"])
+
+    def test_picking_all_three_categories_joins_labels_with_oxford_comma(self):
+        state = self._category_offer_state("Breads, Rice and Chinese")
+        result = recommendation_agent_node(state)
+
+        rec_state = result["recommendation_state"]
+        names = (
+            [d["item_name"] for d in rec_state["last_recommendations"]]
+            + [d["item_name"] for d in rec_state.get("alternates") or []]
+        )
+        self.assertEqual(names, ["Butter Naan", "Garlic Naan", "Jeera Rice", "Veg Manchurian"])
+        self.assertIn("Breads, Rice, and Chinese", result["messages"][0].content)
+
+    def test_merged_items_are_deduped_by_menu_item_id(self):
+        shared = {"item_name": "House Special Combo", "menu_item_id": "99", "price_inr": 300}
+        categories = [
+            {"category": "Combos", "items": [shared]},
+            {"category": "Specials", "items": [shared]},
+        ]
+        state = self._category_offer_state("1,2", categories=categories)
+        result = recommendation_agent_node(state)
+
+        names = [d["item_name"] for d in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(names, ["House Special Combo"])
+
+    def test_skipping_every_category_within_a_restaurant_declines_gracefully(self):
+        state = self._category_offer_state(_NO_SELECTION_VALUE)
+        result = recommendation_agent_node(state)
+
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("this restaurant", result["messages"][0].content.lower())
+
+    def test_skipping_every_category_without_a_restaurant_scope_gives_the_generic_decline(self):
+        state = self._category_offer_state(
+            _NO_SELECTION_VALUE, categories=self.CATEGORIES[:1], restaurant_scope=None,
+        )
+        result = recommendation_agent_node(state)
+
+        self.assertFalse(result["recommendation_state"]["awaiting_feedback"])
+        self.assertIn("tell me what you want to change", result["messages"][0].content)
+
+    def test_widen_within_restaurant_excludes_every_previously_picked_category(self):
+        restaurant_scope = dict(self.RESTAURANT_SCOPE)
+        restaurant_scope["current_category"] = ["Breads", "Rice"]
+        offered = [{"item_name": "Butter Naan", "menu_item_id": "10"}]
+        menu_items = [
+            {"item_name": "Butter Naan", "menu_item_id": "10", "tags": "Breads"},
+            {"item_name": "Jeera Rice", "menu_item_id": "12", "tags": "Rice"},
+            {"item_name": "Veg Manchurian", "menu_item_id": "13", "tags": "Chinese"},
+        ]
+        with patch(
+            "cravr.recommend.RecommendAgent.food_mcp.get_restaurant_menu_items",
+            return_value=menu_items,
+        ):
+            result = _widen_within_restaurant(restaurant_scope, offered, "addr1")
+
+        category_names = [c["category"] for c in result["recommendation_state"]["last_recommendations"]]
+        self.assertEqual(category_names, ["Chinese"])
+
+
+class SplitQuantityTests(unittest.TestCase):
+    """Unit coverage for the token-level quantity marker _resolve_multiple_choices
+    delegates to -- see its module-level docstring for the three recognised
+    shapes and why they don't collide."""
+
+    def test_plain_token_defaults_to_quantity_one(self):
+        self.assertEqual(_split_quantity("Falafel Wrap"), ("Falafel Wrap", 1))
+        self.assertEqual(_split_quantity("3"), ("3", 1))
+
+    def test_chip_submitted_colon_format(self):
+        self.assertEqual(_split_quantity("3:2"), ("3", 2))
+
+    def test_typed_suffix_on_a_name(self):
+        self.assertEqual(_split_quantity("Falafel Wrap x2"), ("Falafel Wrap", 2))
+        self.assertEqual(_split_quantity("Falafel Wrap×2"), ("Falafel Wrap", 2))
+
+    def test_typed_suffix_on_a_bare_index_means_index_then_quantity(self):
+        # "3x2" reads as "option 3, times 2" -- not "option 32".
+        self.assertEqual(_split_quantity("3x2"), ("3", 2))
+
+    def test_typed_prefix_on_a_name(self):
+        self.assertEqual(_split_quantity("2x Falafel Wrap"), ("Falafel Wrap", 2))
+        self.assertEqual(_split_quantity("2 x Falafel Wrap"), ("Falafel Wrap", 2))
+
+    def test_quantity_is_clamped_to_a_sane_range(self):
+        self.assertEqual(_split_quantity("3:0"), ("3", 1))
+        self.assertEqual(_split_quantity("3:99"), ("3", 20))
+
+
+class FeedbackShortcutTests(unittest.TestCase):
     OFFERED = [{"item_name": "Hyderabadi Veg Biryani"}, {"item_name": "Schezwan Paneer"},
                {"item_name": "Green Curry with Rice"}]
     STATE = {"awaiting_feedback": True, "satisfied": False, "last_recommendations": OFFERED}
@@ -547,6 +1176,9 @@ class FeedbackShortcutTests(unittest.TestCase):
         for reply in ["3", "the second one", "yes", "something else", "I'll take the biryani"]:
             with self.subTest(reply=reply):
                 self.assertTrue(is_pure_feedback(reply, self.STATE))
+
+    def test_the_multiselect_skip_sentinel_shortcuts_to_the_recommender(self):
+        self.assertTrue(is_pure_feedback(_NO_SELECTION_VALUE, self.STATE))
 
     def test_a_changed_request_takes_the_full_path(self):
         for reply in ["make it non-veg", "something under 200", "actually Thai", "no, milder please"]:
@@ -570,8 +1202,6 @@ class FeedbackShortcutTests(unittest.TestCase):
         )
 
     def test_entry_labels_are_wired_to_the_right_nodes(self):
-        """The router returns a reason, not a node name -- so the path map is
-        what actually decides where each reason goes. Check they line up."""
         edges = {(e.source, e.target, getattr(e, "data", None)) for e in app.get_graph().edges}
         self.assertIn(("__start__", "recommendation_agent", FEEDBACK), edges)
         self.assertIn(("__start__", "intent_discovery", NEW_REQUEST), edges)

@@ -7,7 +7,7 @@ the way a hand-drawn diagram would.
     python scripts/render_graph.py -o docs/graph.mermaid
     python scripts/render_graph.py --png docs/graph.png
 
-The conditional-edge labels ("feedback", "clarify_and_retry", ...) come from
+The conditional-edge labels ("feedback", "new_request") come from
 the path-map keys in `build_graph()`, which is why those keys are named for
 the reason a branch is taken rather than for its destination node.
 """

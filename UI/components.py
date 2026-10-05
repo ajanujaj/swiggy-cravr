@@ -1,192 +1,156 @@
-"""Chat rendering: message bubbles, sequential option buttons, and dish cards.
-
-Reads `st.session_state.history` (written by `graph_bridge`) and renders
-it. The only place this module writes back is the option-button click
-handler, which calls `graph_bridge.send` exactly the way the chat input
-box does.
-"""
-
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, Callable
+from typing import Any
 
-import streamlit as st
+import chainlit as cl
 
-from graph_bridge import OTHER_VALUE, send
+from cravr.options import OTHER_VALUE
+
+import state
+
+_HINT = "Or type your own answer below."
+_NONE_ADDON_VALUE = "__no_addon__"
+_NUMBERED_LINE = re.compile(r"^\s*\d+[.)]\s+")
+_LIST_THEN_TEXT = re.compile(r"^(\s*[-*] .*)\n(?!\s*[-*] |\s*$)(.*)$", re.M)
+_PHRASE_FIXES = [
+    (re.compile(r"Pick one by number or name, ", re.I), "Tap one, "),
+    (re.compile(r"\s*\((?:numbers, names, or comma-separated)\)", re.I), ""),
+    (re.compile(r"\s*\(numbers, names, or comma-separated\), or say \"none\"\.", re.I), "."),
+    (re.compile(r"select as many as you like", re.I), "pick as many as you like"),
+]
 
 
-def _dish_card_html(position: int, dish: dict[str, Any]) -> str:
-    tags = str(dish.get("tags") or "").replace(";", " · ")
-    price = dish.get("price_inr")
-    rating = dish.get("rating")
-    meta_bits = [
-        b
-        for b in (
-            dish.get("cuisine"),
-            f"₹{price}" if price is not None else None,
-            f"⭐ {rating}" if rating is not None else None,
-        )
-        if b
+def _clean_text(content: str, has_options: bool) -> str:
+    text = content or ""
+    if has_options:
+        text = "\n".join(line for line in text.split("\n") if not _NUMBERED_LINE.match(line))
+        for pattern, replacement in _PHRASE_FIXES:
+            text = pattern.sub(replacement, text)
+    text = _LIST_THEN_TEXT.sub(r"\1\n\n\2", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _chip_options(options: list[dict[str, str]] | None) -> list[dict[str, Any]]:
+    return [
+        {
+            "value": str(o.get("value")),
+            "label": str(o.get("label") or o.get("value") or ""),
+            "group": o.get("group") or "",
+            "required": bool(o.get("required")),
+        }
+        for o in options or []
+        if o.get("value") not in (OTHER_VALUE, _NONE_ADDON_VALUE, None)
     ]
-    return f"""
-        <div class="cravr-dish-card">
-            <div class="cravr-dish-name">{position}. {dish.get('item_name', 'Dish')}</div>
-            <div class="cravr-dish-meta">{dish.get('restaurant_name', '')}</div>
-            <div class="cravr-dish-meta">{' · '.join(meta_bits)}</div>
-            <div class="cravr-dish-tags">{tags}</div>
-        </div>
-        """
 
 
-def render_dish_cards(
+def _element(name: str, props: dict[str, Any]) -> cl.CustomElement:
+    return cl.CustomElement(name=name, props=props, display="inline")
+
+
+async def _send(content: str, element: cl.CustomElement | None) -> cl.Message:
+    message = cl.Message(content=content, elements=[element] if element else [], author="Cravr")
+    await message.send()
+    return message
+
+
+async def send_option_message(question: str, options: list[dict[str, str]] | None) -> None:
+    chips = _chip_options(options)
+    element = _element("OptionChips", {"options": chips, "hint": _HINT}) if chips else None
+    await _send(_clean_text(question, bool(chips)), element)
+    state.set_live_elements([element] if element else [])
+
+
+async def send_assistant_message(content: str, options: list[dict[str, str]] | None) -> None:
+    await send_option_message(content, options)
+
+
+def _dish_props(dish: dict[str, Any], option: dict[str, Any] | None) -> dict[str, Any]:
+    name = str(dish.get("item_name") or "Dish")
+    diet = str(dish.get("dietary_type") or "").lower()
+    tags = [t.strip() for t in re.split(r"[;,]", str(dish.get("tags") or "")) if t.strip()]
+    if option:
+        option = {**option, "cta": "Pick this" if option["label"] == name else option["label"]}
+    return {
+        "name": name,
+        "restaurant": dish.get("restaurant_name") or "",
+        "cuisine": dish.get("cuisine") or "",
+        "price": dish.get("price_inr") or None,
+        "rating": dish.get("rating"),
+        "tags": [t for t in tags if t.lower() not in ("vegetarian", "veg", "non-veg")],
+        "veg": True if diet == "veg" else False if diet in ("non-veg", "nonveg") else None,
+        "badge": dish.get("badge") or "",
+        "reason": dish.get("reason") or "",
+        "eta": dish.get("eta_min") or None,
+        "offer": dish.get("offer") or "",
+        "option": option,
+    }
+
+
+def _intro_text(content: str, dishes: list[dict[str, Any]]) -> str:
+    names = {str(d.get("item_name") or "").strip().lower() for d in dishes} - {""}
+    kept = [
+        line for line in (content or "").split("\n")
+        if not (_NUMBERED_LINE.match(line) and any(n in line.lower() for n in names))
+    ]
+    text = _clean_text("\n".join(kept), True)
+    if len(dishes) == 1:
+        text = re.sub(r"^I’d suggest .*? — that's the only match for what you asked\.?",
+                      "Only one dish matches what you asked for:", text)
+    return text
+
+
+async def send_dish_cards(
+    content: str,
     dishes: list[dict[str, Any]],
-    entry_index: int | None = None,
-    pick_options: list[dict[str, str]] | None = None,
+    pick_options: list[dict[str, str]] | None,
 ) -> None:
-    """Render dishes one below another, numbered to match the numbered list
-    already baked into the message text (see `cravr.recommend._numbered`) --
-    so "pick one by number" means the same thing whether you read the text
-    or look at the cards.
-
-    Without `pick_options` these are plain, non-interactive cards -- used
-    for every dish list except the most recent one (see `render_history`).
-
-    With `pick_options` (one `{"value", "label"}` per position, same order
-    `cravr.recommend._dish_pick_options` built them in -- see
-    `graph_bridge.process_result`), each card *is* the tappable answer: no
-    separate "1. Matcha Pancakes" button duplicating what the card already
-    shows. Streamlit can't put this card's rich HTML inside a native
-    button's label, so instead a real (invisible, full-card-sized) button
-    lives in the same keyed container and CSS stretches it over the card --
-    see the `st-key-dish-` rules in `UI/styles.py`. If there are more
-    options than dishes (e.g. the single-match "widen the search" choice,
-    which isn't a dish at all), the leftover ones render as their own small
-    buttons underneath, using the number already baked into their `value`
-    so it still reads "2. Widen the search" and not a re-numbered "1.".
-    """
-    if not pick_options:
-        for position, dish in enumerate(dishes, start=1):
-            st.markdown(_dish_card_html(position, dish), unsafe_allow_html=True)
-        return
-
-    for position, dish in enumerate(dishes, start=1):
-        option = pick_options[position - 1] if position <= len(pick_options) else None
-        if option is None:
-            st.markdown(_dish_card_html(position, dish), unsafe_allow_html=True)
-            continue
-        with st.container(key=f"dish-{entry_index}-{position}"):
-            st.markdown(_dish_card_html(position, dish), unsafe_allow_html=True)
-            label = dish.get("item_name") or f"Option {position}"
-            if st.button(label, key=f"dish-btn-{entry_index}-{position}", use_container_width=True):
-                send(option.get("value"), display_label=label)
-                st.rerun()
-
-    leftover = pick_options[len(dishes):]
-    for option in leftover:
-        value = option.get("value") or ""
-        label = option.get("label") or value
-        button_label = f"{value}. {label}" if value.isdigit() else label
-        if st.button(
-            button_label,
-            key=f"dish-extra-{entry_index}-{value}",
-            use_container_width=True,
-        ):
-            send(value, display_label=label)
-            st.rerun()
-
-    st.caption("Or type your own answer below.")
+    chips = _chip_options(pick_options)
+    cards = [_dish_props(d, chips[i] if i < len(chips) else None) for i, d in enumerate(dishes)]
+    element = _element("DishCards", {"dishes": cards, "extras": chips[len(dishes):], "hint": _HINT})
+    await _send(_intro_text(content, dishes), element)
+    state.set_live_elements([element] if chips else [])
 
 
-def _render_option_chips(entry_index: int, options: list[dict[str, str]]) -> None:
-    """Tappable answer buttons for the latest clarification question.
-
-    Stacked one below another, numbered in the same order the backend
-    numbers them (see `cravr.options.suggest_options`) -- not side by side
-    in columns, so the order reads top-to-bottom the same way the CLI's
-    numbered list and the recommendation cards already do.
-
-    Filters out the "type your own" sentinel (`OTHER_VALUE`) -- that one
-    isn't a real answer to resume the graph with, it's a cue that free text
-    is welcome, which `st.chat_input` already offers on every turn.
-    """
-    tappable = [o for o in options if o.get("value") != OTHER_VALUE]
-    if not tappable:
-        return
-    for position, option in enumerate(tappable, start=1):
-        label = option.get("label") or option.get("value")
-        if st.button(
-            f"{position}. {label}",
-            key=f"opt-{entry_index}-{option.get('value')}",
-            use_container_width=True,
-        ):
-            send(option.get("value"), display_label=label)
-            st.rerun()
-    st.caption("Or type your own answer below.")
+def _multiselect_question(question: str) -> str:
+    return _clean_text(question.split("\n", 1)[0], True)
 
 
-def _strip_dish_lines(content: str, dishes: list[dict[str, Any]]) -> str:
-    """Drop the numbered dish-description lines from the message text.
-
-    The dishes are about to render as cards right below this text -- left
-    alone, the same three dishes show up twice (once as
-    "1. Chicken Panini from La Pino's Kitchen (...)" text, once as a card).
-    Only lines that actually name one of `dishes` are removed (matched by
-    item name), so unrelated numbered lines -- e.g. the single-match
-    confirmation's "1. Yes, I'll take it / 2. Widen the search" -- are left
-    untouched; those aren't dish descriptions and have no card to duplicate.
-    """
-    names = {str(d.get("item_name") or "").strip().lower() for d in dishes if d.get("item_name")}
-    names.discard("")
-    if not names:
-        return content
-
-    kept = []
-    for line in content.split("\n"):
-        stripped = line.strip()
-        is_numbered = bool(re.match(r"^\d+\.\s", stripped))
-        mentions_dish = any(name in stripped.lower() for name in names)
-        if is_numbered and mentions_dish:
-            continue
-        kept.append(line)
-
-    text = "\n".join(kept)
-    text = re.sub(r"\n{3,}", "\n\n", text)  # collapse gaps the removal left behind
-    return text.strip()
+async def send_multiselect_message(
+    question: str, options: list[dict[str, str]] | None, allow_quantity: bool = False,
+) -> None:
+    chips = _chip_options(options)
+    element = _element("OptionChips", {"options": chips, "multi": True, "hint": _HINT, "quantities": allow_quantity})
+    await _send(_multiselect_question(question), element)
+    state.set_multiselect({"element": element, "options": chips})
+    state.set_live_elements([element])
 
 
-def render_history() -> None:
-    last_index = len(st.session_state.history) - 1
-    for i, entry in enumerate(st.session_state.history):
-        avatar = "🧑" if entry["role"] == "user" else "🍽️"
-        with st.chat_message(entry["role"], avatar=avatar):
-            dishes = entry.get("dishes")
-            content = _strip_dish_lines(entry["content"], dishes) if dishes else entry["content"]
-            st.markdown(content)
+def multiselect_answer(values: list[str]) -> tuple[str, str]:
+    """values may be plain option values ("3") or, when OptionChips.jsx's
+    quantity stepper was shown (allow_quantity=True on a dish multi-select),
+    "value:qty" for anything picked more than once. The raw string is what
+    actually goes on to the graph (RecommendAgent._split_quantity parses the
+    ":qty" suffix back out) -- this only needs to turn it into a readable
+    echoed label like "Falafel Wrap x2"."""
+    current = state.get_multiselect() or {}
+    state.set_multiselect(None)
+    if not values:
+        return _NONE_ADDON_VALUE, "None of these"
+    labels = {o["value"]: o["label"] for o in current.get("options") or []}
 
-            options = entry.get("options")
-            # Only the most recent assistant turn's options are still
-            # actionable -- earlier ones are just a record of what was
-            # asked/offered. Not gated on `st.session_state.awaiting_interrupt`:
-            # a clarification question pauses the graph on an interrupt, but
-            # a dish pick (recommendation_agent's own `options`, see
-            # graph_bridge.process_result) doesn't -- the graph has already
-            # finished that turn, and clicking sends a normal new message.
-            # `graph_bridge.send()` already branches on `awaiting_interrupt`
-            # itself to resume vs. send fresh, so either kind of option
-            # reaches the graph correctly regardless of this render check.
-            is_actionable = bool(options) and i == last_index
+    def _display(raw: str) -> str:
+        base, _, qty = raw.partition(":")
+        label = labels.get(base, base)
+        if qty.isdigit() and int(qty) > 1:
+            return f"{label} x{qty}"
+        return label
 
-            if dishes:
-                render_dish_cards(dishes, entry_index=i, pick_options=options if is_actionable else None)
-            elif is_actionable:
-                _render_option_chips(i, options)
+    return ",".join(values), ", ".join(_display(v) for v in values)
 
 
-def render_sidebar(user_id: str, reset_state: Callable[[], None]) -> None:
-    st.subheader("Session")
-    st.caption(f"User: {user_id}")
-    st.caption(f"Thread: {st.session_state.config['configurable']['thread_id'][:8]}")
-    if st.button("Start a new conversation"):
-        reset_state()
-        st.rerun()
+async def lock_element(element: cl.CustomElement, selected: Any = None) -> None:
+    element.props = {**element.props, "locked": True, "selected": selected}
+    element.content = json.dumps(element.props)
+    await element.update()

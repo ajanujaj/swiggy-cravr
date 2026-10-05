@@ -17,7 +17,6 @@ def at(hour: int, minute: int = 0) -> datetime:
 
 class MealWindowTests(unittest.TestCase):
     def test_ten_pm_offers_dinner_quick_bite_and_snack(self):
-        """The worked example: 10pm is dinner, or something lighter."""
         window = current_meal_window(at(22, 0))
 
         self.assertEqual(window.name, "dinner")
@@ -34,7 +33,6 @@ class MealWindowTests(unittest.TestCase):
         self.assertIn("snack", question.lower())
 
     def test_windows_tile_the_whole_day_without_gaps(self):
-        """Every minute of the day must resolve, including across midnight."""
         for hour in range(24):
             for minute in (0, 29, 30, 59):
                 with self.subTest(hour=hour, minute=minute):
@@ -91,7 +89,6 @@ class ResolveMealIntentTests(unittest.TestCase):
         self.assertIsNone(resolve_meal_intent("9", at(22, 0)))
 
     def test_unmatched_reply_returns_none(self):
-        """A typo must not silently resolve to the first option."""
         self.assertIsNone(resolve_meal_intent("qwerty", at(22, 0)))
 
     def test_empty_reply_returns_none(self):
@@ -103,7 +100,6 @@ class MenuMealTypeTests(unittest.TestCase):
         self.assertEqual(menu_meal_type("breakfast"), "Breakfast")
 
     def test_other_intents_do_not_constrain_meal_type(self):
-        """48 of 80 rows are All Day; filtering on it would only lose choices."""
         for intent in ("dinner", "snack", "quick_bite", "late_night_craving", None):
             with self.subTest(intent=intent):
                 self.assertIsNone(menu_meal_type(intent))
